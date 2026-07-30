@@ -91,17 +91,26 @@ export interface GeoSwarmBridge {
   onFrame(cb: (msg: PumpToRendererMsg) => void): Unsubscribe;
 
   /**
-   * Post a REQ (or RECYCLE) on the engine port.
+   * Post a REQ on the engine port.
+   *
+   * There is no transfer-list parameter and no recycle channel: both legs of
+   * this port are structured clones, because a transferred ArrayBuffer never
+   * becomes reachable main-side and one referenced from the body strips the
+   * whole message (CONTRACTS section 7).
    *
    * @param req message object
-   * @param transferList buffers to hand back to main -- always the ArrayBuffer,
-   *        never a typed-array view (a view silently deep-copies)
    * @returns true when the message went out; false when it was queued or failed
    */
-  sendReq(req: object, transferList?: ArrayBuffer[]): boolean;
+  sendReq(req: object): boolean;
 
-  /** Hand consumed buffers back without issuing a new request. */
-  recycle(buffers: ArrayBuffer[]): boolean;
+  /**
+   * Resolves once main has delivered the engine port over IPC.ENGINE_PORT.
+   * Resolves immediately when the port is already attached.
+   */
+  whenPortReady(): Promise<void>;
+
+  /** Synchronous "is the port attached right now" check. */
+  isPortReady(): boolean;
 
   nview: NativeViewBridge;
 }

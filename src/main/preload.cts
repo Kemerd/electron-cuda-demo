@@ -6,7 +6,8 @@
  * (dist-electron/main/preload.cjs). Everything the renderer can reach goes
  * through contextBridge, and the bridge only ships structured-cloneable values
  * -- which the MessagePort is not. So the port stays here, and the renderer gets
- * callback registrars (onFrame / sendReq / recycle) that close over it.
+ * callback registrars (onFrame / sendReq) plus the port-readiness hooks that
+ * close over it.
  *
  * The port arrives as a real DOM MessagePort on e.ports[0], so it uses the DOM
  * API (port.start(), port.onmessage). The Node-flavoured .on()/.start() pair
@@ -59,19 +60,23 @@ let enginePort: MessagePort | null = null;
  */
 const frameListeners: Array<(msg: PumpToRendererMsg) => void> = [];
 
-/** One message queued before the port existed, with its transfer list. */
-interface PendingPost {
-  msg: object;
-  transfer: ArrayBuffer[];
-}
-
 /**
  * Messages the renderer tried to send before the port arrived. The handshake is
  * fast but not instantaneous, and dropping the first request silently would
- * produce a mysterious one-frame stall on boot.
+ * produce a mysterious one-frame stall on boot. Entries are plain message
+ * objects: there is no transfer list on this port at all (CONTRACTS section 7 --
+ * a transferred ArrayBuffer never becomes reachable main-side, and one that is
+ * also referenced from the body makes the whole message arrive empty).
  */
-const pending: PendingPost[] = [];
+const pending: object[] = [];
 const PENDING_CAP = 8;
+
+/**
+ * Resolvers parked by whenPortReady() while the port was still in flight. The
+ * renderer must not start its REQ drive before IPC.ENGINE_PORT lands, so this
+ * is the signal it waits on rather than guessing with a timer.
+ */
+const portReadyWaiters: Array<() => void> = [];
 
 /** Message extraction that survives a thrown non-Error (a string, null, ...). */
 function errText(err: unknown): string {
@@ -130,9 +135,22 @@ function attachPort(port: MessagePort | null | undefined): void {
     const item = pending.shift();
     if (!item) break;
     try {
-      enginePort.postMessage(item.msg, item.transfer);
+      enginePort.postMessage(item);
     } catch (err) {
       console.warn('[preload] flushing queued message failed:', errText(err));
+    }
+  }
+
+  // Release anyone blocked in whenPortReady(). Drained rather than iterated so a
+  // waiter that re-arms from its own callback cannot be invoked twice, and each
+  // resolve is isolated so one throwing continuation cannot strand the rest.
+  while (portReadyWaiters.length > 0) {
+    const resolve = portReadyWaiters.shift();
+    if (!resolve) break;
+    try {
+      resolve();
+    } catch (err) {
+      console.warn('[preload] port-ready waiter threw:', errText(err));
     }
   }
 }
@@ -143,31 +161,6 @@ ipcRenderer.on(CH.ENGINE_PORT, (event: IpcRendererEvent) => {
   const port = event?.ports?.[0];
   attachPort(port);
 });
-
-/**
- * Filter a caller-supplied transfer list down to things that are actually
- * transferable. A stray typed-array view in here would throw a DataCloneError
- * and kill the frame; worse, listing a view instead of its buffer silently
- * deep-copies, which is the single most expensive mistake in this codebase.
- */
-function sanitizeTransfers(list: unknown): ArrayBuffer[] {
-  if (!Array.isArray(list) || list.length === 0) return [];
-  const out: ArrayBuffer[] = [];
-  for (let i = 0; i < list.length; i++) {
-    const item: unknown = list[i];
-    if (item instanceof ArrayBuffer) {
-      if (item.byteLength > 0) out.push(item);
-      continue;
-    }
-    if (ArrayBuffer.isView(item)) {
-      console.warn('[preload] transfer list contained a view; transferring its buffer instead');
-      if (item.buffer instanceof ArrayBuffer && item.buffer.byteLength > 0) out.push(item.buffer);
-      continue;
-    }
-    console.warn('[preload] dropping non-transferable entry from transfer list');
-  }
-  return out;
-}
 
 /**
  * Thin wrapper around ipcRenderer.invoke that turns a rejected main-process
@@ -240,30 +233,34 @@ const api: GeoSwarmBridge = {
   },
 
   /**
-   * Post a REQ (or RECYCLE) on the engine port.
+   * Post a REQ on the engine port.
+   *
+   * No transfer list, deliberately and permanently: on this leg a transferred
+   * ArrayBuffer never becomes reachable main-side, and one that is also
+   * referenced from the message body makes the ENTIRE message arrive empty with
+   * no error raised (CONTRACTS section 7). The REQ is a structured clone -- it
+   * carries only scalars and the small input struct, so the copy is cheap.
+   *
    * @param req message object
-   * @param transferList buffers to hand back to main
-   * @returns true when the message went out (or was queued)
+   * @returns true when the message went out (false when queued or failed)
    */
-  sendReq(req: object, transferList?: ArrayBuffer[]): boolean {
+  sendReq(req: object): boolean {
     if (!req || typeof req !== 'object') {
       console.warn('[preload] sendReq called without a message object');
       return false;
     }
 
-    const transfer = sanitizeTransfers(transferList);
-
     if (!enginePort) {
       // Queue, bounded. If the port never arrives we would otherwise grow this
       // array once per rAF tick forever.
       if (pending.length < PENDING_CAP) {
-        pending.push({ msg: req, transfer });
+        pending.push(req);
       }
       return false;
     }
 
     try {
-      enginePort.postMessage(req, transfer);
+      enginePort.postMessage(req);
       return true;
     } catch (err) {
       console.warn('[preload] postMessage failed:', errText(err));
@@ -272,14 +269,20 @@ const api: GeoSwarmBridge = {
   },
 
   /**
-   * Hand consumed buffers back without issuing a new request.
+   * Resolves once main has handed over the engine port. Already-attached is the
+   * common case on a renderer reload, so that path resolves immediately rather
+   * than parking a waiter that would never fire again.
    */
-  recycle(buffers: ArrayBuffer[]): boolean {
-    const transfer = sanitizeTransfers(buffers);
-    if (transfer.length === 0) return false;
-    // 'recycle' mirrors MSG.RECYCLE in protocol.ts -- same reason as the CH table
-    // above: no ESM import reaches a sandboxed CJS preload.
-    return api.sendReq({ t: 'recycle', buffers: transfer }, transfer);
+  whenPortReady(): Promise<void> {
+    if (enginePort) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      portReadyWaiters.push(resolve);
+    });
+  },
+
+  /** Synchronous "is the port attached right now" check. */
+  isPortReady(): boolean {
+    return enginePort !== null;
   },
 
   /** Native D3D11 child-window controls. Stubbed main-side until that phase lands. */

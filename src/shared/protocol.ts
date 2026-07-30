@@ -235,22 +235,26 @@ export interface InputState {
  *  installed; main replies with webContents.postMessage(IPC.ENGINE_PORT,
  *  null, [port]). All per-frame traffic then rides that port.
  *
- *  The two legs are asymmetric (empirical Electron behavior, not choice):
- *  main -> renderer payloads ride as STRUCTURED CLONES, because
- *  MessagePortMain.postMessage only accepts ports in its transfer list —
- *  the clone leaves the sender's buffer intact, so the pump immediately
- *  re-pools it. renderer -> main buffers ARE transferred (always list
- *  view.buffer in the transfer array — transferring the view itself
- *  silently deep-copies; transfer detaches). The pump keeps a small pool
- *  per payload kind, caps it at depth 3, and drops returned buffers whose
- *  byteLength no longer matches the active preset.
+ *  Both legs are STRUCTURED CLONES (empirical Electron 43 behavior, not
+ *  a choice): main -> renderer because MessagePortMain.postMessage accepts
+ *  only ports in its transfer list; renderer -> main because a transferred
+ *  ArrayBuffer never becomes reachable on the main side — and worse, a
+ *  transfer-list entry that is also referenced from the message body makes
+ *  the ENTIRE message arrive empty (every property silently stripped).
+ *
+ *  Consequences the code is built around:
+ *  - The pump re-pools its own buffer immediately after posting (the clone
+ *    leaves it intact), so the main side never allocates in steady state.
+ *  - The renderer treats each received buffer as disposable — it is a
+ *    fresh IPC-layer allocation either way, and returning it would cost a
+ *    second full copy just to be discarded. Nothing is recycled across
+ *    the process boundary; transfer lists are never used on this port.
  * ------------------------------------------------------------------ */
 
 /** Message discriminants for port traffic. */
 export const MSG = Object.freeze({
   REQ: 'req',         // renderer -> main: please produce a frame
   FRAME: 'frame',     // main -> renderer: one payload (entities|field|rgba)
-  RECYCLE: 'recycle', // renderer -> main: returning consumed buffers
   ERROR: 'error',     // main -> renderer: engine failure for a request
 } as const);
 export type MsgType = (typeof MSG)[keyof typeof MSG];
@@ -275,7 +279,6 @@ export interface ReqMsg {
   height?: number;
   wantField?: boolean;        // weather scene, non-CUDA raster paths
   input: InputState;
-  buffers: ArrayBuffer[];     // recycled buffers riding along (transferred)
 }
 
 export interface FrameTimings {
@@ -298,12 +301,6 @@ export interface FrameMsg {
   buf: ArrayBuffer;
 }
 
-/** renderer -> main: buffers coming home outside a REQ. */
-export interface RecycleMsg {
-  t: typeof MSG.RECYCLE;
-  buffers: ArrayBuffer[];
-}
-
 /** main -> renderer: the engine could not serve a request. */
 export interface ErrorMsg {
   t: typeof MSG.ERROR;
@@ -314,7 +311,7 @@ export interface ErrorMsg {
 /** Everything the renderer can receive on the port. */
 export type PumpToRendererMsg = FrameMsg | ErrorMsg;
 /** Everything main can receive on the port. */
-export type RendererToPumpMsg = ReqMsg | RecycleMsg;
+export type RendererToPumpMsg = ReqMsg;
 
 /* ------------------------------------------------------------------ *
  *  IPC channel names (ipcMain.handle / ipcRenderer.invoke unless noted)

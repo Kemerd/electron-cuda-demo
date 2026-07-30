@@ -1,23 +1,26 @@
 /**
  * frame-pump.ts -- the MessagePort frame transport between main and renderer.
  *
- * Why a MessagePort instead of plain ipcMain/ipcRenderer: regular IPC is
- * structured-clone only for large payloads unless you hand-roll transfers, and
- * it routes through the main-process router. A MessageChannelMain pair gives us
- * a direct, transferable-capable channel where an ArrayBuffer moves by pointer
- * handoff instead of a memcpy on the leg that supports it. At 2M agents * 32
- * bytes = 64 MB per frame the difference is the whole demo.
+ * Why a MessagePort instead of plain ipcMain/ipcRenderer: regular IPC routes
+ * every payload through the main-process router and gives us no channel of our
+ * own. A MessageChannelMain pair is a direct link between the two processes
+ * that we can size and clock ourselves. At 2M agents * 32 bytes = 64 MB per
+ * frame, having that link be dedicated is the whole demo.
  *
- * Buffer lifecycle (CONTRACTS section 7):
- *   pool -> [clone to renderer as FRAME.buf, ours re-pooled immediately] ->
- *   renderer reads it -> renderer transfers it back on the next REQ.buffers
- *   (or a RECYCLE msg) -> pool.
+ * Buffer lifecycle (CONTRACTS section 7) -- the pump's pool is entirely
+ * self-contained:
+ *   pool -> [clone to renderer as FRAME.buf] -> our copy re-pooled immediately,
+ *   because a structured clone does not detach it.
  *
- * The two legs are asymmetric, which is the single most surprising thing about
- * this file -- see the long note on postFrame(). Three buffers per kind is
- * enough to cover one in flight + one being read + one being refilled, which
- * means steady state has zero allocation. If we ever do allocate after warmup
- * that is a bug worth seeing, so it gets logged.
+ * Nothing comes back across the boundary. Cross-process recycling is impossible
+ * here, not merely unnecessary: a transferred ArrayBuffer never becomes
+ * reachable on the main side, and one that is also referenced from the message
+ * body makes the entire message arrive empty with no error. So both legs are
+ * clones, transfer lists are never used, and the renderer drops what it reads.
+ *
+ * Three buffers per kind is enough to cover one in flight + one being read + one
+ * being refilled, which means steady state has zero allocation. If we ever do
+ * allocate after warmup that is a bug worth seeing, so it gets logged.
  */
 
 import { ipcMain, MessageChannelMain, nativeImage } from 'electron';
@@ -249,17 +252,18 @@ function acquire(kind: PayloadKind, bytes: number): ArrayBuffer | null {
     return null;
   }
 
-  // Pull from the tail; the most recently recycled buffer is the most likely to
-  // still be warm in cache.
+  // Pull from the tail; the buffer we posted most recently is the most likely
+  // to still be warm in cache.
   while (pool.length > 0) {
     const buf = pool.pop();
-    // Detached buffers report byteLength 0 -- that is also how we filter out
-    // anything that slipped through recycling in a bad state.
+    // Detached buffers report byteLength 0 -- the size check filters those out
+    // along with anything left over from a previous preset.
     if (buf && buf.byteLength === bytes) return buf;
   }
 
-  // Warmup allocations are expected (we fill POOL_DEPTH lazily). Past that,
-  // an allocation means the renderer is not returning buffers fast enough.
+  // Warmup allocations are expected (we fill POOL_DEPTH lazily). Past that, an
+  // allocation means a post failed to re-pool its buffer -- worth seeing, since
+  // the pool is self-sufficient and nothing external can starve it.
   if (framesServed > POOL_DEPTH) {
     underflowAllocations++;
     console.warn(
@@ -294,17 +298,6 @@ function release(buf: ArrayBuffer | null | undefined): void {
     }
   }
   // No pool wants it -- stale size after a preset change. Dropping is correct.
-}
-
-/**
- * Absorb a batch of recycled buffers from the renderer.
- */
-function absorbRecycled(list: unknown): void {
-  if (!Array.isArray(list)) return;
-  for (const b of list) {
-    // Structured clone gives us real ArrayBuffers; anything else is a renderer bug.
-    if (b instanceof ArrayBuffer) release(b);
-  }
 }
 
 /* ------------------------------------------------------------------ *
