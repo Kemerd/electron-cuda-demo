@@ -27,6 +27,7 @@ import type {
   PumpToRendererMsg,
   SceneParams,
 } from '../shared/protocol.js';
+import type { OverlayInputEvent } from './overlay-types.js';
 
 /** Rect used by the native-view channels; css px plus the device pixel ratio. */
 export interface NativeViewRect {
@@ -70,6 +71,51 @@ export interface NativeViewBridge {
 
 /** Unsubscribe handle returned by onFrame(). */
 export type Unsubscribe = () => void;
+
+/**
+ * Scene metadata the HUD overlay window shows in its title chip.
+ *
+ * The main renderer is the only thing that knows what scene is mounted and what
+ * it is called, so it pushes the strings rather than main duplicating the
+ * registry.
+ */
+export interface OverlaySceneInfo {
+  scene: string;
+  title: string;
+  subtitle: string;
+}
+
+/**
+ * Controls for the HUD overlay window (CONTRACTS section 6).
+ *
+ * The renderer drives the lifecycle because it is what owns the mode router: it
+ * is the only side that knows a native present mode is actually engaged AND
+ * that the render thread genuinely started. Main inferring it from nview:start
+ * would put a HUD on screen for a start that failed.
+ */
+export interface OverlayBridge {
+  /**
+   * Create or destroy the overlay window.
+   *
+   * @param active true to bring it up over the current native rect
+   * @param info   scene metadata, so the title chip is right on the first push
+   */
+  setActive(active: boolean, info?: OverlaySceneInfo | null): void;
+
+  /** Push new scene title/description without touching the window's lifecycle. */
+  setScene(info: OverlaySceneInfo): void;
+
+  /**
+   * Subscribe to input relayed from the overlay window.
+   *
+   * Events arrive with coordinates normalized to the native rect (0..1); the
+   * receiver maps them back onto its own stage box and replays them into the
+   * camera rig, so orbit/pan/zoom behave identically to the composite path.
+   *
+   * @returns a function that removes this listener
+   */
+  onInput(cb: (event: OverlayInputEvent) => void): Unsubscribe;
+}
 
 /**
  * The complete window.geoswarm surface.
@@ -128,4 +174,7 @@ export interface GeoSwarmBridge {
   isPortReady(): boolean;
 
   nview: NativeViewBridge;
+
+  /** HUD overlay window controls + the input relay (CONTRACTS section 6). */
+  overlay: OverlayBridge;
 }

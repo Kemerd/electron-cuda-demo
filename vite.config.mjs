@@ -45,7 +45,21 @@ export default defineConfig({
     target: 'chrome150',
     sourcemap: true,
     rollupOptions: {
-      input: path.join(repoRoot, 'src/renderer/index.html'),
+      // Two entries, two HTML pages, one bundle graph.
+      //
+      // `overlay` is the HUD that floats over the native D3D11 surface in
+      // matrix modes 6/7 (CONTRACTS section 6). It has to be its own page
+      // because it is loaded into its own transparent BrowserWindow -- Chromium
+      // cannot composite HTML on top of the CUDA-written child HWND, so the
+      // HUD moves to a second OS window rather than a second element.
+      //
+      // Named inputs rather than a bare array so the emitted filenames stay
+      // predictable: main.ts loads dist/renderer/overlay.html by absolute path,
+      // and rollup places an HTML entry at the path implied by its key.
+      input: {
+        index: path.join(repoRoot, 'src/renderer/index.html'),
+        overlay: path.join(repoRoot, 'src/renderer/overlay/overlay.html'),
+      },
     },
   },
 });

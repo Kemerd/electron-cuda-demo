@@ -287,6 +287,20 @@ void ParseInputState(const Napi::Object& obj, InputUniforms* out) {
     out->pointScale = (ps > 0.05 && ps < 64.0) ? static_cast<float>(ps) : 1.0f;
   }
 
+  /* --- weather -------------------------------------------------------- */
+  // InputState.weatherCoverage (protocol.ts) is declared optional, so an older
+  // renderer build sends nothing at all. Falling back to the protocol default
+  // rather than to zero matters: zero means "clear skies", and a missing
+  // property would silently blank the weather scene instead of showing the
+  // realistic scattered look the default describes.
+  {
+    const double wc = GetNumberOr(obj, "weatherCoverage",
+                                  static_cast<double>(GS_WEATHER_COVERAGE_DEFAULT));
+    out->weatherCoverage = (wc >= 0.0 && wc <= 1.0)
+                               ? static_cast<float>(wc)
+                               : GS_WEATHER_COVERAGE_DEFAULT;
+  }
+
   /* --- clock ---------------------------------------------------------- */
   out->timeSec = static_cast<float>(GetNumberOr(obj, "timeSec", 0.0));
 }

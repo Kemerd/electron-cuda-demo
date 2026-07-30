@@ -291,15 +291,29 @@ export default function createScene(): Scene {
 
           // Below the first band there is no echo at all -- clear air must show
           // the earth underneath, not a wash of the lowest color.
-          if (d < 0.08) discard;
+          //
+          // ECHO_FLOOR, raised from 0.08 with the Coverage work. CONTRACTS
+          // section 8 is explicit that "the ramp's bottom band must also start
+          // at meaningful reflectivity, not background noise": at 0.08 the
+          // lowest green began barely above the field's own numerical floor, so
+          // the solver's residual drift term -- which never fully decays --
+          // painted a faint green skin across most of the globe and undercut
+          // the clear regions the coverage threshold had just carved out.
+          if (d < 0.16) discard;
 
           // Classic NEXRAD reflectivity ramp, STEPPED into 6 bands. Real mosaics
           // band like this because reflectivity is binned into dBZ classes;
           // smoothing it away would read as a generic heat map.
+          //
+          // The first edge moved 0.20 -> 0.26 alongside the floor: leaving it
+          // where it was would have squeezed band 0 into a four-hundredths-wide
+          // sliver that essentially nothing landed in, and the ladder would have
+          // lost a rung. The upper four edges are unchanged, so the strong
+          // classes still mean exactly what they meant before.
           vec3 col;
           float a;
-          if (d < 0.20)      { col = vec3(0.16, 0.62, 0.24); a = 0.42; } // light green
-          else if (d < 0.34) { col = vec3(0.13, 0.83, 0.18); a = 0.55; } // green
+          if (d < 0.26)      { col = vec3(0.16, 0.62, 0.24); a = 0.42; } // light green
+          else if (d < 0.38) { col = vec3(0.13, 0.83, 0.18); a = 0.55; } // green
           else if (d < 0.50) { col = vec3(0.98, 0.95, 0.20); a = 0.66; } // yellow
           else if (d < 0.66) { col = vec3(0.99, 0.63, 0.11); a = 0.75; } // orange
           else if (d < 0.82) { col = vec3(0.93, 0.16, 0.14); a = 0.83; } // red

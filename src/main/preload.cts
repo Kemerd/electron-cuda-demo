@@ -30,7 +30,8 @@ import electron = require('electron');
 import type { IpcRendererEvent } from 'electron';
 
 const { contextBridge, ipcRenderer } = electron;
-import type { GeoSwarmBridge, NativeViewRect, NativeViewStartArgs, NativeViewStatsResult, Unsubscribe } from './bridge-types.js';
+import type { GeoSwarmBridge, NativeViewRect, NativeViewStartArgs, NativeViewStatsResult, OverlaySceneInfo, Unsubscribe } from './bridge-types.js';
+import type { OverlayInputEvent } from './overlay-types.js';
 import type { Capabilities, GpuStats, OkResult, PumpToRendererMsg, SceneParams } from '../shared/protocol.js';
 
 // Channel names are duplicated as literals here rather than imported: a
@@ -50,6 +51,13 @@ const CH = Object.freeze({
   NVIEW_START: 'nview:start',       // IPC.NVIEW_START
   NVIEW_STOP: 'nview:stop',         // IPC.NVIEW_STOP
   NVIEW_STATS: 'nview:stats',       // IPC.NVIEW_STATS
+  // HUD overlay window (CONTRACTS section 6). These mirror OVERLAY_IPC in
+  // overlay-types.ts rather than protocol.ts's IPC block -- same reason the
+  // literals above are duplicated at all: a sandboxed CJS preload cannot
+  // import an ESM module, so the strings are repeated with the key named.
+  OVERLAY_SET: 'overlay:set',                  // OVERLAY_IPC.SET
+  OVERLAY_SCENE: 'overlay:scene',              // OVERLAY_IPC.SCENE
+  OVERLAY_INPUT_RELAY: 'overlay:input-relay',  // OVERLAY_IPC.INPUT_RELAY
 });
 
 /** The engine port, once main hands it over. */
@@ -60,6 +68,16 @@ let enginePort: MessagePort | null = null;
  * active scene can both listen without fighting over one callback.
  */
 const frameListeners: Array<(msg: PumpToRendererMsg) => void> = [];
+
+/**
+ * Subscribers to input relayed from the HUD overlay window.
+ *
+ * Kept alongside the frame listeners rather than inside the overlay bridge
+ * object so the ipcRenderer.on() hook below can reach it at module scope --
+ * the hook has to be installed at load time, before the renderer has had a
+ * chance to subscribe, or the first events of a mode switch are dropped.
+ */
+const overlayInputListeners: Array<(event: OverlayInputEvent) => void> = [];
 
 /**
  * Messages the renderer tried to send before the port arrived. The handshake is
@@ -161,6 +179,29 @@ function attachPort(port: MessagePort | null | undefined): void {
 ipcRenderer.on(CH.ENGINE_PORT, (event: IpcRendererEvent) => {
   const port = event?.ports?.[0];
   attachPort(port);
+});
+
+/**
+ * Input relayed from the HUD overlay window, forwarded by main.
+ *
+ * Installed at module load rather than lazily on first subscribe: a mode switch
+ * creates the overlay window and the user can be dragging inside it before the
+ * renderer's own listener is attached, and a dropped pointerdown leaves the
+ * camera rig in a half-gesture state for the rest of the drag.
+ */
+ipcRenderer.on(CH.OVERLAY_INPUT_RELAY, (_event: IpcRendererEvent, payload: unknown) => {
+  if (!payload || typeof payload !== 'object') return;
+  const relayed = payload as OverlayInputEvent;
+
+  for (let i = 0; i < overlayInputListeners.length; i++) {
+    const fn = overlayInputListeners[i];
+    if (typeof fn !== 'function') continue;
+    try {
+      fn(relayed);
+    } catch (err) {
+      console.warn('[preload] overlay input listener threw:', errText(err));
+    }
+  }
 });
 
 /**
@@ -323,6 +364,57 @@ const api: GeoSwarmBridge = {
     },
     stats(): Promise<NativeViewStatsResult> {
       return invokeSafe<NativeViewStatsResult>(CH.NVIEW_STATS);
+    },
+  },
+
+  /**
+   * HUD overlay window (CONTRACTS section 6).
+   *
+   * All three are one-way sends rather than invokes. setActive/setScene are
+   * fire-and-forget lifecycle signals with nothing to return, and the input
+   * relay is on the interaction path -- an invoke round trip per relayed
+   * pointermove would put IPC latency between the user's hand and the camera.
+   */
+  overlay: {
+    setActive(active: boolean, info?: OverlaySceneInfo | null): void {
+      // Scene metadata rides along so the title chip is correct on the very
+      // first HUD push rather than one interval later.
+      const payload: Record<string, unknown> = { active: !!active };
+      if (info && typeof info === 'object') {
+        payload.scene = String(info.scene ?? '');
+        payload.title = String(info.title ?? '');
+        payload.subtitle = String(info.subtitle ?? '');
+      }
+      try {
+        ipcRenderer.send(CH.OVERLAY_SET, payload);
+      } catch (err) {
+        console.warn('[preload] overlay setActive failed:', errText(err));
+      }
+    },
+
+    setScene(info: OverlaySceneInfo): void {
+      if (!info || typeof info !== 'object') return;
+      try {
+        ipcRenderer.send(CH.OVERLAY_SCENE, {
+          scene: String(info.scene ?? ''),
+          title: String(info.title ?? ''),
+          subtitle: String(info.subtitle ?? ''),
+        });
+      } catch (err) {
+        console.warn('[preload] overlay setScene failed:', errText(err));
+      }
+    },
+
+    onInput(cb: (event: OverlayInputEvent) => void): Unsubscribe {
+      if (typeof cb !== 'function') {
+        console.warn('[preload] overlay onInput called without a function');
+        return () => {};
+      }
+      overlayInputListeners.push(cb);
+      return () => {
+        const i = overlayInputListeners.indexOf(cb);
+        if (i >= 0) overlayInputListeners.splice(i, 1);
+      };
     },
   },
 };

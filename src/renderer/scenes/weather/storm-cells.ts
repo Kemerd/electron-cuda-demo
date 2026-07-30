@@ -67,9 +67,21 @@ const SLICES_MAX = 16;
 const SHELL_SEGMENTS_W = 96;
 const SHELL_SEGMENTS_H = 60;
 
-/** Density below this is clear air -- no echo, nothing to extrude. Matches the
- *  flat radar layer's threshold so the two layers agree on where cells start. */
-const ECHO_FLOOR = 0.08;
+/**
+ * Density below this is clear air -- no echo, nothing to extrude. Matches the
+ * flat radar layer's threshold and kEchoFloor in raster.cu so all three layers
+ * agree on where cells start.
+ *
+ * Raised from 0.08 with the Coverage work (CONTRACTS section 8: "the ramp's
+ * bottom band must also start at meaningful reflectivity, not background
+ * noise"). At 0.08 the lowest green band began barely above the field's own
+ * numerical floor, so the residual drift term -- which never fully decays --
+ * kept painting a faint green skin over most of the extrusion. 0.16 puts the
+ * bottom of the ladder at a return that actually means something, and the
+ * clear-air gaps the coverage threshold carves stay clear all the way up the
+ * column instead of filling with the palest band.
+ */
+const ECHO_FLOOR = 0.16;
 
 /* ------------------------------------------------------------------ *
  *  Public surface
@@ -313,8 +325,11 @@ export function createStormCells(options?: StormCellsOptions | null): StormCells
         vec3  col;
         float baseA;
         float capH;
-        if (d < 0.20)      { col = vec3(0.16, 0.62, 0.24); baseA = 0.42; capH = 0.20; }
-        else if (d < 0.34) { col = vec3(0.13, 0.83, 0.18); baseA = 0.55; capH = 0.36; }
+        // First edge is 0.26, not 0.20 -- it moved with ECHO_FLOOR (see the
+        // constant's comment). Same change, same reason, in the flat radar
+        // layer's ladder and in ReflectivityBand() on the CUDA side.
+        if (d < 0.26)      { col = vec3(0.16, 0.62, 0.24); baseA = 0.42; capH = 0.20; }
+        else if (d < 0.38) { col = vec3(0.13, 0.83, 0.18); baseA = 0.55; capH = 0.36; }
         else if (d < 0.50) { col = vec3(0.98, 0.95, 0.20); baseA = 0.66; capH = 0.54; }
         else if (d < 0.66) { col = vec3(0.99, 0.63, 0.11); baseA = 0.75; capH = 0.70; }
         else if (d < 0.82) { col = vec3(0.93, 0.16, 0.14); baseA = 0.83; capH = 0.86; }

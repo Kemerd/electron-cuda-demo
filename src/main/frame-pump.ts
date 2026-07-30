@@ -756,8 +756,11 @@ function uploadEarthTexture(): EarthUploadResult {
     return { ok: false, reason: 'decoded texture has zero size' };
   }
 
-  // toBitmap() gives BGRA8 on Windows; the native side is documented to accept
-  // either channel order, so pass the dimensions and let it swizzle.
+  // toBitmap() yields BGRA8 (Chromium's native bitmap order on every desktop
+  // platform). The engine's contract (CONTRACTS section 4) is RGBA -- the
+  // kernel samples the channels as uploaded and never swizzles -- so main owns
+  // the one-time conversion here. Skipping it is the classic "brown ocean"
+  // defect: R and B trade places and the Pacific turns mud-colored.
   let bitmap;
   try {
     bitmap = image.toBitmap();
@@ -769,9 +772,20 @@ function uploadEarthTexture(): EarthUploadResult {
   }
 
   // Copy out of the Node Buffer's (possibly pooled, oversized) backing store so
-  // the engine receives an ArrayBuffer whose length is exactly the pixel data.
+  // the engine receives an ArrayBuffer whose length is exactly the pixel data,
+  // swizzling BGRA -> RGBA as the pixels move. One pass, once per launch --
+  // this is not a per-frame path, so the readable loop wins over anything
+  // clever. Alpha is carried through untouched (the maps are opaque anyway).
   const bytes = size.width * size.height * 4;
-  const ab = bitmap.buffer.slice(bitmap.byteOffset, bitmap.byteOffset + bytes) as ArrayBuffer;
+  const ab = new ArrayBuffer(bytes);
+  const dst = new Uint8Array(ab);
+  const src = new Uint8Array(bitmap.buffer, bitmap.byteOffset, bytes);
+  for (let i = 0; i < bytes; i += 4) {
+    dst[i] = src[i + 2] ?? 0;     // R <- B slot
+    dst[i + 1] = src[i + 1] ?? 0; // G stays
+    dst[i + 2] = src[i] ?? 0;     // B <- R slot
+    dst[i + 3] = src[i + 3] ?? 0; // A stays
+  }
 
   try {
     const res = upload.call(engine, ab, size.width, size.height);

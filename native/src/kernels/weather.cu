@@ -336,6 +336,76 @@ __global__ void WeatherSeedKernel(float* __restrict__ density, float* __restrict
 }
 
 /* ===================================================================== *
+ *  Coverage shaping
+ * ===================================================================== */
+
+/** Spatial frequency of the cell-breakup mask. Roughly 8 lobes across the
+ *  sphere, which is the scale a mid-latitude system occupies on a global
+ *  mosaic - lower and the whole hemisphere switches on at once, higher and the
+ *  cells shred into speckle that reads as sensor noise, not weather. */
+constexpr float kCellScale = 4.6f;
+
+/**
+ * How hard the mask bites into the density before the coverage threshold.
+ * At 1.0 the mask alone can zero a texel; below that it only ever biases.
+ *
+ * 0.55, not the 0.85 this started at, and the difference is measurable rather
+ * than aesthetic: at 0.85 the mask was doing so much of the clearing that the
+ * COVERAGE DIAL had almost nothing left to do. Sweeping the dial end to end
+ * moved globe echo from 2.7% to 8.0% - the whole range sat under the spec's
+ * 10-20% target for the DEFAULT, and "Severe" looked like a slightly busier
+ * "Clear". The mask's job is to break the sheet into cells; deciding how much
+ * of the planet has weather on it is the dial's job, and it cannot do that job
+ * if the mask has already thrown the field away.
+ */
+constexpr float kCellDepth = 0.55f;
+
+/** Drift rate of the mask, radians-ish per second. Slower than the vortex
+ *  migration on purpose: the systems should move through the cell structure,
+ *  not drag it along, or the gaps look painted on. */
+constexpr float kCellDrift = 0.017f;
+
+/**
+ * @brief Turn the solver's raw density into the coverage-shaped reflectivity
+ *        the field publishes.
+ *
+ * Two stages. First a CELL MASK: ridged fBm on the sphere, remapped so its
+ * upper lobes stay near 1 and its basins fall away hard. Multiplying the raw
+ * density by it breaks the solver's continuous sheet into discrete systems
+ * with real gaps between them - without this stage the coverage threshold just
+ * shaves the whole sheet down uniformly and you get a thinner wash rather than
+ * scattered cells. Then the shared threshold/gain in gsShapeCoverage, which is
+ * the dial itself.
+ *
+ * The mask is analytic (no storage, no extra pass) and evaluated per texel at
+ * pack time, so it costs three octaves of noise on a kernel that is already
+ * doing six - measured well under the advection's own cost.
+ *
+ * @param raw      density straight out of the solver, 0..1
+ * @param dir      unit direction on the sphere for this texel
+ * @param t        scene clock, drives the slow mask drift
+ * @param coverage dial, 0..1
+ * @return shaped density, 0..1
+ */
+__device__ __forceinline__ float ShapeDensity(float raw, const float3& dir, float t,
+                                              float coverage) {
+  // Ridged noise: 1 - |fbm| puts the ridges at the top of the range and the
+  // basins at the bottom, which is the shape that carves gaps rather than
+  // dimming everything by an average.
+  const float3 q = gsMake(dir.x * kCellScale, dir.y * kCellScale,
+                          dir.z * kCellScale + t * kCellDrift);
+  const float ridged = 1.0f - fabsf(gsFbm3(q, 3, 0x5EC7u));
+
+  // Sharpen: a plain ridged field is still fairly gentle, and the spec asks for
+  // SHARP edges. The smoothstep steepens the transition from basin to ridge so
+  // a cell boundary spans a few texels instead of a whole system width.
+  const float mask = gsSmoothstep(0.30f, 0.78f, ridged);
+
+  const float carved = raw * (1.0f - kCellDepth + kCellDepth * mask);
+  return gsShapeCoverage(carved, coverage);
+}
+
+/* ===================================================================== *
  *  Advection + packing
  * ===================================================================== */
 
@@ -352,17 +422,29 @@ __global__ void WeatherSeedKernel(float* __restrict__ density, float* __restrict
  * parcels near the poles far too slowly in longitude, since a texel there
  * covers a tiny arc.
  *
- * @param dstDensity,dstTemp  destination working buffers
+ * Coverage (CONTRACTS section 8) is applied on the WAY OUT, to the packed
+ * field and to the volume extrusion, never to the working buffers. That split
+ * matters: the working density is what the advection reads back next frame, so
+ * shaping it in place would feed a thresholded field into its own backtrace and
+ * the cuts would compound frame over frame until the planet went dry. Shaping
+ * at the write instead makes coverage a pure re-map of the generated density -
+ * instant on a slider drag, exactly reversible, and identical in every backend.
+ * The swarm samples the same packed B channel (swarm.cu SampleWind), so it
+ * feels precisely the weather the radar draws.
+ *
+ * @param dstDensity,dstTemp  destination working buffers (RAW density)
  * @param srcDensity,srcTemp  previous frame's working buffers
- * @param field               RGBA8 output, protocol layout
+ * @param field               RGBA8 output, protocol layout (SHAPED density)
  * @param w,h                 grid dimensions, w == 2*h
  * @param dtSec               timestep
  * @param t                   scene clock
+ * @param coverage            weather coverage dial, 0..1
  */
 __global__ __launch_bounds__(GS_TILE_X * GS_TILE_Y)
 void WeatherStepKernel(float* __restrict__ dstDensity, float* __restrict__ dstTemp,
                        const float* __restrict__ srcDensity, const float* __restrict__ srcTemp,
-                       unsigned char* __restrict__ field, int w, int h, float dtSec, float t) {
+                       unsigned char* __restrict__ field, int w, int h, float dtSec, float t,
+                       float coverage) {
   const int x = blockIdx.x * blockDim.x + threadIdx.x;
   const int y = blockIdx.y * blockDim.y + threadIdx.y;
   if (x >= w || y >= h) return;  // bounds guard for the rounded-up grid
@@ -421,14 +503,18 @@ void WeatherStepKernel(float* __restrict__ dstDensity, float* __restrict__ dstTe
 
   /* --- write ------------------------------------------------------------ */
   const size_t o = static_cast<size_t>(y) * w + x;
+  // Working buffers keep the RAW field - see the kernel header for why the
+  // coverage shaping must not be fed back into the advection.
   dstDensity[o] = density;
   dstTemp[o] = temp;
 
   const size_t p = o * GS_RGBA_CHANNELS;
-  field[p + 0] = gsPackSnorm8(u);        // R: wind u, -1..1
-  field[p + 1] = gsPackSnorm8(v);        // G: wind v, -1..1
-  field[p + 2] = gsPackUnorm8(density);  // B: density, 0..1
-  field[p + 3] = gsPackUnorm8(temp);     // A: temperature, 0..1
+  const float shaped = ShapeDensity(density, dir, t, coverage);
+
+  field[p + 0] = gsPackSnorm8(u);       // R: wind u, -1..1
+  field[p + 1] = gsPackSnorm8(v);       // G: wind v, -1..1
+  field[p + 2] = gsPackUnorm8(shaped);  // B: density, 0..1 (coverage-shaped)
+  field[p + 3] = gsPackUnorm8(temp);    // A: temperature, 0..1
 }
 
 /* ===================================================================== *
@@ -451,14 +537,22 @@ void WeatherStepKernel(float* __restrict__ dstDensity, float* __restrict__ dstTe
  * Writes are uchar4-aligned where possible: x is the fastest-varying axis and
  * threadIdx.x maps to it, so a warp writes 32 contiguous bytes.
  *
+ * The 2D sample runs through the SAME ShapeDensity() the packed field uses, so
+ * the volumetric columns thin out in lockstep with the flat radar overlay when
+ * the Coverage dial moves. Reading the raw working buffer here instead would
+ * leave the CUDA raster marching storms the three.js overlay had already
+ * cleared away - exactly the divergence CONTRACTS section 8 forbids.
+ *
  * @param volume    GS_VOLUME_GRID^3 destination
- * @param density2d float density field, w*h
+ * @param density2d float density field, w*h (RAW - shaped here, per voxel column)
  * @param w,h       field dimensions
  * @param t         scene clock, drives the detail noise animation
+ * @param coverage  weather coverage dial, 0..1
  */
 __global__ __launch_bounds__(256)
 void VolumeExtrudeKernel(unsigned char* __restrict__ volume,
-                         const float* __restrict__ density2d, int w, int h, float t) {
+                         const float* __restrict__ density2d, int w, int h, float t,
+                         float coverage) {
   const int x = blockIdx.x * blockDim.x + threadIdx.x;
   const int y = blockIdx.y * blockDim.y + threadIdx.y;
   const int z = blockIdx.z;
@@ -488,7 +582,15 @@ void VolumeExtrudeKernel(unsigned char* __restrict__ volume,
   const float lon = atan2f(dir.x, dir.z);
   const float fx = ((lon + 3.1415927f) / 6.2831853f) * static_cast<float>(w) - 0.5f;
   const float fy = ((1.5707963f - lat) / 3.1415927f) * static_cast<float>(h) - 0.5f;
-  float base = SampleScalar(density2d, w, h, fx, fy);
+  const float base = ShapeDensity(SampleScalar(density2d, w, h, fx, fy), dir, t, coverage);
+
+  // Coverage cleared this column entirely: no reflectivity means no cell, and
+  // an early out here skips three octaves of detail noise for what would be a
+  // zero write anyway. At the default dial that is most of the volume.
+  if (base <= 0.0f) {
+    volume[o] = 0u;
+    return;
+  }
 
   /* --- altitude falloff, capped by reflectivity -------------------------- */
   // Normalised height in the shell, 0 at the surface, 1 at the top.
@@ -606,13 +708,24 @@ cudaError_t EnsureWeatherScratch(int w, int h, cudaStream_t stream) {
  *  Host launcher
  * ====================================================================== */
 
-cudaError_t LaunchWeatherStep(uint8_t* field, int w, int h, float timeSec,
+cudaError_t LaunchWeatherStep(uint8_t* field, int w, int h, float timeSec, float coverage,
                               const InputUniforms* input, cudaStream_t stream) {
-  // The solver is driven entirely by its own clock and noise; the uniform block
-  // is accepted for signature parity across all the launchers. Reading pointer
-  // heat off it would make the field non-reproducible between runs, which is
-  // the wrong tradeoff for a benchmark scene.
+  // The uniform block is accepted for signature parity across all the launchers
+  // but deliberately not read: the solver is driven entirely by its own clock
+  // and noise, and pulling pointer heat off the input would make the field
+  // non-reproducible between runs - the wrong tradeoff for a benchmark scene.
+  //
+  // The Coverage dial IS consumed, but it arrives as a plain scalar rather than
+  // through this pointer, because `input` is DEVICE memory and this function
+  // runs on the host. Dereferencing it here is an access violation that takes
+  // the whole process down with no CUDA error to report (confirmed the hard
+  // way). `timeSec` is threaded through for exactly the same reason.
   (void)input;
+
+  // Guard the dial rather than trusting the caller: a NaN would propagate
+  // through the threshold into every packed texel, and an out-of-range value
+  // would silently mean something other than what the UI shows.
+  if (!(coverage >= 0.0f && coverage <= 1.0f)) coverage = GS_WEATHER_COVERAGE_DEFAULT;
 
   if (!field) {
     fprintf(stderr, "[cuda_engine] LaunchWeatherStep: null field buffer.\n");
@@ -648,7 +761,7 @@ cudaError_t LaunchWeatherStep(uint8_t* field, int w, int h, float timeSec,
 
   WeatherStepKernel<<<grid, block, 0, stream>>>(
       g_weather.density[dst], g_weather.temperature[dst], g_weather.density[src],
-      g_weather.temperature[src], field, w, h, dtSec, timeSec);
+      g_weather.temperature[src], field, w, h, dtSec, timeSec, coverage);
   CUDA_CHECK(cudaGetLastError());
 
   g_weather.cur = dst;
@@ -660,8 +773,8 @@ cudaError_t LaunchWeatherStep(uint8_t* field, int w, int h, float timeSec,
   const dim3 volBlock(GS_TILE_X, GS_TILE_Y);
   const dim3 volGrid(gsDivUp(GS_VOLUME_GRID, GS_TILE_X), gsDivUp(GS_VOLUME_GRID, GS_TILE_Y),
                      GS_VOLUME_GRID);
-  VolumeExtrudeKernel<<<volGrid, volBlock, 0, stream>>>(g_weather.volume,
-                                                        g_weather.density[dst], w, h, timeSec);
+  VolumeExtrudeKernel<<<volGrid, volBlock, 0, stream>>>(
+      g_weather.volume, g_weather.density[dst], w, h, timeSec, coverage);
   CUDA_CHECK(cudaGetLastError());
 
   /* --- publish for the swarm's wind term and the rasterizer -------------- */

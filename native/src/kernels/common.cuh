@@ -93,6 +93,9 @@
 /** Volumetric density grid edge length. protocol.js: VOLUME_GRID = 256. */
 #define GS_VOLUME_GRID 256
 
+/** Default weather coverage dial. protocol.ts: WEATHER_COVERAGE_DEFAULT = 0.35. */
+#define GS_WEATHER_COVERAGE_DEFAULT 0.35f
+
 /* ====================================================================== *
  *  Launch geometry
  * ====================================================================== */
@@ -181,9 +184,23 @@ struct InputUniforms {
    */
   float pointScale;
 
+  /* --- weather ---------------------------------------------------------- */
+  /**
+   * Coverage dial, 0..1. Mirrors InputState.weatherCoverage in protocol.ts;
+   * GS_WEATHER_COVERAGE_DEFAULT below is the mirror of
+   * WEATHER_COVERAGE_DEFAULT. Shapes the generated density field at the SIM
+   * level (threshold + gain, see gsShapeCoverage) rather than filtering the
+   * display, so the swarm flies the same weather the radar draws and the
+   * volumetric columns thin out in lockstep with the flat overlay.
+   *
+   * Absent/garbage input parses to the default (addon.cc guards the range), so
+   * an older renderer build still produces the realistic scattered look.
+   */
+  float weatherCoverage;
+
   /* --- clock ---------------------------------------------------------- */
   float timeSec;     ///< monotonic scene clock, seconds
-  float _pad;        ///< explicit tail padding so sizeof() is stable
+  float _pad[2];     ///< explicit tail padding so sizeof() is stable
 };
 
 }  // namespace geoswarm
@@ -315,6 +332,132 @@ __host__ __device__ __forceinline__ float gsSmoothstep(float e0, float e1, float
   float t = gsClampf((x - e0) / d, 0.0f, 1.0f);
   return t * t * (3.0f - 2.0f * t);
 }
+
+/* ====================================================================== *
+ *  Weather coverage shaping
+ *
+ *  CONTRACTS section 8: real global radar is SPARSE. The raw solver produces
+ *  a mostly-continuous density field (advection plus a global drift term keeps
+ *  every texel somewhat wet), which draped over the globe reads as a green
+ *  wash - the exact defect the spec names. Coverage fixes that at the SIM
+ *  level, in every backend, by re-mapping the raw density through a threshold
+ *  and a gain before it is ever written.
+ *
+ *  This one function is the shared definition. The WGSL port
+ *  (compute/shaders/weather.wgsl, shapeCoverage) and the CPU fallback
+ *  (sources/cpu-sim.worker.ts, shapeCoverage) are line-for-line the same math,
+ *  so the three backends produce the same picture from the same dial.
+ * ====================================================================== */
+
+/**
+ * @brief Reflectivity floor the display ladders start at.
+ *
+ * Mirrors kEchoFloor in raster.cu and ECHO_FLOOR in
+ * src/renderer/scenes/weather/storm-cells.ts (and the literal in the radar
+ * shell shader). It lives here because the coverage shaping has to KNOW it:
+ * anything the sim publishes below this value is discarded by every renderer,
+ * so a shaping function that maps survivors into 0..1 is quietly running a
+ * second, invisible threshold on top of its own. Measured before this was
+ * fixed: a cut that passed 24% of the globe still only showed 6%, because most
+ * survivors landed under the floor. Survivors are mapped onto
+ * [GS_ECHO_FLOOR, 1] instead, so "passed the cut" and "is visible" are the
+ * same statement.
+ */
+#define GS_ECHO_FLOOR 0.16f
+
+/**
+ * @brief Threshold at coverage 0 (almost nothing survives - "Clear") and at
+ *        coverage 1 (everything survives - widespread severe).
+ *
+ * Not guesses. The carved, shouldered density was histogrammed over the whole
+ * globe, area-weighted by cos(lat) so the equirect pole rows (which cover
+ * almost no sphere) do not dominate the count. Its survivor curve is steep in
+ * the bottom fifth of the range and then flattens onto the pinned vortex cores:
+ *
+ *     cut  0.05 -> 55%   0.075 -> 33%   0.10 -> 24%   0.125 -> 18%
+ *          0.15 -> 13%   0.175 ->  9%   0.20 ->  8%   0.25 ->  6%
+ *
+ * so the entire useful travel of the dial lives between roughly 0.05 and 0.25.
+ * The default (0.35) interpolates to 0.152, which is the ~13% globe coverage
+ * CONTRACTS section 8 asks for; the ends give a nearly bare planet and a
+ * widespread-severe one.
+ */
+#define GS_COVERAGE_CUT_MIN 0.050f
+#define GS_COVERAGE_CUT_MAX 0.245f
+
+/**
+ * @brief Exponent applied to the raw density BEFORE the threshold.
+ *
+ * Above 1, so it pushes the middle of the distribution DOWN the ramp while
+ * leaving the ordering intact, which is what keeps the bulk of a system in the
+ * green/yellow classes with red and magenta reserved for the cores - the
+ * proportion a real mosaic has.
+ *
+ * It has to happen here rather than after the threshold. The solver injects at
+ * the vortex cores hard enough that a real fraction of every system pins at
+ * exactly 1.0, and no pointwise map applied downstream can move that mass
+ * (1^n is 1). Measured the wrong way round first: an exponent applied after the
+ * threshold made the magenta share WORSE, because it shrank the middle of the
+ * distribution while the pin sat exactly where it was.
+ */
+#define GS_COVERAGE_SHOULDER 1.45f
+
+/**
+ * @brief Shape a raw density value by the coverage dial.
+ *
+ * Four stages, each load-bearing:
+ *
+ *  0. SHOULDER. The raw value is compressed by GS_COVERAGE_SHOULDER so the
+ *     solver's saturated cores stop monopolising the top of the ramp.
+ *
+ *  1. THRESHOLD. `cut` slides from GS_COVERAGE_CUT_MAX (clear) down to
+ *     GS_COVERAGE_CUT_MIN (severe). A texel below the cut returns exactly zero
+ *     - not a small number, zero - which is what produces the large fully-clear
+ *     regions and, because the solver's own density is spatially smooth, cells
+ *     with genuinely sharp edges rather than a soft falloff into haze.
+ *
+ *  2. REMAP ONTO THE VISIBLE RANGE. What survives is stretched across
+ *     [GS_ECHO_FLOOR, 1] rather than [0, 1]. That is the difference between a
+ *     dial that works and one that only appears to: every renderer discards
+ *     reflectivity under the floor, so mapping to 0..1 means a large share of
+ *     the texels that passed the cut are thrown away again downstream and the
+ *     dial reads as barely doing anything.
+ *
+ *  3. TOE. A smoothstep over the first sliver of the surviving range eases the
+ *     very edge of each cell, so the boundary lands as a clean edge instead of
+ *     a one-texel hard step that aliases when the equirect field is magnified
+ *     onto the globe. Applied to the interpolation parameter, NOT to the output
+ *     - dropping the output below the floor would delete the cell edge that
+ *     this stage exists to draw.
+ *
+ * @param raw      unshaped density, 0..1 (values outside are clamped in)
+ * @param coverage dial value, 0..1; out-of-range or NaN falls back to default
+ * @return shaped density: exactly 0 (clear air) or GS_ECHO_FLOOR..1
+ */
+__host__ __device__ __forceinline__ float gsShapeCoverage(float raw, float coverage) {
+  // NaN-safe: a NaN fails both compares and would propagate straight into the
+  // packed field, so it is mapped to the documented default here.
+  const float c = (coverage >= 0.0f && coverage <= 1.0f) ? coverage
+                                                         : GS_WEATHER_COVERAGE_DEFAULT;
+  const float d0 = (raw == raw) ? gsClampf(raw, 0.0f, 1.0f) : 0.0f;
+
+  // Stage 0. powf, not __powf: this helper is __host__ __device__ and the fast
+  // intrinsic has no host counterpart.
+  const float d = powf(d0, GS_COVERAGE_SHOULDER);
+
+  const float cut = gsLerpf(GS_COVERAGE_CUT_MAX, GS_COVERAGE_CUT_MIN, c);
+
+  // Stage 1.
+  if (d <= cut) return 0.0f;
+
+  // Stage 2 + 3. The denominator cannot be smaller than 1 - GS_COVERAGE_CUT_MAX,
+  // but the guard stays in case the constants are ever retuned upward.
+  float t = (d - cut) / fmaxf(1e-4f, 1.0f - cut);
+  t *= gsSmoothstep(0.0f, 0.10f, t);
+
+  return gsClampf(GS_ECHO_FLOOR + (1.0f - GS_ECHO_FLOOR) * t, 0.0f, 1.0f);
+}
+
 
 /**
  * @brief Rotate a vector by a quaternion given in xyzw order.

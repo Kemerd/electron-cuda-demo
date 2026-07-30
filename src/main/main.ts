@@ -30,6 +30,7 @@ import {
   registerNativeViewIpc,
   shutdownNativeView,
 } from './nview.js';
+import { registerOverlayIpc, shutdownOverlayWindow } from './overlay-window.js';
 import type { PumpStats } from './frame-pump.js';
 import type { Capabilities } from '../shared/protocol.js';
 
@@ -302,6 +303,9 @@ function finishSmoke(ok: boolean, detail: SmokeDetail): void {
   // Same ordering rule as will-quit: the render thread first, then the
   // transport, then the device allocations it was reading.
   try {
+    // The HUD overlay's push loop reads nativeViewStats() off the addon, so it
+    // has to stop before anything unloads the addon underneath it.
+    shutdownOverlayWindow();
     shutdownNativeView();
     shutdownFramePump();
     shutdownEngine();
@@ -551,6 +555,10 @@ function createWindow(): BrowserWindow | null {
 
   win.on('closed', () => {
     mainWindow = null;
+    // A closed parent must never leave the HUD overlay behind. overlay-window
+    // hooks 'close' on the parent itself, but this covers the path where the
+    // window is destroyed outright without a close event ever firing.
+    shutdownOverlayWindow();
   });
 
   return win;
@@ -678,6 +686,10 @@ if (!gotLock) {
     registerCapabilityIpc();
     registerFramePump();
     registerNativeViewIpc();
+    // The HUD overlay for the native present modes (CONTRACTS section 6). Just
+    // handler registration -- no window exists until the renderer commits to a
+    // native mode and asks for one.
+    registerOverlayIpc();
 
     mainWindow = createWindow();
 
@@ -707,6 +719,12 @@ if (!gotLock) {
     // and a D3D11 swapchain, so it has to be joined before the engine frees the
     // device buffers that thread is reading. Its own 'close' hook usually got
     // there first; this is the backstop for a quit that never closed a window.
+    //
+    // The HUD overlay comes down first of all. It is a real BrowserWindow whose
+    // 500 ms push loop calls into the addon, so an overlay still alive here
+    // would be polling an engine that is about to be torn down -- and CONTRACTS
+    // section 6 counts an overlay window outliving the app as a defect outright.
+    shutdownOverlayWindow();
     shutdownNativeView();
     shutdownFramePump();
     shutdownEngine();

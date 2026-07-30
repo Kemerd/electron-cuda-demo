@@ -54,6 +54,17 @@ export interface RangeSliderOptions {
   readonly precision?: number;
   /** Suffix shown after the value (e.g. "x"). */
   readonly suffix?: string;
+  /**
+   * Optional endpoint captions rendered under the track, e.g.
+   * ['Clear', 'Severe']. CONTRACTS section 8 requires them on the Coverage
+   * dial, and they cost nothing on sliders that do not ask for them.
+   */
+  readonly endpoints?: readonly [string, string];
+  /**
+   * Format the value chip. Overrides the default precision+suffix rendering --
+   * used by the Coverage dial, where "35%" says more than "0.35x".
+   */
+  readonly format?: (value: number) => string;
   /** Fired live, on every input event. */
   readonly onInput: (value: number) => void;
 }
@@ -67,6 +78,13 @@ export interface SceneControlsApi {
    * when a preset change or a CPU auto-cap moves the value from outside.
    */
   setCount(key: string, value: number): void;
+  /**
+   * Same, for an appearance slider. This is the other half of the CONTRACTS
+   * section 8 preset rule: a preset change re-baselines the storm point size,
+   * and a slider still showing the OLD baseline while the scene draws the new
+   * one is precisely the "stale number" the spec calls a defect.
+   */
+  setRange(key: string, value: number): void;
   /** Show a short note under the strip (auto-cap, VRAM refusal). '' clears it. */
   setNote(text: string, variant?: 'warn' | 'info'): void;
   dispose(): void;
@@ -172,28 +190,58 @@ export function createSceneControls(
     root.appendChild(handle.root);
   }
 
+  /** Appearance sliders by key, so setRange() can find them. */
+  const rangeHandles = new Map<
+    string,
+    { handle: SliderHandle; opts: RangeSliderOptions; render: (v: number) => string }
+  >();
+
   if (ranges) {
-    for (const opts of Object.values(ranges)) {
+    for (const [key, opts] of Object.entries(ranges)) {
       const handle = buildRow(opts.label);
       const precision = typeof opts.precision === 'number' ? opts.precision : 1;
       const suffix = typeof opts.suffix === 'string' ? opts.suffix : '';
+
+      // How the value chip reads. A custom formatter wins, otherwise the
+      // precision+suffix default.
+      const render =
+        typeof opts.format === 'function'
+          ? opts.format
+          : (v: number): string => `${v.toFixed(precision)}${suffix}`;
 
       // Linear, and fine-grained enough that the drag feels continuous.
       handle.input.min = String(Math.round(opts.min * 100));
       handle.input.max = String(Math.round(opts.max * 100));
       handle.input.value = String(Math.round(opts.value * 100));
-      handle.chip.textContent = `${opts.value.toFixed(precision)}${suffix}`;
+      handle.chip.textContent = render(opts.value);
 
       // Commits live: a uniform write, no allocation, so anything slower than
       // immediate would just feel broken.
       handle.input.addEventListener('input', () => {
         const v = Number(handle.input.value) / 100;
-        handle.chip.textContent = `${v.toFixed(precision)}${suffix}`;
+        handle.chip.textContent = render(v);
         handle.input.setAttribute('aria-valuetext', String(v));
         opts.onInput(v);
       });
 
       root.appendChild(handle.root);
+
+      // Endpoint captions under the track. Two spans in a flex row rather than
+      // ::before/::after on the input, so screen readers can reach them and the
+      // spacing follows the same layout rules as everything else in the strip.
+      const ends = opts.endpoints;
+      if (ends && ends.length === 2) {
+        const scale = document.createElement('div');
+        scale.className = 'scene-control-scale';
+        const lo = document.createElement('span');
+        lo.textContent = ends[0];
+        const hi = document.createElement('span');
+        hi.textContent = ends[1];
+        scale.append(lo, hi);
+        handle.root.appendChild(scale);
+      }
+
+      rangeHandles.set(key, { handle, opts, render });
     }
   }
 
@@ -214,6 +262,22 @@ export function createSceneControls(
 
       entry.handle.input.value = String(countToPos(entry.opts.min, entry.opts.max, value));
       entry.handle.chip.textContent = formatCount(value);
+      entry.handle.input.setAttribute('aria-valuetext', String(value));
+    },
+
+    setRange(key, value) {
+      const entry = rangeHandles.get(key);
+      if (!entry) return;
+      if (!Number.isFinite(value)) return;
+
+      // Clamp into the slider's own range before writing: a caller pushing a
+      // value the track cannot represent would otherwise leave the thumb and
+      // the chip disagreeing, which is the exact class of stale readout this
+      // method exists to prevent.
+      const v = Math.min(entry.opts.max, Math.max(entry.opts.min, value));
+      entry.handle.input.value = String(Math.round(v * 100));
+      entry.handle.chip.textContent = entry.render(v);
+      entry.handle.input.setAttribute('aria-valuetext', String(v));
     },
 
     setNote(text, variant) {
@@ -231,6 +295,7 @@ export function createSceneControls(
     dispose() {
       if (root.parentNode) root.parentNode.removeChild(root);
       countHandles.clear();
+      rangeHandles.clear();
     },
   };
 }

@@ -28,12 +28,12 @@
  *    normalizes and a cross product, which the GPU does for free alongside the
  *    transform it was already going to do.
  *
- * Zoom LOD (also binding): the glyph collapses by PROJECTED size -- a dot under
- * ~1.5 px, a single triangle (notch dropped) under ~6 px, the full dart above.
- * At ultra counts most of the swarm is subpixel, and filling invisible notches
- * is wasted fill rate. The collapse happens shader-side by moving vertices,
- * which costs nothing: the vertex count is fixed either way and the fragments
- * simply stop existing.
+ * Zoom LOD (also binding): the glyph adapts by PROJECTED size -- a single
+ * triangle (notch dropped) under ~6 px, the full notched dart above, and a
+ * ~2 px floor held by growing the world scale so an agent is NEVER a formless
+ * dot. At ultra counts most of the swarm sits near that floor, and filling
+ * invisible notches is wasted fill rate. The collapse happens shader-side by
+ * moving vertices, which costs nothing: the vertex count is fixed either way.
  */
 
 import * as THREE from 'three';
@@ -219,32 +219,34 @@ export function createDartSwarm(options: DartSwarmOptions): DartSwarmApi {
         float pxSize = (uScale * 2.0 * uViewportH) / (2.0 * dist * uTanHalfFov);
 
         // ---- LOD collapse --------------------------------------------
-        // Under ~1.5 px: a dot. Collapse every vertex toward the centroid so
-        // the two triangles become a tiny quad-ish blob that still lights one
-        // or two pixels -- cheaper than a separate point pipeline and it keeps
-        // one draw call for the whole swarm.
-        //
         // Under ~6 px: drop the notch by pulling it back to the wing line, so
         // the concave kite becomes a single clean triangle. At that size the
         // notch is under a pixel wide and only produces shimmer.
+        //
+        // There is deliberately NO dot rung below that: the ladder's floor is
+        // the triangle itself (CONTRACTS section 8 -- an agent is never a
+        // formless dot). Instead of collapsing further, the glyph's world
+        // scale grows just enough to hold a ~2 px projected height, so the
+        // farthest agents stay tiny but recognizable directional marks.
         vec2 c = position.xy;
 
-        if (pxSize < 1.5) {
-          // Shrink hard toward the origin of dart space; keeps a visible dot
-          // without the shape aliasing into noise.
-          c *= 0.45;
-        } else if (pxSize < 6.0) {
+        if (pxSize < 6.0) {
           // vertId 3 is the notch. Pushing it to the wing baseline (-1.0)
           // removes the concavity; the two triangles become coplanar halves of
           // one triangle.
           if (vertId > 2.5) c.y = -1.0;
         }
 
+        // The ~2 px clamp: grow the world-space scale when the projection
+        // would land under the floor. Above the floor this is exactly 1 and
+        // the glyph stays world-proportional.
+        float grow = max(1.0, 2.0 / max(pxSize, 1e-3));
+
         // ---- world placement -----------------------------------------
         // Scale proportionally to world size (not screen size), so zooming in
         // grows the darts naturally and close-up reveals the notch -- which is
         // the whole point of the ladder.
-        vec3 offset = (right * c.x + fwd * c.y) * uScale;
+        vec3 offset = (right * c.x + fwd * c.y) * (uScale * grow);
 
         // Lift very slightly along the normal so a dart never z-fights the
         // globe surface at grazing angles.

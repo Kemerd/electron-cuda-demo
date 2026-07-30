@@ -476,8 +476,16 @@ cudaError_t LaunchSwarmSeed(float* records, uint32_t count, cudaStream_t stream)
 cudaError_t LaunchSwarmStep(float* records, uint32_t count, float dtSec,
                             const InputUniforms* input, cudaStream_t stream);
 
-/** @brief Write the animated weather field (RGBA8 equirect, w = 2*h). */
-cudaError_t LaunchWeatherStep(uint8_t* field, int w, int h, float timeSec,
+/**
+ * @brief Write the animated weather field (RGBA8 equirect, w = 2*h).
+ *
+ * @param coverage the Coverage dial, 0..1 (protocol.ts
+ *        InputState.weatherCoverage). Passed as a plain scalar, NOT read off
+ *        @p input: that pointer is DEVICE memory, and the launcher runs on the
+ *        host. `timeSec` is threaded through the same way and for the same
+ *        reason - callers source both from Engine::host_input_.
+ */
+cudaError_t LaunchWeatherStep(uint8_t* field, int w, int h, float timeSec, float coverage,
                               const InputUniforms* input, cudaStream_t stream);
 
 /** @brief Seed storm particle records. */

@@ -56,7 +56,7 @@
 struct WeatherUniforms {
   // x = grid width, y = grid height, zw unused
   dims   : vec4<u32>,
-  // x = dt seconds, y = scene clock, zw unused
+  // x = dt seconds, y = scene clock, z = weather coverage dial (0..1), w unused
   timing : vec4<f32>,
 };
 
@@ -72,6 +72,17 @@ struct WeatherUniforms {
 // texture in the core feature set, which is precisely why the ping-pong pair
 // exists rather than a single in-place target.
 @group(0) @binding(3) var fieldOut : texture_storage_2d<rgba8unorm, write>;
+
+// RAW density ping-pong, one f32 per texel. The published texture's B channel
+// carries the COVERAGE-SHAPED density -- which is what the radar overlay, the
+// storm-cell extrusion and the swarm's wind term all consume -- so the
+// advection cannot read it back: thresholding a field that was already
+// thresholded compounds frame over frame until the planet goes dry. These
+// buffers are the WGSL mirror of the float working pair in weather.cu, and
+// they also retire the 8-bit advection banding the header above described as
+// an accepted cost.
+@group(0) @binding(4) var<storage, read>       densityIn  : array<f32>;
+@group(0) @binding(5) var<storage, read_write> densityOut : array<f32>;
 
 /* =================================================================== *
  *  Tunables -- mirrored from native/src/kernels/weather.cu
@@ -94,6 +105,18 @@ const kJetWidth        : f32 = 0.2617994;   // 15 degrees
 const PI  : f32 = 3.1415927;
 const TAU : f32 = 6.2831853;
 const HALF_PI : f32 = 1.5707963;
+
+// Coverage shaping -- mirrored from common.cuh (gsShapeCoverage) and
+// weather.cu (ShapeDensity). CONTRACTS section 8 requires the dial to shape
+// density identically in every backend, so these numbers may not drift.
+const kCoverageCutMin  : f32 = 0.06;
+const kCoverageCutMax  : f32 = 0.72;
+const kCoverageGainMin : f32 = 2.35;
+const kCoverageGainMax : f32 = 1.18;
+const kCellScale       : f32 = 4.6;
+const kCellDepth       : f32 = 0.85;
+const kCellDrift       : f32 = 0.017;
+const kCoverageDefault : f32 = 0.35;   // protocol.ts WEATHER_COVERAGE_DEFAULT
 
 /* =================================================================== *
  *  Hash + gradient noise -- mirrors common.cuh / noise.cuh
@@ -400,6 +423,89 @@ fn dirToUv(dir : vec3<f32>) -> vec2<f32> {
 }
 
 /* =================================================================== *
+ *  Raw density buffer access
+ * =================================================================== */
+
+// Bilinear sample of the raw density buffer at fractional texel coordinates.
+// Wraps in longitude, clamps in latitude -- the same convention SampleScalar
+// uses in weather.cu, so the two solvers agree at the seam.
+//
+// Manual rather than sampler-driven because this is a storage buffer, not a
+// texture: WebGPU has no filtering hardware for buffers. Four loads and a lerp
+// tree, which is exactly what the CUDA side does too.
+fn sampleDensity(fx : f32, fy : f32, w : u32, h : u32) -> f32 {
+  let wi = i32(w);
+  let hi = i32(h);
+
+  let x0 = i32(floor(fx));
+  let y0 = i32(floor(fy));
+  let tx = fx - floor(fx);
+  let ty = fy - floor(fy);
+
+  let xa = ((x0 % wi) + wi) % wi;
+  let xb = (((x0 + 1) % wi) + wi) % wi;
+  let ya = clamp(y0,     0, hi - 1);
+  let yb = clamp(y0 + 1, 0, hi - 1);
+
+  let s00 = densityIn[u32(ya) * w + u32(xa)];
+  let s10 = densityIn[u32(ya) * w + u32(xb)];
+  let s01 = densityIn[u32(yb) * w + u32(xa)];
+  let s11 = densityIn[u32(yb) * w + u32(xb)];
+
+  return mix(mix(s00, s10, tx), mix(s01, s11, tx), ty);
+}
+
+/* =================================================================== *
+ *  Coverage shaping -- the Coverage dial (CONTRACTS section 8)
+ * =================================================================== */
+
+// Threshold + gain. See the long-form rationale on gsShapeCoverage in
+// common.cuh; the short version is: cut slides from 0.72 (clear) to 0.06
+// (severe) and zeroes everything under it, what survives is rescaled back
+// across 0..1 so a surviving cell still reaches the upper reflectivity bands,
+// and a toe over the first sliver of the range keeps the cell boundary from
+// aliasing when the equirect field is magnified onto the globe.
+fn shapeCoverage(raw : f32, coverage : f32) -> f32 {
+  let c = clamp(coverage, 0.0, 1.0);
+  let d = clamp(raw, 0.0, 1.0);
+
+  let cut  = mix(kCoverageCutMax,  kCoverageCutMin,  c);
+  let gain = mix(kCoverageGainMin, kCoverageGainMax, c);
+
+  if (d <= cut) { return 0.0; }
+
+  let t = (d - cut) / max(1e-4, 1.0 - cut);
+  return clamp(t * gain * smoothstepf(0.0, 0.12, t), 0.0, 1.0);
+}
+
+// Cell mask + the dial. Ridged fBm on the sphere breaks the solver's
+// continuous density sheet into discrete systems with real gaps between them;
+// without it the threshold only shaves the sheet down uniformly and the result
+// is a thinner wash rather than the scattered cells the spec asks for.
+// Line-for-line the same as ShapeDensity() in weather.cu.
+fn shapeDensity(raw : f32, dir : vec3<f32>, t : f32, coverage : f32) -> f32 {
+  let q = vec3<f32>(dir.x * kCellScale, dir.y * kCellScale, dir.z * kCellScale + t * kCellDrift);
+  let ridged = 1.0 - abs(fbm3(q, 3, 0x5EC7u));
+
+  // Sharpen basin -> ridge so a cell boundary spans a few texels rather than a
+  // whole system width. The spec is explicit that the edges must be sharp.
+  let mask = smoothstepf(0.30, 0.78, ridged);
+
+  let carved = raw * (1.0 - kCellDepth + kCellDepth * mask);
+  return shapeCoverage(carved, coverage);
+}
+
+// Resolve the dial out of the uniform block, falling back to the protocol
+// default. A host that never wrote timing.z leaves a zero there, and zero means
+// "clear skies" -- which would blank the scene rather than showing the
+// documented scattered look.
+fn coverageDial() -> f32 {
+  let c = U.timing.z;
+  if (c > 0.0 && c <= 1.0) { return c; }
+  return kCoverageDefault;
+}
+
+/* =================================================================== *
  *  Pass 0 -- seed
  * =================================================================== */
 
@@ -430,15 +536,25 @@ fn seed(@builtin(global_invocation_id) gid : vec3<u32>) {
   let base = fbm3(td.dir * 3.2, 4, 0xD3A5u);
   var d = 0.34 + 0.34 * base;
   d = d + 0.20 * exp(-(td.lat * td.lat) / 0.03);   // equatorial convergence band
+  let raw = clamp(d, 0.0, 1.0);
 
   // Temperature baseline: cos^2 of latitude -- warm equator, cold poles.
   let cl = cos(td.lat);
   let temp = clamp(0.5 + 0.48 * cl * cl, 0.0, 1.0);
 
+  // Seed BOTH working slots, so whichever parity the first step reads from
+  // finds a valid source. The step pass only ever writes densityOut, so a
+  // single-slot seed would leave the other half of the ping-pong at zero and
+  // the first frame after the swap would show a blank hemisphere's worth of
+  // advected nothing. Same reasoning as the two-pass seed in weather.cu.
+  densityOut[linear] = raw;
+
+  // The published texture carries the SHAPED value from frame one, so the
+  // scene never flashes an unshaped green wash before the first step lands.
   textureStore(fieldOut, vec2<i32>(i32(x), i32(y)),
                vec4<f32>(wind.u * 0.5 + 0.5,
                          wind.v * 0.5 + 0.5,
-                         clamp(d, 0.0, 1.0),
+                         shapeDensity(raw, td.dir, U.timing.y, coverageDial()),
                          temp));
 }
 
@@ -481,12 +597,20 @@ fn step(@builtin(global_invocation_id) gid : vec3<u32>) {
   // full Rodrigues rotation.
   let back = safeNormalize(td.dir - stepVec * (kAdvectScale * dtSec));
 
-  // textureSampleLevel: no implicit derivatives exist in a compute shader, so
-  // the mip level is explicit. The sampler is configured repeat/clamp, which
-  // gives the longitude wrap and the latitude clamp for free.
+  // Temperature still rides the texture: textureSampleLevel gives the bilinear
+  // filter and the longitude wrap for free from the texture unit, and eight
+  // bits is plenty for a field that relaxes toward a smooth baseline anyway.
+  // (No implicit derivatives exist in a compute shader, so the mip level is
+  // explicit. The sampler is configured repeat/clamp.)
   let prev = textureSampleLevel(fieldIn, fieldSampler, dirToUv(back), 0.0);
-  var density = prev.b;
   var temp = prev.a;
+
+  // Density comes off the f32 working buffer instead. The texture's B channel
+  // holds the coverage-SHAPED value, which is a different quantity: feeding it
+  // back into the advection would threshold an already-thresholded field and
+  // the cuts would compound frame over frame.
+  let uvBack = dirToUv(back);
+  var density = sampleDensity(uvBack.x * f32(w) - 0.5, uvBack.y * f32(h) - 0.5, w, h);
 
   /* --- sources and sinks ----------------------------------------------- */
   // Vortex cores pump moisture in -- this is what draws the spiral arms.
@@ -513,12 +637,16 @@ fn step(@builtin(global_invocation_id) gid : vec3<u32>) {
   temp = clamp(temp, 0.0, 1.0);
 
   /* --- write ------------------------------------------------------------ */
+  // The working buffer keeps the RAW density -- that is what the next frame's
+  // backtrace reads. Only the published texture carries the shaped value.
+  densityOut[linear] = density;
+
   // rgba8unorm storage: the hardware does the 0..1 -> 0..255 quantisation, so
   // the snorm-biased wind components go out as (v * 0.5 + 0.5), matching
   // gsPackSnorm8 on the CUDA side exactly.
   textureStore(fieldOut, vec2<i32>(i32(x), i32(y)),
                vec4<f32>(wind.u * 0.5 + 0.5,
                          wind.v * 0.5 + 0.5,
-                         density,
+                         shapeDensity(density, td.dir, t, coverageDial()),
                          temp));
 }

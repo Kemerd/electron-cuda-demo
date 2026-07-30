@@ -888,6 +888,23 @@ input[type='range']:active::-webkit-slider-thumb { transform: scale(1.06); }
   font-variant-numeric: tabular-nums;
 }
 
+/* Endpoint captions under a range slider (Clear -> Severe on the Coverage
+   dial). Deliberately quieter than the label above the track: they are a scale
+   legend, not a second heading, and they should read as part of the slider. */
+.scene-control-scale {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: -1px;
+  font-size: var(--fs-micro);
+  letter-spacing: 0.05em;
+  color: var(--text-tertiary);
+  opacity: 0.72;
+  /* The captions sit under the thumb's travel; nothing here is interactive, so
+     let clicks fall through to whatever is behind the strip. */
+  pointer-events: none;
+}
+
 .scene-control-note {
   font-size: var(--fs-micro);
   line-height: 1.35;

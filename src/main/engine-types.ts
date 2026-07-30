@@ -152,7 +152,9 @@ export interface CudaEngine {
   /** Write the RGBA8 equirect weather field into `out`. */
   getWeatherField?(out: ArrayBuffer): WeatherFieldResult;
 
-  /** Hand the engine a decoded BGRA8/RGBA8 earth texture for globe shading. */
+  /** Hand the engine a decoded RGBA8 earth texture for globe shading. The
+   *  caller owns the BGRA->RGBA swizzle (nativeImage.toBitmap() is BGRA);
+   *  the kernel samples exactly the channel order it is given. */
   uploadEarthTexture?(rgba: ArrayBuffer, w: number, h: number): InitResult;
 
   /** Sim + rasterize a full frame into `out` (tightly packed RGBA8, w*h*4). */

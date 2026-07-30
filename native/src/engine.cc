@@ -279,6 +279,12 @@ Status Engine::Init() {
   host_input_.camQuat[3] = 1.0f;
   host_input_.fovYDeg = 50.0f;
   host_input_.aspect = 16.0f / 9.0f;
+  // Same reasoning for the appearance/weather knobs: the memset above leaves
+  // them at zero, and zero means "no points" and "clear skies" respectively -
+  // so a frame produced before the first setInput() would show an empty storm
+  // and a bare planet rather than the documented defaults.
+  host_input_.pointScale = 1.0f;
+  host_input_.weatherCoverage = GS_WEATHER_COVERAGE_DEFAULT;
   std::memcpy(h_input_pinned_, &host_input_, sizeof(InputUniforms));
   err = cudaMemcpy(d_input_, h_input_pinned_, sizeof(InputUniforms), cudaMemcpyHostToDevice);
   if (err != cudaSuccess) {
@@ -762,7 +768,8 @@ cudaError_t Engine::StepForView(float dtSec, cudaStream_t stream) {
     // frame, which is exactly the coherence the scene exists to show off.
     if (d_weather_ && weather_grid_ > 0) {
       err = LaunchWeatherStep(d_weather_, static_cast<int>(weather_grid_ * 2u),
-                              static_cast<int>(weather_grid_), host_input_.timeSec, d_input_,
+                              static_cast<int>(weather_grid_), host_input_.timeSec,
+                              host_input_.weatherCoverage, d_input_,
                               stream);
     }
     if (err == cudaSuccess && d_swarm_ && swarm_count_ > 0) {
@@ -856,7 +863,8 @@ StepResult Engine::Step(SceneId scene, double dtMs, void* out, size_t outBytes) 
   } else if (scene == SceneId::kWeather) {
     // Weather updates the field first, then moves the agents through it.
     err = LaunchWeatherStep(d_weather_, static_cast<int>(weather_grid_ * 2u),
-                            static_cast<int>(weather_grid_), host_input_.timeSec, d_input_,
+                            static_cast<int>(weather_grid_), host_input_.timeSec,
+                              host_input_.weatherCoverage, d_input_,
                             sim_stream_);
     if (err == cudaSuccess) {
       err = LaunchSwarmStep(d_swarm_, swarm_count_, dtSec, d_input_, sim_stream_);
@@ -1235,7 +1243,8 @@ RenderResult Engine::RenderFrame(SceneId scene, int w, int h, double dtMs,
   } else if (scene == SceneId::kWeather) {
     if (d_weather_ && weather_grid_) {
       err = LaunchWeatherStep(d_weather_, static_cast<int>(weather_grid_ * 2u),
-                              static_cast<int>(weather_grid_), host_input_.timeSec, d_input_,
+                              static_cast<int>(weather_grid_), host_input_.timeSec,
+                              host_input_.weatherCoverage, d_input_,
                               sim_stream_);
     }
     if (err == cudaSuccess && d_swarm_ && swarm_count_) {

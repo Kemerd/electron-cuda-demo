@@ -45,6 +45,7 @@ import {
   STORM_STRIDE_BYTES,
   MAX_TARGETS,
   MAX_SHOCKWAVES,
+  WEATHER_COVERAGE_DEFAULT,
 } from '../../shared/protocol';
 import type {
   ComputeBackend,
@@ -204,6 +205,16 @@ interface WeatherResources {
   /** Ping-pong field textures, rgba8unorm, w x h. */
   textures: [GPUTexture, GPUTexture];
   views: [GPUTextureView, GPUTextureView];
+  /**
+   * Ping-pong RAW density, f32, w*h. The published texture's B channel carries
+   * the COVERAGE-SHAPED density (that is what the radar, the volumetrics and
+   * the swarm all consume), so the advection cannot read it back: threshold on
+   * a field that was already thresholded compounds frame over frame and the
+   * planet goes dry. These buffers are the WGSL mirror of the float working
+   * pair in weather.cu, and they fix the 8-bit advection banding noted in the
+   * shader header as a side effect.
+   */
+  density: [GPUBuffer, GPUBuffer];
   parity: number;
   sampler: GPUSampler;
   uniform: GPUBuffer;
@@ -502,6 +513,11 @@ export class WebGpuDataSource implements DataSource {
           visibility: GPUShaderStage.COMPUTE,
           storageTexture: { access: 'write-only', format: 'rgba8unorm', viewDimension: '2d' },
         },
+        // Raw-density ping-pong. read-only-storage on the way in, storage on the
+        // way out -- see WeatherResources.density for why the advection cannot
+        // just read the published texture back.
+        { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
       ],
     });
     this.layouts.set('weather', weatherLayout);
@@ -752,6 +768,17 @@ export class WebGpuDataSource implements DataSource {
 
     const sampler = this.fieldSampler(ctx);
 
+    // Raw density working pair. One f32 per texel -- 33 MB at the ultra grid
+    // (4096x2048), which is the same order as the two rgba8 textures it sits
+    // beside and well inside maxStorageBufferBindingSize once the device
+    // creation raises it (see the device limits note in webgpu-device.ts).
+    const densityBytes = w * h * 4;
+    const densityUsage = GPUBufferUsage.STORAGE;
+    const density: [GPUBuffer, GPUBuffer] = [
+      device.createBuffer({ label: 'weather-density-0', size: densityBytes, usage: densityUsage }),
+      device.createBuffer({ label: 'weather-density-1', size: densityBytes, usage: densityUsage }),
+    ];
+
     const uniform = device.createBuffer({
       label: 'weather-uniform',
       size: WEATHER_UNIFORM_BYTES,
@@ -764,7 +791,10 @@ export class WebGpuDataSource implements DataSource {
     const makeGroup = (p: number): GPUBindGroup => {
       const inView = views[p];
       const outView = views[1 - p];
+      const inDensity = density[p];
+      const outDensity = density[1 - p];
       if (!inView || !outView) throw new Error('weather view missing');
+      if (!inDensity || !outDensity) throw new Error('weather density buffer missing');
       return device.createBindGroup({
         label: `weather-bg-${p}`,
         layout,
@@ -773,6 +803,8 @@ export class WebGpuDataSource implements DataSource {
           { binding: 1, resource: inView },
           { binding: 2, resource: sampler },
           { binding: 3, resource: outView },
+          { binding: 4, resource: { buffer: inDensity } },
+          { binding: 5, resource: { buffer: outDensity } },
         ],
       });
     };
@@ -788,6 +820,7 @@ export class WebGpuDataSource implements DataSource {
       h,
       textures,
       views,
+      density,
       parity: 0,
       sampler,
       uniform,
@@ -1198,8 +1231,13 @@ export class WebGpuDataSource implements DataSource {
     return buf;
   }
 
-  /** Pack the weather uniform block. */
-  private packWeatherUniforms(dtSec: number, timeSec: number): ArrayBuffer {
+  /**
+   * Pack the weather uniform block.
+   *
+   * @param coverage the Coverage dial, 0..1 -- rides timing.z and shapes the
+   *                 density the shader publishes (CONTRACTS section 8).
+   */
+  private packWeatherUniforms(dtSec: number, timeSec: number, coverage: number): ArrayBuffer {
     const w = this.weather;
     if (!w) return new ArrayBuffer(0);
 
@@ -1214,7 +1252,7 @@ export class WebGpuDataSource implements DataSource {
 
     f32[4] = dtSec;
     f32[5] = timeSec;
-    f32[6] = 0;
+    f32[6] = coverage;
     f32[7] = 0;
 
     return buf;
@@ -1543,7 +1581,21 @@ export class WebGpuDataSource implements DataSource {
     // decision, same 1/60, as LaunchWeatherStep on the CUDA side.
     const fixedDt = 1 / 60;
     const timeSec = isFiniteNumber(input?.timeSec) ? input.timeSec : 0;
-    ctx.device.queue.writeBuffer(w.uniform, 0, this.packWeatherUniforms(fixedDt, timeSec));
+
+    // Coverage is optional on InputState, so an unset dial resolves to the
+    // protocol default rather than to zero -- zero means "clear skies" and
+    // would blank the scene instead of showing the documented scattered look.
+    const rawCoverage = input?.weatherCoverage;
+    const coverage =
+      isFiniteNumber(rawCoverage) && rawCoverage >= 0 && rawCoverage <= 1
+        ? rawCoverage
+        : WEATHER_COVERAGE_DEFAULT;
+
+    ctx.device.queue.writeBuffer(
+      w.uniform,
+      0,
+      this.packWeatherUniforms(fixedDt, timeSec, coverage),
+    );
 
     // The field is up to 4096x2048 = 8.4M texels. At workgroup_size 64 that is
     // 131,072 workgroups, which exceeds maxComputeWorkgroupsPerDimension
@@ -1554,12 +1606,31 @@ export class WebGpuDataSource implements DataSource {
     const maxDim = ctx.limits.maxComputeWorkgroupsPerDimension;
     const gx = Math.min(totalGroups, maxDim);
 
-    const entry = w.seeded ? 'weather.step' : 'weather.seed';
-    const pass = encoder.beginComputePass({ label: w.seeded ? 'weather-step' : 'weather-seed' });
-    pass.setPipeline(this.requirePipeline(entry));
-    pass.setBindGroup(0, bg);
-    pass.dispatchWorkgroups(gx);
-    pass.end();
+    if (w.seeded) {
+      const pass = encoder.beginComputePass({ label: 'weather-step' });
+      pass.setPipeline(this.requirePipeline('weather.step'));
+      pass.setBindGroup(0, bg);
+      pass.dispatchWorkgroups(gx);
+      pass.end();
+    } else {
+      // Seed BOTH parities. The seed pass writes only the bind group's OUT
+      // slot, and the raw-density ping-pong means the other slot would still be
+      // a zero-filled buffer when the first step reads it -- an entire frame of
+      // advected nothing, visible as the field snapping in on frame two. The
+      // CUDA solver seeds both slots for exactly this reason
+      // (EnsureWeatherScratch runs WeatherSeedKernel twice); this is the same
+      // fix expressed as two dispatches against the two bind groups.
+      const seedPipeline = this.requirePipeline('weather.seed');
+      for (let p = 0; p < 2; p++) {
+        const seedGroup = w.bindGroups[p];
+        if (!seedGroup) continue;
+        const pass = encoder.beginComputePass({ label: `weather-seed-${p}` });
+        pass.setPipeline(seedPipeline);
+        pass.setBindGroup(0, seedGroup);
+        pass.dispatchWorkgroups(gx);
+        pass.end();
+      }
+    }
 
     if (!w.seeded) {
       w.seeded = true;
@@ -1859,6 +1930,8 @@ export class WebGpuDataSource implements DataSource {
     try {
       w.textures[0].destroy();
       w.textures[1].destroy();
+      w.density[0].destroy();
+      w.density[1].destroy();
       w.uniform.destroy();
     } catch (err) {
       console.warn('[webgpu-source] weather destroy threw: %s', errText(err));

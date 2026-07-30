@@ -37,6 +37,12 @@ import { IPC, SCENES } from '../shared/protocol.js';
 import type { OkResult, SceneId } from '../shared/protocol.js';
 import { getEngine } from './capabilities.js';
 import type { CudaEngine, NativeViewStats } from './engine-types.js';
+import {
+  applyClientRect as applyOverlayRect,
+  destroyOverlayWindow,
+  restoreOverlayWindow,
+  setOverlayParent,
+} from './overlay-window.js';
 
 /* ------------------------------------------------------------------ *
  *  Local types
@@ -240,6 +246,14 @@ function createView(win: BrowserWindow, rect: ViewRect): OkResult {
 
   created = true;
   lastRect = rect;
+
+  // The HUD overlay tracks the same rect in screen coordinates, so it learns
+  // about it here rather than over a second channel -- one measurement, one
+  // source, no way for the two windows to drift apart. Recording the parent at
+  // the same time means a later overlay:set already knows what to attach to.
+  setOverlayParent(win);
+  applyOverlayRect(rect);
+
   console.log(
     '[nview] child window created at %d,%d %dx%d css (dpr %s)',
     rect.x,
@@ -273,6 +287,12 @@ function setRect(rect: ViewRect): OkResult {
   }
 
   lastRect = rect;
+
+  // Keep the HUD overlay glued to the surface it annotates. Cheap: the overlay
+  // recomputes screen bounds and issues one setBounds, and it early-returns
+  // entirely when no overlay window exists (every non-native mode).
+  applyOverlayRect(rect);
+
   return { ok: true };
 }
 
@@ -422,6 +442,14 @@ function installWindowHooks(win: BrowserWindow): void {
   hookedWindows.add(win);
 
   win.on('minimize', () => {
+    // The overlay goes on EVERY minimize, not just the ones where the render
+    // thread was running: it is a top-level window in screen space, so a
+    // minimized parent would otherwise leave a HUD floating over the desktop.
+    // CONTRACTS section 6 names minimize explicitly as a destroy trigger.
+    // Idempotent, and overlay-window.ts hooks the same event itself -- this is
+    // the ordering guarantee, so the HUD is gone before the view it annotates.
+    destroyOverlayWindow();
+
     if (!running) return;
     console.log('[nview] window minimized -- pausing the native view');
     setVisible(false);
@@ -435,7 +463,16 @@ function installWindowHooks(win: BrowserWindow): void {
     console.log('[nview] window restored -- resuming the native view');
     if (lastRect) setRect(lastRect);
     setVisible(true);
-    start(startedScene, startedVsync);
+    const resumed = start(startedScene, startedVsync);
+
+    // Bring the HUD back with the surface it annotates.
+    //
+    // Minimize DESTROYS the overlay rather than hiding it (CONTRACTS section 6),
+    // so there is nothing to un-hide here -- it has to be built again. Gated on
+    // the restart actually succeeding: a failed start leaves the native surface
+    // down, and a HUD floating over a dead rect reporting a frozen fps is worse
+    // than no HUD at all.
+    if (resumed.ok) restoreOverlayWindow(win);
   });
 
   // A closing window takes its HWND with it. Anything still holding that handle
@@ -606,6 +643,12 @@ export function probeNativeViewSupport(): { ok: boolean; reason?: string } {
  * honest.
  */
 export function shutdownNativeView(): void {
+  // The HUD goes first. It is a window floating over the native surface, and
+  // tearing the surface down underneath it would leave the overlay briefly
+  // composited over whatever Chromium paints next -- and if the teardown throws
+  // below, an overlay destroyed here is still an overlay that did not orphan.
+  destroyOverlayWindow();
+
   try {
     if (created) setVisible(false);
     stop();

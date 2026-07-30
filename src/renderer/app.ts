@@ -52,6 +52,7 @@ import {
   DEFAULT_PRESET,
   MAX_TARGETS,
   MAX_SHOCKWAVES,
+  WEATHER_COVERAGE_DEFAULT,
   isLegalMode,
 } from '../shared/protocol';
 import type {
@@ -59,6 +60,7 @@ import type {
   ComputeBackend,
   InputState,
   ModeState,
+  PresetId,
   SceneId,
 } from '../shared/protocol';
 
@@ -80,6 +82,7 @@ import { createCudaBlit } from './present/cuda-blit';
 import type { CudaBlitApi } from './present/cuda-blit';
 import { createNativeView } from './present/native-view';
 import type { NativeViewApi } from './present/native-view';
+import type { OverlayInputEvent } from '../main/overlay-types';
 import type { CudaSourceApi, RgbaFrame } from './cuda-source';
 
 import { createSidebar } from './ui/sidebar';
@@ -214,7 +217,18 @@ const inputState: InputState & { pointScale: number } = {
   },
   timeSec: 0,
   pointScale: 1,
+  // Coverage starts at the protocol default rather than at zero. Zero means
+  // "clear skies", so an unset dial would boot the weather scene onto a bare
+  // planet and read as a broken sim rather than as a knob nobody touched.
+  weatherCoverage: WEATHER_COVERAGE_DEFAULT,
 };
+
+/**
+ * Live Coverage dial value (CONTRACTS section 8). Mirrored into inputState on
+ * every change; kept as its own variable so a scene remount can restore the
+ * slider to what the user chose rather than snapping back to the default.
+ */
+let weatherCoverage = WEATHER_COVERAGE_DEFAULT;
 
 /**
  * Shared per-frame state handed to scene.frame(). Mutated in place, never
@@ -1219,6 +1233,12 @@ function ensureNativeView(): NativeViewApi | null {
     // from here rather than from the reservation above.
     onActiveChange: (active) => {
       if (!active) applyNativeStats(null);
+
+      // The HUD overlay window follows the SURFACE, not the mode. This is the
+      // only callback that fires on real transitions in both directions, which
+      // is exactly what its lifecycle needs: created when the render thread is
+      // confirmed up, destroyed the moment it goes down (CONTRACTS section 6).
+      syncOverlayWindow();
     },
     onStats: applyNativeStats,
   });
@@ -1346,6 +1366,103 @@ function syncNativeView(): void {
 }
 
 /* ------------------------------------------------------------------ *
+ *  HUD overlay window (CONTRACTS section 6)
+ *
+ *  In the native present modes the picture comes out of a Win32 child HWND
+ *  that Chromium neither composites nor can draw over -- so the in-page HUD is
+ *  invisible in exactly the modes whose numbers are most worth reading. The
+ *  fix is a second, transparent BrowserWindow tracking the native rect, owned
+ *  by main (src/main/overlay-window.ts) and driven from here.
+ *
+ *  This side owns two things and nothing else: WHEN the window should exist
+ *  (only the mode router knows a native mode is genuinely engaged and started),
+ *  and hiding the in-page card while it does. The contract is explicit that the
+ *  two must never show at once.
+ * ------------------------------------------------------------------ */
+
+/** True while the window overlay is up, so a repeat sync is a no-op. */
+let overlayWindowActive = false;
+
+/** The preload's overlay surface, or null when the bridge predates it. */
+function overlayBridge(): NonNullable<Window['geoswarm']>['overlay'] | null {
+  const bridge = window.geoswarm;
+  if (!bridge || !bridge.overlay || typeof bridge.overlay.setActive !== 'function') return null;
+  return bridge.overlay;
+}
+
+/** Title/description for the mounted scene, as the HUD chip shows them. */
+function currentSceneInfo(): { scene: string; title: string; subtitle: string } {
+  const entry = SCENE_REGISTRY[activeSceneId];
+  return {
+    scene: activeEngineScene(),
+    title: entry?.title ?? 'GeoSwarm',
+    subtitle: entry?.subtitle ?? '',
+  };
+}
+
+/**
+ * Show or hide the in-page perf card and title.
+ *
+ * visibility rather than display: the card's layout box is what the
+ * .native-present gutter is sized around, and collapsing it would let the
+ * reserved rect expand under a window overlay that is still sized to the old
+ * box -- a one-frame mismatch on every mode toggle. Hidden-but-laid-out keeps
+ * the geometry stable while guaranteeing only one HUD is legible at a time.
+ *
+ * @param hidden true while the window overlay owns the HUD
+ */
+function setInPageHudHidden(hidden: boolean): void {
+  const card = document.getElementById('fps-overlay');
+  if (card) card.style.visibility = hidden ? 'hidden' : '';
+
+  // The stage topbar carries the same title/description the overlay chip does.
+  // Leaving it visible would show the scene name twice, once through the glass
+  // of a window that is drawing its own copy a few hundred pixels away.
+  const topbar = document.querySelector<HTMLElement>('.stage-topbar');
+  if (topbar) topbar.style.visibility = hidden ? 'hidden' : '';
+}
+
+/**
+ * Bring the HUD overlay window up or down for the current state.
+ *
+ * Driven off the native view's REAL state rather than the mode alone: a native
+ * mode whose render thread failed to start shows the composite fallback, and
+ * putting a HUD over it would annotate a surface that is not there.
+ */
+function syncOverlayWindow(): void {
+  const api = overlayBridge();
+  if (!api) return;
+
+  // isRunning(), not isNativePresentMode(): intent is not evidence. The
+  // controller only reports true once main confirmed both the child window and
+  // the render thread, which is the same signal the fps readout trusts.
+  const wanted = isNativePresentMode() && nativeView !== null && nativeView.isRunning();
+
+  if (wanted === overlayWindowActive) {
+    // Already in the right state, but a scene change while it is up still has
+    // to reach the title chip.
+    if (wanted && typeof api.setScene === 'function') api.setScene(currentSceneInfo());
+    return;
+  }
+
+  overlayWindowActive = wanted;
+
+  try {
+    api.setActive(wanted, wanted ? currentSceneInfo() : null);
+  } catch (err) {
+    console.warn('[app] overlay window sync failed: %s', errText(err));
+    overlayWindowActive = false;
+    return;
+  }
+
+  // Only ever hidden while the replacement is genuinely up -- never both, and
+  // never neither.
+  setInPageHudHidden(wanted);
+
+  console.log(`[app] HUD overlay window ${wanted ? 'active' : 'dismissed'}`);
+}
+
+/* ------------------------------------------------------------------ *
  *  Scene lifecycle
  * ------------------------------------------------------------------ */
 
@@ -1439,6 +1556,11 @@ async function mountScene(id: string): Promise<void> {
   // down and back up around it rather than splatting a freed buffer.
   syncNativeView();
 
+  // Repaint the overlay window's title chip for the scene that just mounted.
+  // syncOverlayWindow() pushes the metadata when the window is already up and
+  // is a no-op otherwise, so this covers both directions.
+  syncOverlayWindow();
+
   // Point the compute backend at whatever this scene needs. Non-fatal either
   // way: a scene renders its own geometry regardless of whether any records
   // ever arrive.
@@ -1482,6 +1604,33 @@ function mountSceneControls(id: string): void {
         },
       },
     });
+  } else if (id === 'weather') {
+    // The weather scene has no count of its own -- its size is the fidelity
+    // panel's weatherGrid -- but it does own the Coverage dial, which is a
+    // uniform and therefore lives on exactly the same "appearance slider"
+    // discipline as the storm's point size: commit on input, no reallocation.
+    sceneControls = createSceneControls(
+      {},
+      {
+        coverage: {
+          label: 'Coverage',
+          min: 0,
+          max: 1,
+          value: weatherCoverage,
+          endpoints: ['Clear', 'Severe'],
+          // A percentage reads as a dial position; "0.35x" reads as a
+          // multiplier of something, and there is no something.
+          format: (v) => `${Math.round(v * 100)}%`,
+          onInput: (value) => {
+            weatherCoverage = Math.min(1, Math.max(0, value));
+            // Straight into the shared InputState -- every backend picks it up
+            // on its next frame with no reconfiguration at all. That IS the
+            // "live on input, uniform only" requirement.
+            inputState.weatherCoverage = weatherCoverage;
+          },
+        },
+      },
+    );
   } else if (id === 'storm') {
     sceneControls = createSceneControls(
       {
@@ -1499,15 +1648,21 @@ function mountSceneControls(id: string): void {
       {
         // Point size is a uniform, not an allocation -- it applies live and
         // never touches configureScene.
+        //
+        // The slider carries the ABSOLUTE multiplier while the state behind it
+        // is baseline x adjustment (see rebaselineStormPointScale). Storing the
+        // adjustment on every input is what lets a later preset click move the
+        // baseline underneath and keep the user's relative intent.
         size: {
           label: 'Particle size',
-          min: 0.5,
-          max: 4,
+          min: STORM_SIZE_MIN,
+          max: STORM_SIZE_MAX,
           value: stormPointScale,
           precision: 2,
           suffix: 'x',
           onInput: (value) => {
             stormPointScale = value;
+            stormPointAdjust = stormPointBaseline > 0 ? value / stormPointBaseline : 1;
             applyStormPointScale();
           },
         },
@@ -1519,10 +1674,96 @@ function mountSceneControls(id: string): void {
 }
 
 /**
- * Current storm point-size multiplier. Lives here rather than in the scene so
- * it survives a remount and can be re-applied to a freshly mounted scene.
+ * Push the current fidelity params and appearance baselines back into whatever
+ * control strip is mounted.
+ *
+ * This is the second half of the CONTRACTS section 8 preset rule. Reconfiguring
+ * the backend is the easy half; the half that used to be missing is that the
+ * VISIBLE controls have to agree with what just happened. A preset switch that
+ * leaves a slider showing a stale number is called out in the spec as a defect,
+ * and it was a real one -- clicking Low with the storm scene open reallocated to
+ * 50k particles while the slider still read "4.00M" and the size slider still
+ * showed the Ultra grain.
+ *
+ * Safe to call when no strip is mounted, and safe to call for keys the mounted
+ * strip does not have: setCount/setRange both no-op on an unknown key, so this
+ * one function serves every scene without knowing which is up.
  */
-let stormPointScale = 1;
+function resyncSceneControls(): void {
+  if (!sceneControls) return;
+
+  sceneControls.setCount('swarm', sceneParams.swarmCount);
+  sceneControls.setCount('storm', sceneParams.stormCount);
+  sceneControls.setRange('size', stormPointScale);
+  sceneControls.setRange('coverage', weatherCoverage);
+}
+
+/* ------------------------------------------------------------------ *
+ *  Preset-driven appearance state (CONTRACTS section 8, the "one knob" rule)
+ *
+ *  A preset change moves everything: counts reconfigure through the active
+ *  DataSource, every per-scene slider and value chip resyncs, and the storm
+ *  point-size baseline snaps to PRESETS[id].stormPointScale. The size slider
+ *  then adjusts FROM that baseline and re-baselines on the next preset change.
+ *
+ *  That last part is why there are two numbers rather than one. Keeping only
+ *  the absolute size would mean a preset change either throws away the user's
+ *  adjustment (annoying) or ignores the preset's baseline (wrong -- 4M
+ *  particles at the Low preset's 2.0x is a solid wall of white). Keeping the
+ *  baseline and a multiplier separately lets a preset click re-anchor the
+ *  scale while the user's "a bit bigger than default" intent survives it.
+ * ------------------------------------------------------------------ */
+
+/**
+ * The active preset's stormPointScale, or the default preset's when the picker
+ * has gone off-preset (a raw Advanced slider) and there is no preset to read.
+ */
+// Annotated `number`, not inferred: PRESETS is a frozen literal, so the
+// initializer's type is the narrow union of the four declared stormPointScale
+// values and every later assignment outside that set would be a type error.
+let stormPointBaseline: number = PRESETS[DEFAULT_PRESET].stormPointScale;
+
+/**
+ * User adjustment relative to the baseline, 1 = "exactly the preset default".
+ * Preserved across preset changes; the absolute size is always the product.
+ */
+let stormPointAdjust = 1;
+
+/**
+ * Current storm point-size multiplier -- the absolute value the scene and the
+ * CUDA splat consume. Lives here rather than in the scene so it survives a
+ * remount and can be re-applied to a freshly mounted scene.
+ */
+let stormPointScale: number = stormPointBaseline;
+
+/** Slider travel for the storm size control, absolute multiplier. */
+const STORM_SIZE_MIN = 0.25;
+const STORM_SIZE_MAX = 5;
+
+/**
+ * Recompute the absolute point size from the baseline and the user adjustment,
+ * clamped into the slider's own range so the control and the scene can never
+ * disagree about what is being drawn.
+ */
+function resolveStormPointScale(): number {
+  const raw = stormPointBaseline * stormPointAdjust;
+  if (!Number.isFinite(raw)) return stormPointBaseline;
+  return Math.min(STORM_SIZE_MAX, Math.max(STORM_SIZE_MIN, raw));
+}
+
+/**
+ * Snap the point-size baseline to a preset and rebuild the absolute size.
+ *
+ * Called on every preset change, including the ones that arrive through the
+ * Advanced sliders (where presetKey is null and the baseline holds still --
+ * moving a raw count is not a fidelity decision about grain size).
+ */
+function rebaselineStormPointScale(presetKey: PresetId | null): void {
+  if (presetKey && PRESETS[presetKey]) {
+    stormPointBaseline = PRESETS[presetKey].stormPointScale;
+  }
+  stormPointScale = resolveStormPointScale();
+}
 
 /**
  * Push the point-size multiplier into the active scene, if it accepts one.
@@ -1775,6 +2016,220 @@ function installPointerHandlers(): void {
 
   // The right mouse button is an interaction mode here, not a context menu.
   host.addEventListener('contextmenu', (e) => e.preventDefault());
+}
+
+/* ------------------------------------------------------------------ *
+ *  HUD overlay input relay (CONTRACTS section 6)
+ *
+ *  In the native present modes the D3D11 child HWND sits over the stage and the
+ *  HUD overlay window sits over THAT, so every pointer event the user aims at
+ *  the scene lands in a different OS window entirely. This page never sees
+ *  them, and without a relay orbit/pan/zoom/click-targets would simply be dead
+ *  in modes 6/7 -- which the contract forbids in those words.
+ *
+ *  The design decision that keeps this small: the relayed events are REPLAYED
+ *  as synthetic DOM events on the scene's own canvas, rather than being
+ *  translated into camera commands here. That matters more than it looks.
+ *  OrbitControls, the click-vs-drag discrimination, the rally-target raycast
+ *  and the storm force modes are all already wired to that canvas by
+ *  globe-controls.ts and installPointerHandlers() above. Re-implementing any of
+ *  that against a second input path is how the two present modes end up feeling
+ *  subtly different -- and CONTRACTS section 8 requires them to be
+ *  indistinguishable, because the side-by-side comparison depends on it.
+ *
+ *  So: one coordinate transform, one dispatch, and every existing consumer
+ *  behaves exactly as it does when the mouse is really over the page.
+ * ------------------------------------------------------------------ */
+
+/** Unhook for the relay subscription, so a re-install cannot stack listeners. */
+let overlayInputUnsub: (() => void) | null = null;
+
+/**
+ * The element relayed events are replayed on.
+ *
+ * The scene's canvas, not #stage-surface: globe-controls.ts binds OrbitControls
+ * and the click raycast directly to `renderer.domElement`, and an event
+ * dispatched on an ancestor does not reach a listener bound to a descendant.
+ * Dispatching on the canvas gets both -- the rig's own listeners fire, and the
+ * event then BUBBLES to #stage-surface where app.ts's pointer handlers pick up
+ * the storm force state. One dispatch, every consumer.
+ */
+function relayTarget(): HTMLElement | null {
+  const host = document.getElementById('stage-surface');
+  if (!host) return null;
+  return host.querySelector<HTMLElement>('.scene-canvas') ?? host;
+}
+
+/**
+ * Map a normalized overlay coordinate onto real client coordinates.
+ *
+ * The overlay sends fractions of the NATIVE RECT, and the native rect is the
+ * reserved slot inside this page -- so the slot's own box is the correct thing
+ * to map back through. Using the stage box instead would be wrong by exactly
+ * the gutter width in native modes, which is where the HUD card sits: a drag
+ * near the right edge of the surface would land well past it, and the camera
+ * would move further than the hand did.
+ *
+ * @param out receives clientX/clientY
+ * @returns false when nothing usable could be measured
+ */
+function overlayToClient(
+  nx: number,
+  ny: number,
+  out: { x: number; y: number },
+): boolean {
+  const slot = document.getElementById('native-view-slot');
+  const box = slot && slot.isConnected ? slot.getBoundingClientRect() : null;
+
+  // The slot is display:none outside native modes, which reports a zero box.
+  // Falling back to the stage keeps a stray late event from producing NaN.
+  const rect =
+    box && box.width > 0 && box.height > 0
+      ? box
+      : (document.getElementById('stage-surface')?.getBoundingClientRect() ?? null);
+
+  if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+
+  out.x = rect.left + nx * rect.width;
+  out.y = rect.top + ny * rect.height;
+  return true;
+}
+
+/** Scratch for the coordinate transform; reused so a drag allocates nothing. */
+const relayPoint = { x: 0, y: 0 };
+
+/**
+ * Replay one relayed event on the scene canvas.
+ *
+ * Synthetic events are constructed with the real DOM constructors and
+ * `bubbles: true`, so they are indistinguishable from user input to every
+ * listener downstream -- which is the entire point. `isTrusted` is false, but
+ * nothing in this codebase reads it (and OrbitControls does not either).
+ */
+function applyRelayedInput(event: OverlayInputEvent): void {
+  if (!event || typeof event !== 'object') return;
+
+  // A relayed event arriving after the mode changed would move a camera the
+  // user is no longer driving through the overlay. Cheap guard, and it closes
+  // the window between main destroying the overlay and the last event in
+  // flight landing here.
+  if (!isNativePresentMode()) return;
+
+  const target = relayTarget();
+  if (!target) return;
+
+  const kind = event.kind;
+
+  // ---- keys: storm force modes --------------------------------------
+  // Dispatched on window, which is where the storm scene listens for them
+  // (a canvas that never has focus would never receive a keydown).
+  if (kind === 'key') {
+    if (event.key !== '1' && event.key !== '2' && event.key !== '3') return;
+    try {
+      window.dispatchEvent(
+        new KeyboardEvent('keydown', { key: event.key, bubbles: true, cancelable: true }),
+      );
+    } catch (err) {
+      console.warn('[app] relayed key dispatch failed: %s', errText(err));
+    }
+    return;
+  }
+
+  const nx = isFiniteNumber(event.nx) ? event.nx : null;
+  const ny = isFiniteNumber(event.ny) ? event.ny : null;
+  if (nx === null || ny === null) return;
+  if (!overlayToClient(nx, ny, relayPoint)) return;
+
+  // ---- wheel: zoom ---------------------------------------------------
+  if (kind === 'wheel') {
+    try {
+      target.dispatchEvent(
+        new WheelEvent('wheel', {
+          clientX: relayPoint.x,
+          clientY: relayPoint.y,
+          deltaX: isFiniteNumber(event.deltaX) ? event.deltaX : 0,
+          deltaY: isFiniteNumber(event.deltaY) ? event.deltaY : 0,
+          deltaMode: isFiniteNumber(event.deltaMode) ? event.deltaMode : 0,
+          ctrlKey: event.ctrlKey === true,
+          shiftKey: event.shiftKey === true,
+          altKey: event.altKey === true,
+          metaKey: event.metaKey === true,
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+    } catch (err) {
+      console.warn('[app] relayed wheel dispatch failed: %s', errText(err));
+    }
+    return;
+  }
+
+  // ---- pointers: orbit / pan / click ---------------------------------
+  const type =
+    kind === 'down'
+      ? 'pointerdown'
+      : kind === 'move'
+        ? 'pointermove'
+        : kind === 'up'
+          ? 'pointerup'
+          : 'pointercancel';
+
+  // buttons must be honest on a move: OrbitControls decides whether a drag is
+  // an orbit or a pan from the button that started it, and a move reporting no
+  // buttons held reads as the gesture having ended.
+  const button = isFiniteNumber(event.button) ? event.button : 0;
+  const buttons = isFiniteNumber(event.buttons) ? event.buttons : 0;
+
+  try {
+    target.dispatchEvent(
+      new PointerEvent(type, {
+        // A stable synthetic id keeps the whole gesture looking like one
+        // pointer to anything tracking pointerId across down/move/up.
+        pointerId: isFiniteNumber(event.pointerId) ? event.pointerId : 1,
+        pointerType: 'mouse',
+        isPrimary: true,
+        clientX: relayPoint.x,
+        clientY: relayPoint.y,
+        button,
+        buttons,
+        ctrlKey: event.ctrlKey === true,
+        shiftKey: event.shiftKey === true,
+        altKey: event.altKey === true,
+        metaKey: event.metaKey === true,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+  } catch (err) {
+    console.warn('[app] relayed pointer dispatch failed: %s', errText(err));
+  }
+}
+
+/**
+ * Subscribe to input relayed from the HUD overlay window.
+ *
+ * Installed once during boot and never torn down: the subscription is a single
+ * callback on the preload's listener array, and the guard inside
+ * applyRelayedInput() is what makes it inert outside the native modes.
+ */
+function installOverlayInputRelay(): void {
+  if (overlayInputUnsub) return;
+
+  const api = overlayBridge();
+  if (!api || typeof api.onInput !== 'function') {
+    // An older preload without the relay: the native modes still work, the
+    // camera just cannot be driven over the surface. Worth one line, not a chip.
+    console.warn('[app] preload has no overlay input relay; camera input over the native surface will not work');
+    return;
+  }
+
+  overlayInputUnsub = api.onInput((event) => {
+    try {
+      applyRelayedInput(event);
+    } catch (err) {
+      console.warn('[app] relayed input failed: %s', errText(err));
+    }
+  });
 }
 
 /* ------------------------------------------------------------------ *
@@ -2129,8 +2584,23 @@ async function boot(): Promise<void> {
     // Ultra is the documented default, but it is tuned for a very large GPU.
     // Phase 1 proves the transport, so start at Low and let the user climb.
     initial: caps.cuda.ok ? 'low' : DEFAULT_PRESET,
-    onChange: (params) => {
+    onChange: (params, presetKey) => {
       sceneParams = params;
+
+      // ONE knob moves everything (CONTRACTS section 8). The three effects are
+      // deliberately ordered: baseline first (so the resync below has the new
+      // number to publish), then the visible controls, then the backend.
+      //
+      // Doing the resync before ensureSource matters more than it looks. The
+      // configure round trip is async and can be refused (the VRAM guard) or
+      // capped (the CPU baseline), and BOTH of those paths write the strip
+      // themselves afterwards -- updateControlNote snaps the count slider to
+      // what is really running. Painting the requested values first and letting
+      // the outcome correct them keeps the control honest at every instant
+      // rather than only at the end.
+      rebaselineStormPointScale(presetKey);
+      applyStormPointScale();
+      resyncSceneControls();
 
       // Reconfigure whichever backend is live. It reallocates for the new counts
       // and does not remount the scene, because geometry sizes are a backend
@@ -2139,6 +2609,12 @@ async function boot(): Promise<void> {
     },
   });
   sceneParams = ui.presets.getParams();
+
+  // Seed the point-size baseline from whatever preset the picker actually
+  // started on. Without this the first storm mount would draw at the Ultra
+  // baseline while the panel showed Low -- the same stale-number defect, just
+  // one frame earlier than a preset click would produce it.
+  rebaselineStormPointScale(ui.presets.getPreset());
 
   ui.sidebar = createSidebar({
     initial: 'globe',
@@ -2166,6 +2642,11 @@ async function boot(): Promise<void> {
   }
 
   installPointerHandlers();
+
+  // The HUD overlay window's input relay. Installed before any scene exists so
+  // the very first native-mode entry already has it armed -- the subscription
+  // is inert until a relayed event actually arrives.
+  installOverlayInputRelay();
 
   // Build the native-view controller before the first scene mounts, so a boot
   // that starts in a native mode (it cannot today, but a persisted mode would)
@@ -2207,6 +2688,20 @@ async function boot(): Promise<void> {
     // it is in a native mode, and no code path left alive to stop it.
     if (nativeView) nativeView.dispose();
     nativeView = null;
+
+    // Same reasoning for the HUD overlay: it is a real BrowserWindow owned by
+    // main, so a renderer reload would otherwise leave it floating over a page
+    // that no longer knows it exists -- an orphaned overlay window, which
+    // CONTRACTS section 6 calls a defect in those words.
+    const overlay = overlayBridge();
+    if (overlay) {
+      try {
+        overlay.setActive(false, null);
+      } catch {
+        /* teardown on unload is best-effort by definition */
+      }
+    }
+    overlayWindowActive = false;
   });
 
   startFrameLoop();

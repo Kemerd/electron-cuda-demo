@@ -40,6 +40,7 @@ import {
   MAX_TARGETS,
   MAX_SHOCKWAVES,
   SCENES,
+  WEATHER_COVERAGE_DEFAULT,
 } from '../../shared/protocol';
 import type { InputState, SceneId, SceneParams } from '../../shared/protocol';
 
@@ -332,12 +333,94 @@ const ADVECT_SCALE = 0.1;
 const JET_LAT = 0.6981317;
 const JET_WIDTH = 0.2617994;
 
+/* ------------------------------------------------------------------ *
+ *  Coverage shaping (CONTRACTS section 8)
+ *
+ *  Mirrored from native/src/kernels/common.cuh (gsShapeCoverage) and
+ *  weather.cu (ShapeDensity). The dial has to shape density identically in
+ *  every backend or the three paths stop being comparable, so these numbers
+ *  are copies, not independent tuning.
+ * ------------------------------------------------------------------ */
+
+const COVERAGE_CUT_MIN = 0.06;
+const COVERAGE_CUT_MAX = 0.72;
+const COVERAGE_GAIN_MIN = 2.35;
+const COVERAGE_GAIN_MAX = 1.18;
+const CELL_SCALE = 4.6;
+const CELL_DEPTH = 0.85;
+const CELL_DRIFT = 0.017;
+
+/** Smoothstep, matching the GLSL definition the other two backends use. */
+function smoothstepf(e0: number, e1: number, x: number): number {
+  const d = e1 - e0;
+  if (Math.abs(d) < 1e-20) return x < e0 ? 0 : 1;
+  const t = Math.min(1, Math.max(0, (x - e0) / d));
+  return t * t * (3 - 2 * t);
+}
+
+/**
+ * Threshold + gain on a raw density value.
+ *
+ * The cut slides from 0.72 (clear) down to 0.06 (severe) and zeroes everything
+ * beneath it, which is what produces large fully-clear regions and sharp cell
+ * edges. What survives is rescaled back across 0..1 so a cell that only just
+ * cleared a high cut still reaches the upper reflectivity bands -- without
+ * that, turning coverage DOWN would also turn every remaining storm green and
+ * the dial would read as a brightness knob. The toe over the first sliver of
+ * the surviving range keeps the boundary from aliasing under magnification.
+ */
+function shapeCoverage(raw: number, coverage: number): number {
+  const c = Number.isFinite(coverage) ? Math.min(1, Math.max(0, coverage)) : WEATHER_COVERAGE_DEFAULT;
+  const d = Number.isFinite(raw) ? Math.min(1, Math.max(0, raw)) : 0;
+
+  const cut = COVERAGE_CUT_MAX + (COVERAGE_CUT_MIN - COVERAGE_CUT_MAX) * c;
+  const gain = COVERAGE_GAIN_MIN + (COVERAGE_GAIN_MAX - COVERAGE_GAIN_MIN) * c;
+
+  if (d <= cut) return 0;
+
+  const t = (d - cut) / Math.max(1e-4, 1 - cut);
+  return Math.min(1, Math.max(0, t * gain * smoothstepf(0, 0.12, t)));
+}
+
+/**
+ * Cell mask + the dial -- the full shaping the packed field publishes.
+ *
+ * The ridged-noise mask breaks the solver's continuous density sheet into
+ * discrete systems with real gaps between them. Without it the coverage
+ * threshold only shaves the sheet down uniformly and the result is a thinner
+ * wash rather than the scattered cells the spec describes.
+ *
+ * @param px,py,pz unit direction on the sphere for this texel
+ * @param t        worker clock, drives the slow mask drift
+ */
+function shapeDensity(
+  raw: number,
+  px: number,
+  py: number,
+  pz: number,
+  t: number,
+  coverage: number,
+): number {
+  const ridged = 1 - Math.abs(noise3(px * CELL_SCALE, py * CELL_SCALE, pz * CELL_SCALE + t * CELL_DRIFT, 0x5ec7));
+  const mask = smoothstepf(0.3, 0.78, ridged);
+  const carved = raw * (1 - CELL_DEPTH + CELL_DEPTH * mask);
+  return shapeCoverage(carved, coverage);
+}
+
 /** Shared scratch. Allocated once; the step path never allocates. */
 const curlOut = new Float32Array(3);
 const windOut = new Float32Array(3); // u, v, density
 
 /** Monotonic worker clock, seconds. Driven by the host's dt. */
 let clockSec = 0;
+
+/**
+ * Live Coverage dial (InputState.weatherCoverage). Held here rather than
+ * threaded through every call site because both consumers -- packField() and
+ * the swarm's sampleWind() -- are deep inside per-texel/per-agent loops where
+ * an extra argument buys nothing. Refreshed once per step() from the input.
+ */
+let weatherCoverage: number = WEATHER_COVERAGE_DEFAULT;
 
 /* ------------------------------------------------------------------ *
  *  Seeding
@@ -687,7 +770,13 @@ function sampleWind(dx: number, dy: number, dz: number, out: Float32Array): void
   const d11 = den[yb * w + xb] ?? 0;
   const dTop = d00 + (d10 - d00) * tx;
   const dBot = d01 + (d11 - d01) * tx;
-  out[2] = dTop + (dBot - dTop) * ty;
+
+  // Shaped, not raw. The buffer holds the unshaped field (the advection reads
+  // it back and a thresholded input would compound), but what the swarm is
+  // supposed to feel is the weather the radar SHOWS -- so the same shaping the
+  // packed field publishes is applied at the sample point. Without this the
+  // agents would push through storms that had been cleared away on screen.
+  out[2] = shapeDensity(dTop + (dBot - dTop) * ty, dx, dy, dz, clockSec, weatherCoverage);
 }
 
 /**
@@ -887,12 +976,21 @@ function packField(): void {
       const idx = y * w + x;
       const o = idx * FIELD_CHANNELS;
 
-      windAt(cosLat * Math.sin(lon), Math.sin(lat), cosLat * Math.cos(lon), windOut);
+      const px = cosLat * Math.sin(lon);
+      const py = Math.sin(lat);
+      const pz = cosLat * Math.cos(lon);
+
+      windAt(px, py, pz, windOut);
+
+      // Coverage shaping happens HERE, on the way out, never in the working
+      // buffer -- the advection reads that buffer back and a thresholded input
+      // would compound frame over frame. See shapeDensity().
+      const shaped = shapeDensity(den[idx] ?? 0, px, py, pz, clockSec, weatherCoverage);
 
       // R/G carry u/v as snorm8; B density; A temperature (protocol.ts).
       out[o] = Math.min(255, Math.max(0, ((windOut[0] ?? 0) * 0.5 + 0.5) * 255 + 0.5)) | 0;
       out[o + 1] = Math.min(255, Math.max(0, ((windOut[1] ?? 0) * 0.5 + 0.5) * 255 + 0.5)) | 0;
-      out[o + 2] = Math.min(255, Math.max(0, (den[idx] ?? 0) * 255 + 0.5)) | 0;
+      out[o + 2] = Math.min(255, Math.max(0, shaped * 255 + 0.5)) | 0;
       out[o + 3] = Math.min(255, Math.max(0, (tf[idx] ?? 0) * 255 + 0.5)) | 0;
     }
   }
@@ -1460,6 +1558,18 @@ function step(cmd: StepCmd): void {
   clockSec += dt;
 
   const input = cmd.input;
+
+  // Refresh the Coverage dial once per step. Optional on InputState, so an
+  // unset value resolves to the protocol default rather than to zero -- zero
+  // means "clear skies" and would blank the scene instead of showing the
+  // documented scattered look.
+  const rawCoverage = input ? input.weatherCoverage : undefined;
+  weatherCoverage =
+    typeof rawCoverage === 'number' && Number.isFinite(rawCoverage) &&
+    rawCoverage >= 0 && rawCoverage <= 1
+      ? rawCoverage
+      : WEATHER_COVERAGE_DEFAULT;
+
   const t0 = performance.now();
 
   let src: Float32Array | null = null;
