@@ -286,13 +286,8 @@ constexpr float kShellOuter = GS_ALTITUDE_MAX * 1.5f;
  */
 constexpr float kDartScale = 0.0075f;
 
-/** Samples along a swarm agent's velocity vector, forming the streak. */
+/** Samples along a swarm agent's heading, forming the oriented dash. */
 constexpr int kStreakSamples = 3;
-
-/** Length of the streak as a multiple of the agent's per-second displacement.
- *  Motion blur in the strict sense would need the frame's exposure time; this
- *  fixed factor reads correctly across the whole speed band. */
-constexpr float kStreakScale = 0.055f;
 
 /**
  * Coverage deposited by the head sample of one agent's streak.
@@ -311,11 +306,11 @@ constexpr float kSwarmHeadWeight = 2.6f;
  *  direction cue, not a solid bar. */
 constexpr float kStreakTaper = 0.55f;
 
-/** Footprint ceilings, in pixels. Zoomed far in, an unbounded projected size
- *  would turn each agent into a hundreds-of-pixels stamp of atomics; past this
- *  radius the glyph is already unambiguous. */
-constexpr int kSwarmMaxRadius = 9;
-constexpr int kStormMaxRadius = 12;
+/** Footprint ceiling, in pixels, shared by both splat shapes. Zoomed far in,
+ *  an unbounded projected size would turn each entity into a
+ *  hundreds-of-pixels stamp of atomics; past this radius the mark is already
+ *  unambiguous. */
+constexpr int kSplatMaxRadius = 12;
 
 /**
  * Storm point sizing - the three.js storm scene's vertex shader, verbatim
@@ -679,7 +674,7 @@ __global__ void ClearSplatKernel(float4* __restrict__ accum, int count) {
 }
 
 /**
- * @brief Additively deposit a coloured gaussian footprint at a screen position.
+ * @brief Deposit a round sprite footprint into the accumulation buffer.
  *
  * Four atomicAdds per covered pixel: RGB carries color * weight, w carries the
  * raw weight, so the composite can recover both a mean colour (rgb / w) and a
@@ -688,75 +683,20 @@ __global__ void ClearSplatKernel(float4* __restrict__ accum, int count) {
  * whole frame, so even at millions of entities the atomic traffic is not the
  * bottleneck - the record reads are.
  *
- * The footprint is now sized per call rather than by a compile-time constant:
- * the swarm glyph is world-proportional (CONTRACTS section 8's zoom ladder),
- * so a zoomed-in agent must cover more pixels than a subpixel one.
+ * The radial profile is the three.js storm sprite's, verbatim: discard outside
+ * r=0.5 of the point square, fade with 1 - smoothstep(0, 0.25, r2). Both
+ * entity classes deposit through it - the storm because it IS that sprite, the
+ * swarm because a hard-edged disc chain reads like the mesh path's crisp
+ * glyph, where a gaussian of the same size reads as a fuzzy blob.
+ *
+ * The footprint is sized per call rather than by a compile-time constant: both
+ * glyphs are world-proportional (CONTRACTS section 8's zoom ladder), so a
+ * zoomed-in entity must cover more pixels than a subpixel one.
  *
  * @param accum  float4 accumulation buffer, w*h
  * @param w,h    frame dimensions
  * @param sx,sy  sub-pixel screen position
  * @param color  linear colour of the entity
- * @param weight peak (centre) deposit weight
- * @param sigma  gaussian sigma, pixels
- * @param radius footprint half-width, pixels (caller clamps to its ceiling)
- */
-__device__ __forceinline__ void SplatGaussian(float4* __restrict__ accum, int w, int h, float sx,
-                                              float sy, const float3& color, float weight,
-                                              float sigma, int radius) {
-  if (weight <= 1e-5f) return;
-  if (radius < 1) radius = 1;
-  if (sigma < 0.3f) sigma = 0.3f;
-
-  const int cx = static_cast<int>(floorf(sx));
-  const int cy = static_cast<int>(floorf(sy));
-
-  // Cheap whole-footprint reject before the loop. Saves the inner bounds checks
-  // for the overwhelming majority of off-screen entities at these counts.
-  if (cx < -radius || cy < -radius || cx >= w + radius || cy >= h + radius) {
-    return;
-  }
-
-  const float invTwoSigmaSq = 1.0f / (2.0f * sigma * sigma);
-
-  for (int dy = -radius; dy <= radius; ++dy) {
-    const int py = cy + dy;
-    if (py < 0 || py >= h) continue;
-
-    for (int dx = -radius; dx <= radius; ++dx) {
-      const int px = cx + dx;
-      if (px < 0 || px >= w) continue;
-
-      // Distance from the splat centre to this pixel's centre.
-      const float ox = (static_cast<float>(px) + 0.5f) - sx;
-      const float oy = (static_cast<float>(py) + 0.5f) - sy;
-      const float d2 = ox * ox + oy * oy;
-
-      const float g = __expf(-d2 * invTwoSigmaSq) * weight;
-      if (g < 1e-5f) continue;  // below the quantisation floor, skip the atomics
-
-      float4* dst = accum + static_cast<size_t>(py) * w + px;
-      atomicAdd(&dst->x, color.x * g);
-      atomicAdd(&dst->y, color.y * g);
-      atomicAdd(&dst->z, color.z * g);
-      atomicAdd(&dst->w, g);
-    }
-  }
-}
-
-/**
- * @brief Deposit a soft round point sprite, matching the three.js storm scene's
- *        fragment profile.
- *
- * The WebGL path draws gl_PointSize-sized squares and discards outside r=0.5,
- * fading with 1 - smoothstep(0, 0.25, r2). This reproduces that exact radial
- * profile over a splat of diameter @p sizePx so the two backends' particles are
- * the same shape as well as the same size - a gaussian reads visibly "softer"
- * than the sprite at equal diameter.
- *
- * @param accum  float4 accumulation buffer, w*h
- * @param w,h    frame dimensions
- * @param sx,sy  sub-pixel screen position
- * @param color  linear colour of the particle
  * @param weight peak (centre) deposit weight
  * @param sizePx sprite diameter, pixels
  */
@@ -778,7 +718,7 @@ __device__ __forceinline__ void SplatDisc(float4* __restrict__ accum, int w, int
   const float half = sizePx * 0.5f;
   int radius = static_cast<int>(ceilf(half + 0.5f));
   if (radius < 1) radius = 1;
-  if (radius > kStormMaxRadius) radius = kStormMaxRadius;
+  if (radius > kSplatMaxRadius) radius = kSplatMaxRadius;
 
   const int cx = static_cast<int>(floorf(sx));
   const int cy = static_cast<int>(floorf(sy));
@@ -905,40 +845,45 @@ void SplatSwarmKernel(float4* __restrict__ accum, int w, int h,
   const float pxSize =
       (kDartScale * 2.0f * static_cast<float>(h)) / fmaxf(2.0f * depth * tanHalf, 1e-4f);
 
-  // Footprint from projected size. The sigma factor puts the visible core of
-  // the gaussian at roughly the glyph's height; the radius covers it to ~2%.
-  float sigma = pxSize * 0.30f;
-  if (sigma < 0.55f) sigma = 0.55f;
-  if (sigma > 4.5f) sigma = 4.5f;
-  int radius = static_cast<int>(ceilf(sigma * 2.2f));
-  if (radius > kSwarmMaxRadius) radius = kSwarmMaxRadius;
+  // The splat is the dart's WIDTH, not its height: the glyph is a thin kite
+  // 0.62 dart-units wide per side, and the length comes from the streak below.
+  // A first cut used a gaussian of ~the full glyph height and the swarm read
+  // as fat fuzzy blobs beside the mesh path's crisp arrows - a hard-edged disc
+  // at the kite's width plus a short oriented dash is the honest splat-domain
+  // equivalent of the shape.
+  const float discPx = pxSize * 0.62f;
 
   // No depth-based brightness attenuation: the mesh dart's fill alpha is the
   // same at any distance (only its projected SIZE attenuates), and this layer
   // is composited as coverage, so brightness parity means a constant weight.
   const float weight = kSwarmHeadWeight;
 
-  /* --- streak --------------------------------------------------------- */
-  // Project the streak endpoints rather than the midpoint plus a screen-space
-  // offset: perspective makes a world-space streak foreshorten, and doing it in
-  // screen space would give every agent the same apparent length.
-  const float3 tail = gsSub(p, gsScale(v, kStreakScale));
+  /* --- oriented dash --------------------------------------------------- */
+  // A fixed WORLD length along the velocity direction - the dart's own body
+  // length - projected end-to-end so perspective foreshortens it naturally.
+  // The old velocity-proportional streak stretched fast agents into long
+  // capsules that had no counterpart on the mesh path; a unit-length dash
+  // keeps the direction cue while matching the glyph's footprint.
+  const float speed = gsLength(v);
+  const float3 tail = (speed > 1e-6f)
+                          ? gsSub(p, gsScale(v, (kDartScale * 1.5f) / speed))
+                          : p;
 
   float tx, ty, tdepth;
-  if (ProjectPoint(tail, in, w, h, &tx, &ty, &tdepth)) {
+  if (speed > 1e-6f && ProjectPoint(tail, in, w, h, &tx, &ty, &tdepth)) {
     #pragma unroll
     for (int s = 0; s < kStreakSamples; ++s) {
       const float f = static_cast<float>(s) / static_cast<float>(kStreakSamples - 1);
-      // Fade toward the tail so the streak reads as a direction, not a bar.
+      // Fade toward the tail so the dash reads as a direction, not a bar.
       // Coverage saturates rather than sums (1 - exp(-w)), so overlapping
       // samples cannot blow the head out - no energy split needed.
       const float taper = 1.0f - kStreakTaper * f;
-      SplatGaussian(accum, w, h, gsLerpf(sx, tx, f), gsLerpf(sy, ty, f), color, weight * taper,
-                    sigma, radius);
+      SplatDisc(accum, w, h, gsLerpf(sx, tx, f), gsLerpf(sy, ty, f), color, weight * taper,
+                discPx);
     }
   } else {
-    // Tail behind the camera - just draw the head.
-    SplatGaussian(accum, w, h, sx, sy, color, weight, sigma, radius);
+    // No heading (or tail behind the camera) - just draw the head.
+    SplatDisc(accum, w, h, sx, sy, color, weight, discPx);
   }
 }
 
