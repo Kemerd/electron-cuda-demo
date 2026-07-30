@@ -14,10 +14,12 @@
  * not the engine's self-reported kernel time. Engine timings are shown
  * alongside, clearly separated.
  *
- * CUDA link proof (phase 1): when CUDA is live we run a REQ/FRAME/RECYCLE cycle
- * against the frame pump every tick and hand the resulting swarm records to the
- * globe scene, which plots them. One request in flight at a time -- the pump is
- * synchronous per request, and queueing more would just build latency.
+ * CUDA link proof (phase 1): when CUDA is live we run a REQ/FRAME cycle against
+ * the frame pump every tick and hand the resulting swarm records to the globe
+ * scene, which plots them. One request in flight at a time -- the pump is
+ * synchronous per request, and queueing more would just build latency. Frame
+ * buffers are read and then dropped for GC; nothing goes back across the port
+ * (CONTRACTS section 7).
  *
  * Two things in here are not obvious and are worth reading before changing:
  *
@@ -196,9 +198,6 @@ let requestInFlight = false;
 
 /** Monotonic request id. */
 let nextFrameId = 1;
-
-/** Buffers waiting to be handed back to the pump on the next REQ. */
-const recycleQueue: ArrayBuffer[] = [];
 
 /* ------------------------------------------------------------------ *
  *  CUDA link verdict
@@ -425,9 +424,9 @@ function markLinkVerified(count: number): void {
   setChip('cuda-link', 'CUDA link verified', 'cuda');
 
   if (wasFailed) {
-    console.log('[app] CUDA link recovered -- %d records after an earlier failure verdict', count);
+    console.log(`[app] CUDA link recovered -- ${count} records after an earlier failure verdict`);
   } else {
-    console.log('[app] CUDA link verified -- %d records in first frame', count);
+    console.log(`[app] CUDA link verified -- ${count} records in first frame`);
   }
 }
 
@@ -518,7 +517,7 @@ function applyMode(next: Partial<ModeState> | null | undefined): void {
     resetLinkAttempt('waiting for the first frame after a mode change');
   }
 
-  console.log('[app] mode -> %s / %s / %s', mode.compute, mode.raster, mode.present);
+  console.log(`[app] mode -> ${mode.compute} / ${mode.raster} / ${mode.present}`);
 }
 
 /* ------------------------------------------------------------------ *
@@ -644,8 +643,8 @@ async function configureEngineScene(engineScene: SceneId): Promise<void> {
     if (isFiniteNumber(res.vramUsedMB)) {
       setChip('vram', `${Math.round(res.vramUsedMB)} MB VRAM`, 'cuda');
     }
-    // A reallocation invalidates every pooled buffer we were holding.
-    recycleQueue.length = 0;
+    // A reallocation changes the payload size, so any request still in flight
+    // is answering for the old geometry. Clear the guard and start fresh.
     requestInFlight = false;
 
     // A successful (re)configure is a fresh warmup: the engine may have just
@@ -718,9 +717,9 @@ function onEngineMessage(msg: PumpToRendererMsg): void {
     const stride = strideFor(msg.scene);
     const count = isFiniteNumber(msg.count) ? msg.count : 0;
 
-    // A view over the transferred buffer -- no copy. It stays valid until we
-    // hand the buffer back, which happens at the end of this function after
-    // the scene has read it.
+    // A view over the received buffer -- no copy. The buffer is ours outright
+    // (it arrived as a structured clone and is never handed back), so the view
+    // stays valid for as long as anything holds a reference to it.
     let view: Float32Array | null = null;
     try {
       view = new Float32Array(msg.buf);
@@ -729,8 +728,6 @@ function onEngineMessage(msg: PumpToRendererMsg): void {
     }
 
     if (view && activeScene && typeof activeScene.setEntities === 'function') {
-      // The scene reads immediately (it plots during the same tick), so handing
-      // the buffer back below is safe.
       activeScene.setEntities(view, count, stride);
     }
 
@@ -743,11 +740,9 @@ function onEngineMessage(msg: PumpToRendererMsg): void {
     }
   }
 
-  // Return the buffer to the pump. Detaching it here is exactly why the scene
-  // has to consume the data synchronously above.
-  if (msg.buf instanceof ArrayBuffer && msg.buf.byteLength > 0) {
-    recycleQueue.push(msg.buf);
-  }
+  // Nothing to return: the buffer is a fresh IPC-layer allocation, and shipping
+  // it back would cost a second full copy just to be discarded on arrival
+  // (CONTRACTS section 7). Dropping the reference here hands it to the GC.
 }
 
 /**
@@ -792,11 +787,8 @@ function pumpEngineFrame(dtMs: number): void {
   // Targets are capped by protocol; keep the array from ever exceeding it.
   if (inputState.targets.length > MAX_TARGETS) inputState.targets.length = MAX_TARGETS;
 
-  // Drain the recycle queue into this request. Splicing into a fresh array is
-  // one small allocation per frame, unavoidable because the transfer list has
-  // to be a real array -- but it holds references, not payload bytes.
-  const buffers = recycleQueue.length > 0 ? recycleQueue.splice(0, recycleQueue.length) : [];
-
+  // Scalars plus the shared input struct, and nothing else. The REQ carries no
+  // buffers and rides as a structured clone -- see CONTRACTS section 7.
   const req: ReqMsg = {
     t: MSG.REQ,
     frameId: nextFrameId++,
@@ -806,11 +798,10 @@ function pumpEngineFrame(dtMs: number): void {
     dtMs,
     wantField: false,
     input: inputState,
-    buffers,
   };
 
   requestInFlight = true;
-  const sent = bridge.sendReq(req, buffers);
+  const sent = bridge.sendReq(req);
 
   if (!sent) {
     // The port has not arrived yet (or the post failed). Clear the flag so the
@@ -954,7 +945,7 @@ const SMOKE_TICK_MS = 16;
  */
 function startFrameLoop(): void {
   if (isSmokeRun()) {
-    console.log('[app] smoke run detected; driving frames on a %d ms interval', SMOKE_TICK_MS);
+    console.log(`[app] smoke run detected; driving frames on a ${SMOKE_TICK_MS} ms interval`);
     window.setInterval(() => tick(performance.now()), SMOKE_TICK_MS);
     return;
   }
@@ -987,9 +978,6 @@ function installEngineListener(): void {
 /** How long boot waits for IPC.ENGINE_PORT before starting the drive anyway. */
 const PORT_WAIT_MS = 10_000;
 
-/** Poll period for the fallback readiness wait. */
-const PORT_POLL_MS = 25;
-
 /**
  * Block until the engine port has actually been delivered.
  *
@@ -1001,57 +989,32 @@ const PORT_POLL_MS = 25;
  * dropped on the floor -- a send-before-listen race whose only symptom was a
  * chip that eventually said the link had failed.
  *
- * The preferred path is the preload's own whenPortReady() hook. If the bridge
- * in this build predates it, fall back to a bounded poll on isPortReady(), and
- * if neither exists, wait out a short grace period rather than blocking the
- * whole app on a hook that is never coming.
+ * whenPortReady() is a required member of the bridge (CONTRACTS section 7), so
+ * there is exactly one path here. It resolves with no value, so readiness is
+ * signalled by which side of the race settles first -- hence the boolean-tagged
+ * wrappers rather than racing the hook's own resolution value.
  *
  * @returns true when the port is known to be attached
  */
 async function waitForEnginePort(bridge: GeoswarmBridge | undefined): Promise<boolean> {
-  if (!bridge) return false;
+  if (!bridge || typeof bridge.whenPortReady !== 'function') return false;
 
-  // Preferred: the preload resolves this on port arrival.
-  if (typeof bridge.whenPortReady === 'function') {
-    try {
-      const ready = await Promise.race([
-        bridge.whenPortReady(),
-        new Promise<boolean>((resolve) => window.setTimeout(() => resolve(false), PORT_WAIT_MS)),
-      ]);
-      if (ready) return true;
-      console.warn('[app] engine port not delivered within %d ms', PORT_WAIT_MS);
-      linkFailureReason = `engine port not delivered within ${Math.round(PORT_WAIT_MS / 1000)} s`;
-      return false;
-    } catch (err) {
-      console.warn('[app] whenPortReady threw: %s', errText(err));
-      return false;
-    }
-  }
+  try {
+    // The timeout is a ceiling on boot, not a failure in itself: the preload
+    // still queues the first few REQs, so a late port is recoverable.
+    const ready = await Promise.race([
+      bridge.whenPortReady().then(() => true),
+      new Promise<boolean>((resolve) => window.setTimeout(() => resolve(false), PORT_WAIT_MS)),
+    ]);
+    if (ready) return true;
 
-  // Fallback: poll the synchronous check if the bridge exposes one.
-  if (typeof bridge.isPortReady === 'function') {
-    const deadline = performance.now() + PORT_WAIT_MS;
-    while (performance.now() < deadline) {
-      try {
-        if (bridge.isPortReady()) return true;
-      } catch (err) {
-        console.warn('[app] isPortReady threw: %s', errText(err));
-        return false;
-      }
-      await new Promise<void>((resolve) => window.setTimeout(resolve, PORT_POLL_MS));
-    }
-    console.warn('[app] engine port not ready within %d ms', PORT_WAIT_MS);
+    console.warn(`[app] engine port not delivered within ${PORT_WAIT_MS} ms`);
     linkFailureReason = `engine port not delivered within ${Math.round(PORT_WAIT_MS / 1000)} s`;
     return false;
+  } catch (err) {
+    console.warn(`[app] whenPortReady threw: ${errText(err)}`);
+    return false;
   }
-
-  // No readiness hook at all. The preload still queues the first few REQs, so
-  // the drive is not lost -- it just starts blind. Log it loudly: this is a
-  // preload/renderer version mismatch, not a normal state.
-  console.warn(
-    '[app] preload exposes no port-readiness hook; starting the drive without a handshake wait',
-  );
-  return false;
 }
 
 async function boot(): Promise<void> {
@@ -1076,11 +1039,12 @@ async function boot(): Promise<void> {
   };
   frameState.caps = caps;
 
-  console.log(
-    '[app] caps: cuda=%s webgpu=%s',
-    caps.cuda.ok ? caps.cuda.name || 'ok' : `no (${caps.cuda.reason})`,
-    caps.webgpu.ok ? 'ok' : `no (${caps.webgpu.reason})`,
-  );
+  // Template literal rather than printf placeholders: this line is forwarded to
+  // the main process by the smoke console tap, which captures the raw format
+  // string -- "%s" would show up verbatim in the captured output.
+  const cudaSummary = caps.cuda.ok ? caps.cuda.name || 'ok' : `no (${caps.cuda.reason})`;
+  const webgpuSummary = caps.webgpu.ok ? 'ok' : `no (${caps.webgpu.reason})`;
+  console.log(`[app] caps: cuda=${cudaSummary} webgpu=${webgpuSummary}`);
 
   // ---- UI ------------------------------------------------------------
   ui.overlay = createFpsOverlay(document.getElementById('fps-overlay'));
@@ -1142,7 +1106,7 @@ async function boot(): Promise<void> {
     if (bridge && typeof bridge.uploadEarth === 'function') {
       const res = await bridge.uploadEarth();
       if (!res || res.ok !== true) {
-        console.log('[app] earth texture not uploaded: %s', (res && res.reason) || 'unknown');
+        console.log(`[app] earth texture not uploaded: ${(res && res.reason) || 'unknown'}`);
       }
     }
   }

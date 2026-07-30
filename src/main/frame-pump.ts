@@ -337,18 +337,18 @@ function replyError(frameId: number, reason: string): void {
 /**
  * Post a FRAME.
  *
- * NOTE ON THE TRANSFER LIST -- this is the one place the main->renderer leg
- * cannot honour the "always transfer the ArrayBuffer" rule. Electron types
+ * NOTE ON THE TRANSFER LIST -- there isn't one, on either leg. Electron types
  * MessagePortMain.postMessage as (message, transfer?: MessagePortMain[]): the
  * main-side transfer list accepts ports and nothing else. Passing an
  * ArrayBuffer there throws "Port at index 0 is not a valid port" and the frame
- * is lost outright, so the payload rides as a structured clone instead.
+ * is lost outright, so the payload rides as a structured clone instead. The
+ * renderer's return leg looks like it supports transfer (it is a DOM
+ * MessagePort) but does not in practice -- see CONTRACTS section 7.
  *
  * Consequence: the outbound copy is real, and because a clone does not detach,
  * the buffer we just sent is still ours. We put it straight back in the pool --
- * that is what keeps this path allocation-free despite the copy. The renderer's
- * return leg is a DOM MessagePort, which does support ArrayBuffer transfer, so
- * inbound recycling stays a genuine zero-copy handoff.
+ * that is what keeps this path allocation-free despite the copy, with no help
+ * from the renderer at all.
  *
  * @param msg fully-formed FRAME message with .buf set
  */
@@ -383,10 +383,8 @@ function handleRequest(req: Partial<ReqMsg> & { kind?: unknown }): void {
 
   const frameId = numOr(req.frameId, 0);
 
-  // Buffers riding on the request come back first so they are available to
-  // satisfy this very request -- that is what keeps steady state allocation-free.
-  absorbRecycled(req.buffers);
-
+  // A REQ carries no buffers -- the pool refills itself in postFrame() rather
+  // than waiting on anything from the renderer (CONTRACTS section 7).
   const engine = getEngine();
   if (!engine) {
     replyError(frameId, 'CUDA engine unavailable');
@@ -584,12 +582,11 @@ function onPortMessage(e: { data: unknown }): void {
   const msg = asRecord(e?.data);
   if (!msg) return;
 
+  // REQ is the only thing the renderer sends on this port; there is no recycle
+  // channel to handle (CONTRACTS section 7).
   switch (msg.t) {
     case MSG.REQ:
       handleRequest(msg as Partial<ReqMsg>);
-      break;
-    case MSG.RECYCLE:
-      absorbRecycled(msg.buffers);
       break;
     default:
       console.warn('[pump] unknown message type "%s"', String(msg.t));
@@ -617,7 +614,8 @@ function establishPort(webContents: WebContents | null | undefined): void {
     port = null;
   }
 
-  // A reload invalidates every buffer the old renderer held. Start clean.
+  // A reload resets the frame counters, so drop the pooled memory with them
+  // rather than carrying buffers sized for whatever the last session was doing.
   for (const kind of Object.values(KIND)) pools[kind].length = 0;
   framesServed = 0;
   underflowAllocations = 0;

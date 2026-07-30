@@ -12,9 +12,9 @@
  *  2. The renderer's merged capability model and per-frame state -- neither
  *     crosses a process boundary, so neither belongs in protocol.ts.
  *
- *  3. The `window.geoswarm` ambient declaration, which EXTENDS the shared
+ *  3. The `window.geoswarm` ambient declaration, which points at the shared
  *     GeoSwarmBridge interface rather than restating it. See the bridge
- *     section at the bottom for why the two extra members are optional.
+ *     section at the bottom.
  *
  * Everything that crosses a process boundary comes from shared/protocol, and
  * the bridge surface comes from main/bridge-types -- nothing in this file
@@ -156,26 +156,15 @@ export interface SceneModule {
  * ------------------------------------------------------------------ */
 
 /**
- * The bridge as the renderer sees it: the main-side declaration plus the
- * port-readiness hooks.
+ * The bridge as the renderer sees it.
  *
- * Both hooks are OPTIONAL, and that is a statement about the current preload,
- * not a style choice -- preload.cts does not expose either one yet. The
- * renderer needs to know when IPC.ENGINE_PORT has actually been delivered
- * before it starts the REQ drive (starting earlier is the send-before-listen
- * race documented in app.ts), so it asks for the hook, degrades to a bounded
- * poll if only the synchronous form exists, and logs loudly if neither does.
- * Declaring them optional here is what lets the renderer compile and run
- * against a preload that has not grown them yet; once the main workstream adds
- * them to GeoSwarmBridge, these two members become redundant and should be
- * deleted from this file rather than kept in sync.
+ * This carries nothing of its own any more. The port-readiness hooks that used
+ * to be declared here as optional extras -- whenPortReady() / isPortReady() --
+ * now live on GeoSwarmBridge as required members, because preload.cts exposes
+ * them, so restating them would only create a way for the two to drift. The
+ * alias is kept because every renderer module imports this name.
  */
-export interface GeoswarmBridge extends GeoSwarmBridge {
-  /** Resolves once main has delivered the engine port over IPC.ENGINE_PORT. */
-  whenPortReady?(): Promise<boolean>;
-  /** Synchronous "is the port attached right now" check. */
-  isPortReady?(): boolean;
-}
+export type GeoswarmBridge = GeoSwarmBridge;
 
 declare global {
   interface Window {
