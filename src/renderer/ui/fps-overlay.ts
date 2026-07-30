@@ -486,7 +486,10 @@ export function createFpsOverlay(host: HTMLElement | null): FpsOverlayApi {
     const stepX = sparkW / (ringCount - 1);
     const scaleY = sparkH / peak;
 
-    // 16.67ms reference line -- the 60Hz budget.
+    // 16.67ms reference line. It means more now than it did against raw rAF
+    // deltas, where every backend sat under it by construction: the trace plots
+    // effective intervals, so a line above this one is a scene genuinely
+    // updating slower than 60 Hz, whatever the compositor is doing.
     const budgetY = sparkH - Math.min(sparkH, 16.67 * scaleY);
     ctx.strokeStyle = 'rgba(255,255,255,0.14)';
     ctx.lineWidth = 1;

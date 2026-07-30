@@ -451,11 +451,6 @@ export default function createScene(): Scene {
     gridSpec.camZ = cam.z;
 
     const stats = wind.analyze(gridSpec as WindGridSpec, sampleField);
-    // SCRATCH-PROBE
-    (window as unknown as { __windStats?: unknown }).__windStats = {
-      n: stats.sampleCount, floor: stats.floorSpeed, label: stats.labelSpeed,
-      max: stats.maxSpeed, kts: stats.labels.map((l) => l.knots), rows, useBarbs,
-    };
 
     // Nothing measurable in view: clear both layers rather than drawing a
     // stale picture over a field that has gone quiet.
@@ -467,9 +462,15 @@ export default function createScene(): Scene {
 
     if (labels) labels.setLabels(stats.labels);
 
-    // Normalization span for emphasis: floor -> 0, field maximum -> 1.
+    // Normalization span for emphasis: floor -> 0, the field's 90th percentile
+    // -> 1. Deliberately NOT the field maximum -- see EMPHASIS_PERCENTILE in
+    // wind-field.ts; anchoring on the maximum let a few sqrt(2) corner cells
+    // squash the entire ramp into its coolest band.
     const floor = stats.floorSpeed;
-    const span = Math.max(1e-4, stats.maxSpeed - floor);
+    const span = Math.max(1e-4, stats.emphasisTop - floor);
+
+    // SCRATCH-PROBE
+    const probeBands = [0, 0, 0, 0];
 
     let seg = 0; // segments written so far
 
@@ -524,10 +525,21 @@ export default function createScene(): Scene {
         // what makes the remaining glyphs read as a system.
         if (speed < floor) continue;
 
-        // Where this cell sits in the significant range, 0 at the floor and 1
-        // at the fastest thing on screen. Drives length AND brightness, which
-        // is the spec's "emphasis scales with speed".
-        const emphasis = Math.min(1, (speed - floor) / span);
+        // Where this cell sits in the significant range: 0 at the floor, 1 at
+        // the field's 90th percentile. Drives length AND brightness, which is
+        // the spec's "emphasis scales with speed".
+        //
+        // The gamma is not decoration. Wind speed above a percentile floor is
+        // strongly bottom-heavy -- most surviving cells sit just over the floor
+        // and the tail is thin -- so the linear ratio parks the bulk of the
+        // layer under the first color break and the whole ramp reads as one
+        // flat cool wash. A capture of the linear version showed exactly that.
+        // The 0.62 exponent lifts the middle of the distribution into the
+        // middle of the ramp, which is where the ladder becomes visible; it
+        // still preserves ordering, so a faster cell is never drawn weaker
+        // than a slower one.
+        const linear = Math.min(1, Math.max(0, (speed - floor) / span));
+        const emphasis = Math.pow(linear, 0.62);
 
         // east = normalize(cross(+Y, radial)); north = cross(radial, east).
         let ex = pz;
@@ -565,17 +577,30 @@ export default function createScene(): Scene {
         // NORMALIZED emphasis, not the raw speed: an absolute ladder paints the
         // whole layer one flat color whenever the field is uniformly fast or
         // uniformly slow, which is exactly when the structure matters most.
-        let r = 0.55, g = 0.85, b = 1.0;
-        if (emphasis > 0.80) { r = 1.0; g = 0.45; b = 0.35; }
-        else if (emphasis > 0.55) { r = 1.0; g = 0.78; b = 0.35; }
-        else if (emphasis > 0.28) { r = 0.75; g = 0.95; b = 0.6; }
+        //
+        // Break points sit at roughly the quartiles of the post-gamma
+        // distribution rather than at even fractions of the range. Even
+        // fractions look principled and are wrong: nothing forces a field's
+        // speeds to be uniformly distributed, and this one is not, so the top
+        // two bands went essentially unused and the ladder had two rungs.
+        // The two weakest bands are SATURATED cool colors rather than pale
+        // ones. This layer is drawn over the reflectivity ramp, whose largest
+        // areas are yellow and green -- a pale cyan-white glyph on a yellow
+        // cell has almost no chroma difference and the barbs disappeared into
+        // the radar in exactly the regions with weather in them. Deep cyan and
+        // white-hot are the two ends that survive that background.
+        let r = 0.24, g = 0.72, b = 0.95;
+        if (emphasis > 0.68) { r = 1.00; g = 0.97; b = 0.92; probeBands[3]!++; }
+        else if (emphasis > 0.46) { r = 1.00; g = 0.72; b = 0.30; probeBands[2]!++; }
+        else if (emphasis > 0.24) { r = 0.42; g = 0.90; b = 1.00; probeBands[1]!++; }
+        else { probeBands[0]!++; }
 
         // Brightness is the other half of "emphasis scales with speed". A cell
-        // just over the floor sits at ~55% intensity so it is legible but
+        // just over the floor sits at ~62% intensity so it is legible but
         // clearly secondary; the cores burn at full. Vertex colors on an
         // additive-free LineBasicMaterial mean this is a straight multiply, no
         // extra state and no second draw call.
-        const bright = 0.55 + emphasis * 0.45;
+        const bright = 0.62 + emphasis * 0.38;
         r *= bright; g *= bright; b *= bright;
 
         if (useBarbs) {
@@ -593,6 +618,14 @@ export default function createScene(): Scene {
     geo.attributes.position!.needsUpdate = true;
     geo.attributes.color!.needsUpdate = true;
     geo.setDrawRange(0, seg * 2);
+
+    // SCRATCH-PROBE
+    (window as unknown as { __windStats?: unknown }).__windStats = {
+      n: stats.sampleCount, floor: stats.floorSpeed, label: stats.labelSpeed,
+      max: stats.maxSpeed, top: stats.emphasisTop,
+      kts: stats.labels.map((l) => l.knots), rows, useBarbs,
+      bands: probeBands, seg,
+    };
   }
 
   /** Segment emitter signature shared by the two glyph builders. */

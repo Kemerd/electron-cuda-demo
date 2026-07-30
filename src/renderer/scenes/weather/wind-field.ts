@@ -57,6 +57,24 @@ const SIGNIFICANCE_PERCENTILE = 0.40;
 const LABEL_PERCENTILE = 0.96;
 
 /**
+ * Percentile the emphasis ramp saturates at.
+ *
+ * NOT the field maximum, which is what the first version used and which is
+ * measurably wrong here. The field stores u and v as independently clamped
+ * -1..1 components, so a handful of corner cells reach magnitude sqrt(2) =
+ * 1.414 while the bulk of the significant flow sits between the ~0.34 floor and
+ * ~1.0. Normalizing against 1.414 pushed nearly every glyph below the first
+ * color break: a capture of the layer came out almost uniformly in the coolest
+ * band, with the speed ladder invisible.
+ *
+ * Anchoring at the 90th percentile means the ramp saturates on the fastest
+ * tenth of what is actually on screen -- so the top of the ramp gets used, the
+ * bands separate, and the few outliers above it simply pin at full emphasis
+ * instead of compressing everything else.
+ */
+const EMPHASIS_PERCENTILE = 0.90;
+
+/**
  * Histogram resolution for the percentile estimate. 64 buckets over the field's
  * own min..max speed range puts the floor within ~1.5% of the true percentile,
  * which is far finer than the eye can judge "is that glyph significant". A full
@@ -72,8 +90,33 @@ const HISTOGRAM_BUCKETS = 64;
  */
 const MAX_CORE_CANDIDATES = 256;
 
-/** Maximum labels emitted per rebuild. Sparse is the whole point. */
-const MAX_LABEL_CLUSTERS = 7;
+/**
+ * How far inside the visible disc a cell must sit to be a label candidate.
+ *
+ * The glyph walk admits anything past FACING_CUTOFF (~0.15 of the radius),
+ * which reaches almost to the limb -- correct for glyphs, since a barb at the
+ * edge is still readable foreshortened. It is wrong for labels: a billboarded
+ * text quad at the limb sits half off the globe with nothing behind it, and a
+ * capture of the first version had every callout ringing the edge, reading as
+ * a border decoration rather than as annotation of the systems in view.
+ *
+ * Tuned against captures. 0.55 (57 degrees off the view axis, most of the way
+ * to the silhouette on a sphere) still put callouts on the lower rim; 0.78 was
+ * clean but so tight that a whole hemisphere of weather produced a single
+ * label. 0.68 keeps them off the rim while leaving room for the two or three
+ * distinct systems a hemisphere usually holds.
+ */
+const LABEL_FACING_MIN = 0.68;
+
+/**
+ * Maximum labels emitted per rebuild. Sparse is the whole point.
+ *
+ * Five, not seven: at seven the capture showed callouts ringing the visible
+ * hemisphere fairly evenly, which reads as an annotation grid rather than "here
+ * are the systems". The cap is a backstop anyway -- the cluster radius is what
+ * normally decides how many there are, and a quiet field produces fewer.
+ */
+const MAX_LABEL_CLUSTERS = 5;
 
 /**
  * Cluster radius as a multiple of the current grid step, in radians of arc.
@@ -82,7 +125,7 @@ const MAX_LABEL_CLUSTERS = 7;
  * behavior identical at every zoom: zoomed in, cells are closer together in
  * arc, and so is the radius that merges them.
  */
-const CLUSTER_RADIUS_STEPS = 6.0;
+const CLUSTER_RADIUS_STEPS = 10.0;
 
 /**
  * Neighbour offsets, in grid cells, used for the coherence probe. Sampling the
@@ -119,8 +162,14 @@ export interface WindStats {
   readonly floorSpeed: number;
   /** Speed at LABEL_PERCENTILE -- the entry price for a label candidacy. */
   readonly labelSpeed: number;
-  /** Fastest cell seen this pass. Drives emphasis normalization. */
+  /** Fastest cell seen this pass. Reported for diagnostics. */
   readonly maxSpeed: number;
+  /**
+   * Speed the emphasis ramp saturates at -- the EMPHASIS_PERCENTILE of the
+   * field, not its maximum. See that constant for why the maximum is the wrong
+   * anchor.
+   */
+  readonly emphasisTop: number;
   /** Clustered label cores, strongest first. Length <= MAX_LABEL_CLUSTERS. */
   readonly labels: readonly WindLabel[];
 }
@@ -230,6 +279,7 @@ export function createWindAnalyzer(): WindAnalyzerApi {
     floorSpeed: 0,
     labelSpeed: 0,
     maxSpeed: 0,
+    emphasisTop: 0,
     labels: labelView as readonly WindLabel[],
   };
 
@@ -249,6 +299,10 @@ export function createWindAnalyzer(): WindAnalyzerApi {
     let min = Number.POSITIVE_INFINITY;
     let max = 0;
     let n = 0;
+
+    // Camera distance, so the label-candidacy test can compare a normalized
+    // facing rather than a raw dot product that moves with the zoom.
+    const camLen = Math.hypot(grid.camX, grid.camY, grid.camZ);
 
     // Pass one collects the range; the histogram needs it before it can bin.
     // Both passes are the same walk, so the speeds are recomputed rather than
@@ -297,7 +351,8 @@ export function createWindAnalyzer(): WindAnalyzerApi {
         const px = cosLat * Math.sin(lon);
         const py = Math.sin(lat);
         const pz = cosLat * Math.cos(lon);
-        if (px * grid.camX + py * grid.camY + pz * grid.camZ < grid.facingCutoff) continue;
+        const facing = px * grid.camX + py * grid.camY + pz * grid.camZ;
+        if (facing < grid.facingCutoff) continue;
 
         sample(lat, lon, probeA);
         const u = probeA[0] ?? 0;
@@ -310,10 +365,18 @@ export function createWindAnalyzer(): WindAnalyzerApi {
         if (b >= HISTOGRAM_BUCKETS) b = HISTOGRAM_BUCKETS - 1;
         histogram[b] = (histogram[b] ?? 0) + 1;
 
-        // Strong cells are also label candidates. The list is capped, so an
-        // insertion that would overflow replaces the weakest entry -- which
-        // keeps the top-N without sorting the whole grid.
-        considerCandidate(speed, px, py, pz);
+        // Strong cells well inside the disc are also label candidates. The list
+        // is capped, so an insertion that would overflow replaces the weakest
+        // entry -- which keeps the top-N without sorting the whole grid. Cells
+        // near the limb count toward the percentiles (they are drawn, so they
+        // are part of the picture) but never carry a callout.
+        //
+        // The comparison is against a NORMALIZED facing: the raw dot product
+        // scales with camera distance, so a fixed threshold on it would admit
+        // everything when zoomed out and nothing when zoomed in.
+        if (camLen > 0 && facing / camLen >= LABEL_FACING_MIN) {
+          considerCandidate(speed, px, py, pz);
+        }
       }
     }
 
@@ -401,6 +464,77 @@ export function createWindAnalyzer(): WindAnalyzerApi {
   }
 
   /**
+   * Mean clamped wind speed over a disc of the field centred on a direction.
+   *
+   * Fixed 13-point stencil: the core plus three rings of four probes at 40%,
+   * 73% and 100% of the radius, rotated between rings so the samples do not
+   * line up on two axes. That is enough to characterize a system's strength
+   * without turning a label into a second full field pass -- at most seven
+   * labels times thirteen samples is under a hundred reads per rebuild.
+   *
+   * @param cx unit-sphere x of the cluster core
+   * @param cy unit-sphere y
+   * @param cz unit-sphere z
+   * @param radiusRad disc radius in radians of arc
+   * @param grid geometry, for the magnitude ceiling
+   * @param sample field sampler
+   * @return mean clamped magnitude; the core's own value if nothing else reads
+   */
+  function discMeanSpeed(
+    cx: number, cy: number, cz: number,
+    radiusRad: number,
+    grid: WindGridSpec,
+    sample: FieldSampler,
+  ): number {
+    // Core direction back to lat/lon. Clamping the asin argument matters: a
+    // direction that is a hair over unit length from accumulated float error
+    // makes asin return NaN, and a NaN latitude propagates into every probe.
+    const lat = Math.asin(Math.min(1, Math.max(-1, cy)));
+    const lon = Math.atan2(cx, cz);
+    const cosLat = Math.max(0.08, Math.cos(lat));
+    const ceiling = grid.knotsMagCeiling;
+
+    let sum = 0;
+    let n = 0;
+
+    /** Sample one probe offset, in radians of arc, and fold it into the mean. */
+    const probe = (dLat: number, dLon: number): void => {
+      const pLat = lat + dLat;
+      // Past a pole the equirect mapping folds; skip rather than read a texel
+      // from the wrong hemisphere and call it part of this system.
+      if (pLat > Math.PI * 0.49 || pLat < -Math.PI * 0.49) return;
+
+      sample(pLat, lon + dLon / cosLat, probeB);
+      const u = probeB[0] ?? 0;
+      const v = probeB[1] ?? 0;
+      const s = Math.hypot(u, v);
+      if (!(s > 0)) return;
+
+      sum += Math.min(ceiling, s);
+      n++;
+    };
+
+    probe(0, 0);
+    // Ring radii as fractions of the disc, and the angular offset each ring is
+    // rotated by so the 12 probes do not collapse onto two lines.
+    const rings: ReadonlyArray<readonly [number, number]> = [
+      [0.40, 0],
+      [0.73, Math.PI / 4],
+      [1.00, Math.PI / 8],
+    ];
+    for (const ring of rings) {
+      const r = radiusRad * ring[0];
+      for (let k = 0; k < 4; k++) {
+        const a = ring[1] + (k * Math.PI) / 2;
+        probe(Math.sin(a) * r, Math.cos(a) * r);
+      }
+    }
+
+    if (n === 0) return 0;
+    return sum / n;
+  }
+
+  /**
    * Collapse the candidate pool into sparse cluster labels.
    *
    * Greedy, strongest-first: take the fastest remaining candidate, emit it as a
@@ -411,8 +545,9 @@ export function createWindAnalyzer(): WindAnalyzerApi {
    *
    * @param grid geometry (cluster radius rides the grid step)
    * @param minSpeed candidacy floor -- below this a cell is not a core
+   * @param sample field sampler, for the per-cluster reading
    */
-  function cluster(grid: WindGridSpec, minSpeed: number): void {
+  function cluster(grid: WindGridSpec, minSpeed: number, sample: FieldSampler): void {
     labelView.length = 0;
     if (candCount === 0) return;
 
@@ -453,40 +588,38 @@ export function createWindAnalyzer(): WindAnalyzerApi {
       slot.y = by;
       slot.z = bz;
 
-      // Claim the core and everything in its neighbourhood, accumulating the
-      // cluster's mean speed as we go.
-      //
-      // The label reports the CLUSTER's speed, not the single hottest texel's.
-      // That is not a softening -- it is the only honest reading available. The
-      // field's u/v are clamped to the -1..1 rails, so a strong system has many
-      // texels sitting at exactly magnitude 1.0; labelling the peak would print
-      // the clamp value on every system in view and the callouts would all read
-      // the same number regardless of how the systems actually differ. Averaging
-      // over the cluster recovers the contrast the clamp destroyed: a broad,
-      // fully-saturated jet still reads at the ceiling, while a small core with
-      // a soft surround reads lower, which is the truth about those two systems.
-      let sum = 0;
-      let n = 0;
+      // Claim the core and everything in its neighbourhood, so the next
+      // iteration cannot put a second label on the same system.
       for (let i = 0; i < candCount; i++) {
-        const s = candSpeed[i] ?? -1;
-        if (s < 0) continue;
+        if ((candSpeed[i] ?? -1) < 0) continue;
         const dx = (candPos[i * 3] ?? 0) - bx;
         const dy = (candPos[i * 3 + 1] ?? 0) - by;
         const dz = (candPos[i * 3 + 2] ?? 0) - bz;
-        if (dx * dx + dy * dy + dz * dz > chordSq) continue;
-        sum += s;
-        n++;
-        candSpeed[i] = -1;
+        if (dx * dx + dy * dy + dz * dz <= chordSq) candSpeed[i] = -1;
       }
 
-      // n is at least 1 -- the core itself is always inside its own radius --
-      // but the guard costs nothing and a zero divide here would print NaN kt.
-      const clusterSpeed = n > 0 ? sum / n : bestSpeed;
+      // Reading for the label: the mean CLAMPED speed over a disc centred on
+      // the core, re-sampled from the field rather than averaged over the
+      // candidate pool.
+      //
+      // Both details are load-bearing. Averaging the pool would average only
+      // cells that already cleared the 96th percentile -- a set that is, by
+      // construction, uniformly fast -- so every system would report the same
+      // number, which is the exact failure the average is meant to fix.
+      // Re-sampling the disc includes the system's shoulders, so a tight core
+      // with a soft surround reads genuinely lower than a broad jet.
+      //
+      // And the clamp is applied to each SAMPLE, before the mean, not to the
+      // mean afterwards. The field's u/v are clamped per component, so a corner
+      // cell has magnitude sqrt(2); letting it contribute 1.41 to the mean lets
+      // one artifact of the storage format drag a whole system's reading past
+      // full scale. Clamped first, an over-the-rails cell contributes exactly
+      // full scale and nothing more.
+      const clusterSpeed = discMeanSpeed(bx, by, bz, radiusRad, grid, sample);
 
       // Knots are rounded to 5 the way plotted winds are -- "47 kt" on an EFB
       // would look like a data readout, "45 kt" looks like a wind plot.
-      const shown = Math.min(grid.knotsMagCeiling, clusterSpeed);
-      slot.knots = Math.max(5, Math.round((shown * grid.knotsPerUnit) / 5) * 5);
+      slot.knots = Math.max(5, Math.round((clusterSpeed * grid.knotsPerUnit) / 5) * 5);
       labelView.push(slot);
     }
   }
@@ -515,6 +648,7 @@ export function createWindAnalyzer(): WindAnalyzerApi {
         stats.floorSpeed = 0;
         stats.labelSpeed = 0;
         stats.maxSpeed = 0;
+        stats.emphasisTop = 0;
         stats.labels = labelView;
         return stats;
       }
@@ -525,15 +659,22 @@ export function createWindAnalyzer(): WindAnalyzerApi {
         stats.floorSpeed = 0;
         stats.labelSpeed = 0;
         stats.maxSpeed = 0;
+        stats.emphasisTop = 0;
         stats.labels = labelView;
         return stats;
       }
 
       const floor = percentile(SIGNIFICANCE_PERCENTILE, range.n, range.min, range.max);
       const labelFloor = percentile(LABEL_PERCENTILE, range.n, range.min, range.max);
+      const top = percentile(EMPHASIS_PERCENTILE, range.n, range.min, range.max);
 
-      cluster(grid, labelFloor);
+      cluster(grid, labelFloor, sample);
 
+      // The ramp needs a strictly positive span; a field of identical speeds
+      // would otherwise put the top exactly on the floor and divide by zero
+      // downstream. Nudging the top above the floor makes every cell read as
+      // full emphasis, which is the correct picture for a uniform field.
+      stats.emphasisTop = Math.max(top, floor + 1e-4);
       stats.sampleCount = range.n;
       stats.floorSpeed = floor;
       stats.labelSpeed = labelFloor;

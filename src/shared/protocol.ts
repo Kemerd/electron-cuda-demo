@@ -137,6 +137,10 @@ export interface SceneParams {
 /** Native-side 3D density grid used by the volumetric ray-marcher. */
 export const VOLUME_GRID = 256;
 
+/** Default weather coverage (see InputState.weatherCoverage): realistic
+ *  scattered systems — distinct cells, large clear regions. */
+export const WEATHER_COVERAGE_DEFAULT = 0.35;
+
 /** Interaction limits — mirrored in native/src/kernels/common.cuh */
 export const MAX_TARGETS = 8;     // simultaneous swarm rally points
 export const MAX_SHOCKWAVES = 8;  // concurrent click shockwaves in storm scene
@@ -233,6 +237,15 @@ export interface InputState {
   shockwaves: Shockwave[];    // <= MAX_SHOCKWAVES
   camera: CameraState;
   timeSec: number;            // monotonic scene clock
+  /**
+   * Weather coverage dial, 0..1 (default WEATHER_COVERAGE_DEFAULT).
+   * Shapes the density field at the SIM level in every backend: 0 = clear
+   * skies, ~0.35 = realistic scattered systems (most of the globe clear),
+   * 1 = severe widespread. Applied as a threshold/bias on generated
+   * density, not a display filter — the swarm feels the same weather the
+   * radar shows.
+   */
+  weatherCoverage?: number;
 }
 
 /* ------------------------------------------------------------------ *
