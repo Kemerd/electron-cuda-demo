@@ -1,261 +1,530 @@
 /**
  * scenes/storm -- Particle Storm.
  *
- * Phase 1 placeholder running a real CPU particle system: a few thousand
- * particles pulled through a vortex field, respawning as their energy decays.
- * It is the same behavioral model the CUDA kernel will implement at 4M
- * particles, which makes this both a demo and a CPU baseline the benchmark
- * scene can point at.
+ * THREE.Points over the raw 4-float storm records: position at [0..2] and
+ * energy at [3] are bound as two InterleavedBufferAttributes over the same
+ * buffer, so the backend's output becomes vertex data with zero repacking.
  *
- * All state lives in flat Float32Arrays allocated once at mount. The per-frame
- * cost is pure arithmetic plus one batched canvas path.
+ * Energy drives an additive color ramp (deep blue -> cyan -> white hot) and
+ * point size is distance-attenuated, which is what gives the cloud depth: near
+ * particles are large and bright, far ones fade into a haze.
+ *
+ * Interaction (CONTRACTS section 8):
+ *   cursor        a force whose mode is 1 attract / 2 repel / 3 vortex
+ *   keys 1 2 3    select that mode
+ *   click         a shockwave at the cursor's world position
+ *
+ * The cursor has no globe to raycast against here, so pointerWorld comes from
+ * unprojecting the cursor onto a plane through the origin facing the camera --
+ * the plane the storm is densest in, which is what makes the force feel like it
+ * is where the cursor is.
  */
 
-import { createBackdrop, createCaption } from '../placeholder';
-import type { Backdrop } from '../placeholder';
-import type { FrameState, Scene, SceneMountContext } from '../../types';
+import * as THREE from 'three';
+import { STORM_FLOATS } from '../../../shared/protocol';
+import type { EntityFrame, FrameState, Scene, SceneMountContext } from '../../types';
+import { spawnShockwave, SHOCKWAVE_LIFE_SEC } from '../../interaction';
 
-/** CPU particle budget. Chosen so the integrator stays well under 1ms. */
-const COUNT = 4000;
+/** Particle ceiling. Matches the Ultra storm preset. */
+const STORM_CAPACITY = 4_000_000;
 
-/** Particle lifetime bounds in seconds. */
-const LIFE_MIN = 2.2;
-const LIFE_MAX = 6.0;
+/** Click discrimination, same thresholds as the globe rig. */
+const CLICK_MAX_PX = 5;
+const CLICK_MAX_MS = 250;
 
 export default function createScene(): Scene {
   let root: HTMLElement | null = null;
-  let backdrop: Backdrop | null = null;
-  let caption: HTMLElement | null = null;
+  let renderer: THREE.WebGLRenderer | null = null;
+  let scene: THREE.Scene | null = null;
+  let camera: THREE.PerspectiveCamera | null = null;
+
+  let points: THREE.Points | null = null;
+  let geometry: THREE.InstancedBufferGeometry | THREE.BufferGeometry | null = null;
+  let material: THREE.ShaderMaterial | null = null;
+  let interleaved: THREE.InterleavedBuffer | null = null;
+
+  /** Shockwave rings -- one per live wave, animated from its age. */
+  interface WaveRing {
+    mesh: THREE.Mesh;
+    uRadius: { value: number };
+    uFade: { value: number };
+  }
+  const rings: WaveRing[] = [];
+
+  let sawEngineData = false;
+  let viewW = 1;
+  let viewH = 1;
   let timeSec = 0;
 
-  // Flat SoA layout: better cache behavior than an array of objects, and it
-  // mirrors the interleaved device layout the CUDA path will produce.
-  const px = new Float32Array(COUNT);
-  const py = new Float32Array(COUNT);
-  const vx = new Float32Array(COUNT);
-  const vy = new Float32Array(COUNT);
-  const energy = new Float32Array(COUNT);
-  const decay = new Float32Array(COUNT);
+  /** Uniform handles kept directly (see the globe scene's note on this). */
+  let uPixelRatio: { value: number } | null = null;
+  let uTime: { value: number } | null = null;
+
+  /** Pointer bookkeeping for click detection. */
+  let downX = 0;
+  let downY = 0;
+  let downTime = 0;
+  let pressActive = false;
+
+  /** Current force mode, driven by keys 1/2/3. */
+  let forceMode: 1 | 2 | 3 = 1;
+
+  /** See the globe scene: declared before the return for closure access. */
+  let lastState: FrameState | null = null;
+
+  /** Scratch, never reallocated. */
+  const ndc = new THREE.Vector2();
+  const raycaster = new THREE.Raycaster();
+  const cursorPlane = new THREE.Plane();
+  const cursorHit = new THREE.Vector3();
+  const camForward = new THREE.Vector3();
+
+  /* ---------------------------------------------------------------- *
+   *  Particle cloud
+   * ---------------------------------------------------------------- */
 
   /**
-   * Wang hash -> uniform float in [0,1). Deterministic, allocation-free, and
-   * the same generator family the kernels use, so the two look alike.
+   * Build the points cloud with the record buffer bound directly.
+   *
+   * The store is allocated at capacity once. A smaller batch just sets a
+   * shorter draw range -- reallocating a 64 MB buffer on a preset change mid
+   * frame is exactly the kind of hitch the benchmark would then measure.
    */
-  function hash01(seed: number): number {
-    let s = seed | 0;
-    s = (s ^ 61) ^ (s >>> 16);
-    s = (s + (s << 3)) | 0;
-    s = s ^ (s >>> 4);
-    s = Math.imul(s, 0x27d4eb2d);
-    s = s ^ (s >>> 15);
-    return (s >>> 0) / 4294967296;
+  function buildPoints(): THREE.Points {
+    const store = new Float32Array(STORM_CAPACITY * STORM_FLOATS);
+    const buf = new THREE.InterleavedBuffer(store, STORM_FLOATS);
+    buf.setUsage(THREE.DynamicDrawUsage);
+    interleaved = buf;
+
+    const geo = new THREE.BufferGeometry();
+    // position at [0..2], energy at [3] -- the protocol layout, read in place.
+    geo.setAttribute('position', new THREE.InterleavedBufferAttribute(buf, 3, 0, false));
+    geo.setAttribute('energy', new THREE.InterleavedBufferAttribute(buf, 1, 3, false));
+    geo.setDrawRange(0, 0);
+    // The storm fills a fixed volume; a computed bounding sphere would be
+    // recomputed every frame for a cull that can never fire.
+    geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 0, 0), 2.4);
+    geometry = geo;
+
+    const pixelRatio = { value: 1 };
+    const time = { value: 0 };
+    uPixelRatio = pixelRatio;
+    uTime = time;
+
+    const mat = new THREE.ShaderMaterial({
+      transparent: true,
+      depthWrite: false,
+      // Additive is what makes energy read as heat: overlapping particles sum
+      // toward white instead of averaging toward grey.
+      blending: THREE.AdditiveBlending,
+      uniforms: { uPixelRatio: pixelRatio, uTime: time },
+
+      vertexShader: /* glsl */ `
+        precision highp float;
+
+        attribute float energy;
+        uniform float uPixelRatio;
+
+        varying float vEnergy;
+
+        void main() {
+          vEnergy = clamp(energy, 0.0, 1.0);
+
+          vec4 mv = modelViewMatrix * vec4(position, 1.0);
+          gl_Position = projectionMatrix * mv;
+
+          // Distance attenuation: size falls as 1/d, the same way a real
+          // perspective projection scales a sphere of fixed world radius.
+          float dist = max(0.05, -mv.z);
+          float base = 2.6 + vEnergy * 3.4;
+          gl_PointSize = (base * uPixelRatio) / dist;
+
+          // Floor the size so distant particles stay visible as a haze rather
+          // than dropping below a pixel and flickering in and out.
+          gl_PointSize = max(gl_PointSize, 0.8 * uPixelRatio);
+        }
+      `,
+
+      fragmentShader: /* glsl */ `
+        precision highp float;
+
+        varying float vEnergy;
+
+        void main() {
+          // Soft round sprite. Square points would tile into a visible grid at
+          // high density.
+          vec2 d = gl_PointCoord - vec2(0.5);
+          float r2 = dot(d, d);
+          if (r2 > 0.25) discard;
+          float falloff = 1.0 - smoothstep(0.0, 0.25, r2);
+
+          // Energy ramp: deep blue -> cyan -> white hot.
+          vec3 cold = vec3(0.10, 0.22, 0.75);
+          vec3 mid  = vec3(0.20, 0.85, 1.00);
+          vec3 hot  = vec3(1.00, 1.00, 1.00);
+
+          vec3 col = vEnergy < 0.5
+            ? mix(cold, mid, vEnergy * 2.0)
+            : mix(mid, hot, (vEnergy - 0.5) * 2.0);
+
+          // Additive blending means alpha IS the intensity; scaling by energy
+          // as well as the sprite falloff keeps dim particles from summing into
+          // a bright fog at high counts.
+          float a = falloff * (0.18 + vEnergy * 0.82);
+
+          gl_FragColor = vec4(col, a);
+        }
+      `,
+    });
+    material = mat;
+
+    const pts = new THREE.Points(geo, mat);
+    pts.frustumCulled = false;
+    return pts;
   }
 
-  let respawnSeed = 12345;
+  /**
+   * Build the shockwave ring pool. Same analytic-ring approach the globe's
+   * target markers use: the shader draws the ring, the mesh is a plain quad.
+   */
+  function buildRings(parent: THREE.Scene): void {
+    for (let i = 0; i < 8; i++) {
+      const uRadius = { value: 0 };
+      const uFade = { value: 0 };
+
+      const mat = new THREE.ShaderMaterial({
+        transparent: true,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+        blending: THREE.AdditiveBlending,
+        uniforms: { uRadius, uFade },
+        vertexShader: /* glsl */ `
+          precision highp float;
+          varying vec2 vUv;
+          void main() {
+            vUv = uv;
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+          }
+        `,
+        fragmentShader: /* glsl */ `
+          precision highp float;
+          uniform float uRadius;
+          uniform float uFade;
+          varying vec2 vUv;
+          void main() {
+            vec2 d = vUv - vec2(0.5);
+            float r = length(d) * 2.0;
+            // A thin shell at the wave's current radius, matching the impulse
+            // the kernel applies -- the ring you see is the ring that pushes.
+            float band = 1.0 - smoothstep(0.0, 0.09, abs(r - uRadius));
+            if (band <= 0.001) discard;
+            gl_FragColor = vec4(vec3(0.55, 0.92, 1.0), band * uFade * 0.55);
+          }
+        `,
+      });
+
+      const geo = new THREE.PlaneGeometry(4.4, 4.4);
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.visible = false;
+      mesh.renderOrder = 3;
+      parent.add(mesh);
+
+      rings.push({ mesh, uRadius, uFade });
+    }
+  }
+
+  /* ---------------------------------------------------------------- *
+   *  Input
+   * ---------------------------------------------------------------- */
 
   /**
-   * (Re)seed one particle onto the outer rim with a tangential kick.
-   * @param i particle index
+   * Unproject the cursor onto a plane through the origin facing the camera.
+   *
+   * There is no globe here to hit, but the storm is a volume centred on the
+   * origin, so the plane through the origin perpendicular to the view direction
+   * is where the cloud is densest -- putting the force there is what makes it
+   * feel attached to the cursor rather than floating in front of or behind it.
    */
-  function respawn(i: number): void {
-    respawnSeed = (respawnSeed + 0x9e3779b9) | 0;
-    const a = hash01(respawnSeed + i) * Math.PI * 2;
-    const r = 0.55 + hash01(respawnSeed ^ (i * 2654435761)) * 0.45;
+  function cursorToWorld(nx: number, ny: number, out: THREE.Vector3): boolean {
+    if (!camera) return false;
+    ndc.set(nx, ny);
+    raycaster.setFromCamera(ndc, camera);
 
-    px[i] = Math.cos(a) * r;
-    py[i] = Math.sin(a) * r;
+    camera.getWorldDirection(camForward);
+    cursorPlane.setFromNormalAndCoplanarPoint(camForward, new THREE.Vector3(0, 0, 0));
 
-    // Tangential launch so the field spins up immediately instead of collapsing.
-    vx[i] = -Math.sin(a) * 0.35;
-    vy[i] = Math.cos(a) * 0.35;
+    return raycaster.ray.intersectPlane(cursorPlane, out) !== null;
+  }
 
-    energy[i] = 1;
-    const life = LIFE_MIN + hash01(respawnSeed + i * 7919) * (LIFE_MAX - LIFE_MIN);
-    decay[i] = 1 / life;
+  function onKeyDown(e: KeyboardEvent): void {
+    // 1 attract, 2 repel, 3 vortex -- matching MouseForceMode in protocol.ts.
+    if (e.key === '1') forceMode = 1;
+    else if (e.key === '2') forceMode = 2;
+    else if (e.key === '3') forceMode = 3;
+    else return;
+    console.log(`[storm] force mode -> ${forceMode}`);
+  }
+
+  function onPointerDown(e: PointerEvent): void {
+    downX = e.clientX;
+    downY = e.clientY;
+    downTime = performance.now();
+    pressActive = e.button === 0;
+  }
+
+  function onPointerMove(e: PointerEvent): void {
+    if (!pressActive) return;
+    const dx = e.clientX - downX;
+    const dy = e.clientY - downY;
+    if (dx * dx + dy * dy > CLICK_MAX_PX * CLICK_MAX_PX) pressActive = false;
+  }
+
+  /** A click (not a drag) spawns a shockwave where the cursor is. */
+  function onPointerUp(e: PointerEvent): void {
+    const wasActive = pressActive;
+    pressActive = false;
+    if (!wasActive) return;
+    if (performance.now() - downTime > CLICK_MAX_MS) return;
+    if (!renderer || !lastState) return;
+
+    const rect = renderer.domElement.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+
+    const nx = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+    const ny = -(((e.clientY - rect.top) / rect.height) * 2 - 1);
+
+    if (cursorToWorld(nx, ny, cursorHit)) {
+      spawnShockwave(lastState.input, [cursorHit.x, cursorHit.y, cursorHit.z]);
+    }
+  }
+
+  function onContextMenu(e: Event): void {
+    // Right-drag is the repel mode here, not a menu.
+    e.preventDefault();
   }
 
   return {
     mount(ctx: SceneMountContext) {
       root = document.createElement('div');
       root.className = 'scene-root';
+      if (ctx && ctx.host) ctx.host.appendChild(root);
 
-      backdrop = createBackdrop(root, { tint: '190,110,255', accent: '255,120,170' });
-
-      caption = createCaption(root, {
-        tag: 'Particle Storm',
-        title: 'CPU baseline, 4k particles',
-        body:
-          'A real vortex integrator running on the main thread -- the same model the CUDA kernel scales to four million particles with hash-based RNG and analytic curl noise. This stays as the CPU column in the benchmark.',
-      });
-
-      // Stagger initial energies so particles do not all expire on the same frame.
-      for (let i = 0; i < COUNT; i++) {
-        respawn(i);
-        energy[i] = hash01(i * 2246822519) * 0.9 + 0.1;
+      try {
+        renderer = new THREE.WebGLRenderer({
+          antialias: false, // additive points do not benefit; MSAA just costs
+          alpha: false,
+          powerPreference: 'high-performance',
+        });
+      } catch (err) {
+        const why = err instanceof Error ? err.message : String(err);
+        console.warn(`[storm] WebGL unavailable: ${why}`);
+        renderer = null;
+        return;
       }
 
-      if (ctx && ctx.host) ctx.host.appendChild(root);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+      renderer.setClearColor(0x04040a, 1);
+      renderer.domElement.className = 'scene-canvas';
+      root.appendChild(renderer.domElement);
+
+      camera = new THREE.PerspectiveCamera(55, 1.6, 0.05, 100);
+      camera.position.set(0, 0.6, 5.0);
+      camera.lookAt(0, 0, 0);
+
+      scene = new THREE.Scene();
+      points = buildPoints();
+      scene.add(points);
+      buildRings(scene);
+
+      const canvas = renderer.domElement;
+      canvas.addEventListener('contextmenu', onContextMenu);
+      canvas.addEventListener('pointerdown', onPointerDown);
+      canvas.addEventListener('pointermove', onPointerMove);
+      canvas.addEventListener('pointerup', onPointerUp);
+      // Keys are global: the canvas is not focusable and requiring a click to
+      // arm the shortcuts is a worse experience than a window listener.
+      window.addEventListener('keydown', onKeyDown);
+
+      console.log('[storm] particle scene mounted');
     },
 
     unmount() {
-      if (backdrop) backdrop.dispose();
-      if (caption && caption.parentNode) caption.parentNode.removeChild(caption);
+      if (renderer) {
+        const canvas = renderer.domElement;
+        canvas.removeEventListener('contextmenu', onContextMenu);
+        canvas.removeEventListener('pointerdown', onPointerDown);
+        canvas.removeEventListener('pointermove', onPointerMove);
+        canvas.removeEventListener('pointerup', onPointerUp);
+      }
+      window.removeEventListener('keydown', onKeyDown);
+
+      if (scene) {
+        scene.traverse((obj) => {
+          const m = obj as Partial<THREE.Mesh> & Partial<THREE.Points>;
+          if (m.geometry && typeof m.geometry.dispose === 'function') m.geometry.dispose();
+          const mat = m.material;
+          if (Array.isArray(mat)) {
+            for (const one of mat) if (one && typeof one.dispose === 'function') one.dispose();
+          } else if (mat && typeof mat.dispose === 'function') {
+            mat.dispose();
+          }
+        });
+        scene.clear();
+      }
+
+      if (renderer) {
+        renderer.dispose();
+        renderer.forceContextLoss();
+        if (renderer.domElement.parentNode) {
+          renderer.domElement.parentNode.removeChild(renderer.domElement);
+        }
+      }
+
       if (root && root.parentNode) root.parentNode.removeChild(root);
+
       root = null;
-      backdrop = null;
-      caption = null;
+      renderer = null;
+      scene = null;
+      camera = null;
+      points = null;
+      geometry = null;
+      material = null;
+      interleaved = null;
+      uPixelRatio = null;
+      uTime = null;
+      rings.length = 0;
+      sawEngineData = false;
+      lastState = null;
     },
 
     resize(w: number, h: number) {
-      if (backdrop) backdrop.resize(w, h);
+      if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return;
+      viewW = w;
+      viewH = h;
+      if (renderer) renderer.setSize(w, h, false);
+      if (camera) {
+        camera.aspect = w / h;
+        camera.updateProjectionMatrix();
+      }
+      if (uPixelRatio && renderer) uPixelRatio.value = renderer.getPixelRatio();
+    },
+
+    setEntities(f: EntityFrame) {
+      if (!f || !interleaved || !geometry) return;
+      if (!(f.records instanceof Float32Array)) return;
+
+      // Storm records are 4 floats. A swarm batch arriving here would be read
+      // as garbage positions, so refuse it outright.
+      if (f.stride !== STORM_FLOATS) {
+        geometry.setDrawRange(0, 0);
+        return;
+      }
+
+      const n = Math.min(
+        f.count,
+        STORM_CAPACITY,
+        Math.floor(f.records.length / STORM_FLOATS),
+      );
+      if (n <= 0) {
+        geometry.setDrawRange(0, 0);
+        return;
+      }
+
+      const store = interleaved.array as Float32Array;
+      store.set(f.records.subarray(0, n * STORM_FLOATS));
+
+      interleaved.needsUpdate = true;
+      interleaved.clearUpdateRanges();
+      interleaved.addUpdateRange(0, n * STORM_FLOATS);
+
+      geometry.setDrawRange(0, n);
+      sawEngineData = true;
+    },
+
+    hasEngineData(): boolean {
+      return sawEngineData;
     },
 
     frame(dt: number, state: FrameState) {
-      if (!backdrop || !backdrop.ctx) return;
+      if (!renderer || !scene || !camera) return;
 
-      // Clamp the step: a long stall must not teleport every particle.
-      let step = Number.isFinite(dt) ? Math.min(Math.max(dt, 0), 0.05) : 0.016;
-      if (state && state.reducedMotion) step *= 0.35;
-      timeSec += step;
+      lastState = state;
 
-      backdrop.drawWash(timeSec);
+      const step = Number.isFinite(dt) ? Math.min(Math.max(dt, 0), 0.1) : 0;
+      timeSec += state && state.reducedMotion ? step * 0.35 : step;
+      if (uTime) uTime.value = timeSec;
 
-      const ctx = backdrop.ctx;
-      const W = backdrop.width();
-      const H = backdrop.height();
-      if (W <= 0 || H <= 0) return;
+      // Serialize the camera so the CUDA path renders the identical view.
+      if (state && state.input && state.input.camera) {
+        const cam = state.input.camera;
+        cam.pos[0] = camera.position.x;
+        cam.pos[1] = camera.position.y;
+        cam.pos[2] = camera.position.z;
+        cam.quat[0] = camera.quaternion.x;
+        cam.quat[1] = camera.quaternion.y;
+        cam.quat[2] = camera.quaternion.z;
+        cam.quat[3] = camera.quaternion.w;
+        cam.fovYDeg = camera.fov;
+        cam.aspect = viewH > 0 ? viewW / viewH : 1.6;
+      }
 
-      // Pointer becomes an attractor when held down -- state.pointer is
-      // normalized 0..1 over the stage surface.
-      const pointer = state && state.pointer;
-      const hasPull = !!(pointer && pointer.down);
-      // Map pointer into the same [-1,1] space the particles live in.
-      const pullX = hasPull && pointer ? pointer.x * 2 - 1 : 0;
-      const pullY = hasPull && pointer ? -(pointer.y * 2 - 1) : 0;
+      // Cursor ray -> world, every frame. This is the pointer force's position.
+      if (state && state.input && state.pointer) {
+        const nx = state.pointer.x * 2 - 1;
+        const ny = -(state.pointer.y * 2 - 1);
+        state.input.pointerWorld = cursorToWorld(nx, ny, cursorHit)
+          ? [cursorHit.x, cursorHit.y, cursorHit.z]
+          : null;
 
-      integrate(step, timeSec, hasPull, pullX, pullY);
-      draw(ctx, W, H);
+        // The keyboard owns the mode; the pointer only says whether it is down.
+        state.input.mouse.mode = forceMode;
+        state.input.mouse.down = state.pointer.down;
+        state.input.mouse.x = state.pointer.x;
+        state.input.mouse.y = state.pointer.y;
+      }
+
+      updateRings(state);
+
+      renderer.render(scene, camera);
     },
   };
 
   /**
-   * Advance every particle one step. Vortex + inward pull + optional pointer
-   * attractor, semi-implicit Euler with velocity damping.
+   * Animate the shockwave rings from the live wave list. Each ring is billboarded
+   * to face the camera so it reads as a wave front from any angle.
    */
-  function integrate(
-    dt: number,
-    t: number,
-    hasPull: boolean,
-    pullX: number,
-    pullY: number,
-  ): void {
-    // Slow global rotation of the vortex axis keeps the field from settling.
-    const swirl = 1.15 + Math.sin(t * 0.23) * 0.35;
-    const damp = Math.exp(-1.1 * dt); // frame-rate independent damping
+  function updateRings(state: FrameState): void {
+    const waves = state && state.input && Array.isArray(state.input.shockwaves)
+      ? state.input.shockwaves
+      : [];
 
-    for (let i = 0; i < COUNT; i++) {
-      // The ?? 0 fallbacks satisfy noUncheckedIndexedAccess; i is always in
-      // range for arrays allocated at COUNT.
-      const x = px[i] ?? 0;
-      const y = py[i] ?? 0;
+    for (let i = 0; i < rings.length; i++) {
+      const ring = rings[i];
+      if (!ring) continue;
 
-      const r2 = x * x + y * y;
-      // Softening constant avoids the singularity at the origin; without it a
-      // particle passing near center gets slingshot to infinity.
-      const inv = 1 / (r2 + 0.04);
-
-      // Tangential (curl) component -- this is what makes it a vortex.
-      let ax = -y * swirl * inv;
-      let ay = x * swirl * inv;
-
-      // Weak inward pull so particles spiral in rather than orbiting forever.
-      ax -= x * 0.55;
-      ay -= y * 0.55;
-
-      if (hasPull) {
-        const dx = pullX - x;
-        const dy = pullY - y;
-        const d2 = dx * dx + dy * dy + 0.05;
-        const g = 2.4 / d2;
-        ax += dx * g;
-        ay += dy * g;
+      const w = i < waves.length ? waves[i] : null;
+      if (!w || w.age >= SHOCKWAVE_LIFE_SEC) {
+        if (ring.mesh.visible) ring.mesh.visible = false;
+        continue;
       }
 
-      let nvx = ((vx[i] ?? 0) + ax * dt) * damp;
-      let nvy = ((vy[i] ?? 0) + ay * dt) * damp;
-
-      // Speed clamp: keeps the trail lengths bounded and the motion readable.
-      const sp2 = nvx * nvx + nvy * nvy;
-      if (sp2 > 9) {
-        const s = 3 / Math.sqrt(sp2);
-        nvx *= s;
-        nvy *= s;
+      const p = w.pos;
+      if (!p || p.length !== 3) {
+        ring.mesh.visible = false;
+        continue;
       }
 
-      vx[i] = nvx;
-      vy[i] = nvy;
-      px[i] = x + nvx * dt;
-      py[i] = y + nvy * dt;
+      ring.mesh.position.set(p[0], p[1], p[2]);
+      // Billboard: copy the camera's orientation so the quad always faces us.
+      if (camera) ring.mesh.quaternion.copy(camera.quaternion);
+      ring.mesh.visible = true;
 
-      energy[i] = (energy[i] ?? 0) - (decay[i] ?? 0) * dt;
-
-      // Recycle on death or on escaping the visible region.
-      const nx = px[i] ?? 0;
-      const ny = py[i] ?? 0;
-      if ((energy[i] ?? 0) <= 0 || nx * nx + ny * ny > 2.6) respawn(i);
+      // Normalized radius in the quad's own uv space. The quad is 4.4 world
+      // units across and the kernel's wave expands at SHOCK_SPEED (1.9 u/s),
+      // so this maps the wave's real radius onto the ring's 0..1 uv radius.
+      const worldR = w.age * 1.9;
+      ring.uRadius.value = Math.min(1, worldR / 2.2);
+      ring.uFade.value = Math.max(0, 1 - w.age / SHOCKWAVE_LIFE_SEC);
     }
-  }
-
-  /** One energy band and the color it paints. */
-  interface Band {
-    lo: number;
-    hi: number;
-    style: string;
-    size: number;
-  }
-
-  /**
-   * Batched draw. Particles are bucketed into three energy bands so we get a
-   * color ramp with three fillStyle changes instead of COUNT of them.
-   */
-  function draw(ctx: CanvasRenderingContext2D, W: number, H: number): void {
-    const scale = Math.min(W, H) * 0.42;
-    const cx = W * 0.5;
-    const cy = H * 0.5;
-    const dot = Math.max(0.8, Math.min(W, H) * 0.0022);
-
-    ctx.globalCompositeOperation = 'lighter';
-
-    // Band edges and their colors, hot core to cool rim.
-    const bands: Band[] = [
-      { lo: 0.66, hi: 1.01, style: 'rgba(255,190,235,0.55)', size: 1.25 },
-      { lo: 0.33, hi: 0.66, style: 'rgba(200,120,255,0.42)', size: 1.0 },
-      { lo: 0.0, hi: 0.33, style: 'rgba(120,90,220,0.30)', size: 0.8 },
-    ];
-
-    for (let b = 0; b < bands.length; b++) {
-      const band = bands[b];
-      if (!band) continue;
-      ctx.fillStyle = band.style;
-      ctx.beginPath();
-
-      const r = dot * band.size;
-      for (let i = 0; i < COUNT; i++) {
-        const e = energy[i] ?? 0;
-        if (e < band.lo || e >= band.hi) continue;
-
-        const sx = cx + (px[i] ?? 0) * scale;
-        const sy = cy - (py[i] ?? 0) * scale;
-        // Cull offscreen points before paying for the arc.
-        if (sx < -8 || sy < -8 || sx > W + 8 || sy > H + 8) continue;
-
-        ctx.moveTo(sx + r, sy);
-        ctx.arc(sx, sy, r, 0, Math.PI * 2);
-      }
-
-      ctx.fill();
-    }
-
-    ctx.globalCompositeOperation = 'source-over';
   }
 }
