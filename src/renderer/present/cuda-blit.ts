@@ -163,6 +163,12 @@ export function createCudaBlit(host: HTMLElement | null): CudaBlitApi {
   const canvas = document.createElement('canvas');
   canvas.className = 'scene-canvas cuda-blit-canvas';
   canvas.style.display = 'none';
+  // This canvas only ever SHOWS pixels; every interaction (orbit, pan, zoom,
+  // click-to-target) belongs to the rig canvas underneath it. Without this the
+  // blit canvas is the hit target for the whole stage in mode 5 and the camera
+  // silently stops responding -- OrbitControls listens on the three.js canvas,
+  // which is a sibling, so the events never reach it by bubbling.
+  canvas.style.pointerEvents = 'none';
   // Sits above the three.js canvas when shown; both are absolutely positioned
   // inside the stage surface, and the CSS class carries the inset/z-index.
   canvas.width = 1;

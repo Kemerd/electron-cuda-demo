@@ -138,9 +138,77 @@ __device__ __forceinline__ float3 AtmoColor() { return gsMake(0.290f, 0.520f, 0.
 /** City-light colour on the night side. */
 __device__ __forceinline__ float3 NightColor() { return gsMake(0.95f, 0.72f, 0.38f); }
 
-/** Cloud albedo. Slightly blue-shifted in shadow, warm in the sun. */
-__device__ __forceinline__ float3 CloudLit() { return gsMake(1.00f, 0.98f, 0.94f); }
-__device__ __forceinline__ float3 CloudShadow() { return gsMake(0.28f, 0.33f, 0.44f); }
+/* ===================================================================== *
+ *  NEXRAD reflectivity ramp
+ * ===================================================================== */
+
+/**
+ * @brief Band index for a reflectivity value, 0..5.
+ *
+ * The classic six-class NEXRAD ladder: light green, green, yellow, orange, red,
+ * magenta. Anything below kEchoFloor is clear air and gets no band at all - the
+ * caller must test that separately, because band 0 is a real echo, not "nothing".
+ *
+ * The thresholds are NOT invented here. They are the same edges the renderer's
+ * radar overlay uses, so the CUDA march and the three.js shell quantise the
+ * identical field into the identical classes - that equivalence is the entire
+ * point of the side-by-side comparison. Source of truth for the numbers:
+ * src/renderer/scenes/weather/index.ts, the stepped ladder in the radar shell's
+ * fragment shader (buildRadar()). Both originate from the CONTRACTS section 8
+ * spec. Keep the two in sync or the demo's central claim stops being true.
+ *
+ * Written as a compare ladder rather than a lookup table for the same reason the
+ * renderer does it: six compares beat a constant-memory read per march step, and
+ * the edges being inline next to the colours they produce makes them reviewable.
+ *
+ * @param d reflectivity (the field's B channel), 0..1
+ * @return band index 0..5
+ */
+__device__ __forceinline__ int ReflectivityBand(float d) {
+  if (d < 0.20f) return 0;
+  if (d < 0.34f) return 1;
+  if (d < 0.50f) return 2;
+  if (d < 0.66f) return 3;
+  if (d < 0.82f) return 4;
+  return 5;
+}
+
+/**
+ * @brief Colour for a reflectivity band.
+ *
+ * Mirrors the renderer's palette exactly (see ReflectivityBand for the source
+ * file). The values there are authored in sRGB for a GLSL shader that writes
+ * straight to the framebuffer; this path composites in linear space and applies
+ * the transfer function at the end, so each channel is raised to 2.2 to match
+ * what the renderer actually puts on screen. Skipping that conversion is what
+ * would make the CUDA bands read washed-out next to the three.js ones.
+ *
+ * @param band index 0..5, as returned by ReflectivityBand
+ * @return linear-space RGB for that band
+ */
+__device__ __forceinline__ float3 ReflectivityColor(int band) {
+  // sRGB values, verbatim from the renderer's ladder.
+  float3 c;
+  switch (band) {
+    case 0:  c = gsMake(0.16f, 0.62f, 0.24f); break;  // light green
+    case 1:  c = gsMake(0.13f, 0.83f, 0.18f); break;  // green
+    case 2:  c = gsMake(0.98f, 0.95f, 0.20f); break;  // yellow
+    case 3:  c = gsMake(0.99f, 0.63f, 0.11f); break;  // orange
+    case 4:  c = gsMake(0.93f, 0.16f, 0.14f); break;  // red
+    default: c = gsMake(0.86f, 0.20f, 0.83f); break;  // magenta
+  }
+  return gsMake(__powf(c.x, 2.2f), __powf(c.y, 2.2f), __powf(c.z, 2.2f));
+}
+
+/**
+ * @brief Clear-air threshold. Below this there is no echo and the march must
+ *        contribute nothing, so the globe shows through between cells.
+ *
+ * Same 0.08 the renderer discards at. This is what keeps the shell from becoming
+ * a uniform haze: without a hard floor, the vast low-density majority of the
+ * volume each contributes a sliver of the lowest band and the sum is fog.
+ */
+constexpr float kEchoFloor = 0.08f;
 
 /* ===================================================================== *
  *  Volumetric march parameters
@@ -156,8 +224,28 @@ constexpr int kMarchSteps = 56;
  *  nothing a viewer can see. */
 constexpr float kAlphaCutoff = 0.98f;
 
-/** Extinction coefficient - how fast density turns into opacity. */
-constexpr float kExtinction = 7.5f;
+/**
+ * Extinction coefficient - how fast density turns into opacity.
+ *
+ * The old value (7.5) was tuned for the generic-cloud look, where every sample
+ * was shaded the same near-white regardless of reflectivity, so the whole shell
+ * saturated into flat fog. What makes the radar read work is not a lower
+ * extinction but the fact that the marched density is now scaled by reflectivity
+ * twice over - the extrusion scales density by the base reflectivity, and a
+ * stronger cell also gets a taller column to march through - so the opacity
+ * spread across the six bands comes out of the density, not out of this constant.
+ *
+ * 9.0 is where that spread lands correctly. Integrating a full column through
+ * the shell at the average detail-noise value gives, band 0 through band 5:
+ * 0.11 / 0.38 / 0.66 / 0.88 / 0.97 / 0.98 opacity. A light-green region is
+ * translucent enough to read the continents through - which is what keeps it a
+ * radar overlay rather than an overcast deck - while a magenta core is
+ * effectively solid. Lower values (the 3.2 this was first set to) push band 0
+ * down to 4% opacity, which disappears entirely against the globe and throws
+ * away most of the picture, since real reflectivity products are mostly green
+ * with small embedded cores.
+ */
+constexpr float kExtinction = 9.0f;
 
 /** Shell the march covers, matching weather.cu's volume extrusion. */
 constexpr float kShellInner = GS_GLOBE_RADIUS;
@@ -403,6 +491,58 @@ __device__ __forceinline__ float SampleVolume(const unsigned char* __restrict__ 
   const float x11 = gsLerpf(c011, c111, tx);
 
   return gsLerpf(gsLerpf(x00, x10, ty), gsLerpf(x01, x11, ty), tz);
+}
+
+/**
+ * @brief Bilinear sample of the equirect field's reflectivity (B) channel.
+ *
+ * This is the SAME buffer the renderer uploads into its radar-overlay texture,
+ * read with the same equirect convention weather.cu writes and swarm.cu samples
+ * (row 0 = north pole, column 0 = longitude -180). Reading the field directly -
+ * rather than inferring reflectivity from the marched density - is what lets the
+ * CUDA columns land in the same bands as the three.js shell: the volume has an
+ * altitude falloff and 3D erosion noise baked into it, so its local value is an
+ * opacity, not a reflectivity, and banding it would put cells a class or two off.
+ *
+ * Bilinear rather than nearest because the band edges are hard: nearest sampling
+ * makes the boundary between two classes follow the field's texel grid, which
+ * reads as blocky staircase artifacts rather than the smooth-edged bands of a
+ * real mosaic. (The quantisation still happens after the interpolation - exactly
+ * the same order the renderer uses, and for the same reason.)
+ *
+ * @param field RGBA8 equirect, may be null
+ * @param w,h   field dimensions, w == 2*h
+ * @param dir   normalized world direction
+ * @return reflectivity 0..1, or 0 when no field is available
+ */
+__device__ __forceinline__ float SampleReflectivity(const unsigned char* __restrict__ field, int w,
+                                                    int h, const float3& dir) {
+  if (!field || w <= 1 || h <= 1) return 0.0f;
+
+  const float lat = asinf(gsClampf(dir.y, -1.0f, 1.0f));
+  const float lon = atan2f(dir.x, dir.z);
+
+  const float fx = ((lon + 3.1415927f) / 6.2831853f) * static_cast<float>(w) - 0.5f;
+  const float fy = ((1.5707963f - lat) / 3.1415927f) * static_cast<float>(h) - 0.5f;
+
+  const int x0 = static_cast<int>(floorf(fx));
+  const int y0 = static_cast<int>(floorf(fy));
+  const float tx = fx - static_cast<float>(x0);
+  const float ty = fy - static_cast<float>(y0);
+
+  // Longitude is periodic; latitude clamps at the poles.
+  const int xa = ((x0 % w) + w) % w;
+  const int xb = (((x0 + 1) % w) + w) % w;
+  const int ya = min(max(y0, 0), h - 1);
+  const int yb = min(max(y0 + 1, 0), h - 1);
+
+  const float inv = 1.0f / 255.0f;
+  const float d00 = field[(static_cast<size_t>(ya) * w + xa) * GS_RGBA_CHANNELS + 2] * inv;
+  const float d10 = field[(static_cast<size_t>(ya) * w + xb) * GS_RGBA_CHANNELS + 2] * inv;
+  const float d01 = field[(static_cast<size_t>(yb) * w + xa) * GS_RGBA_CHANNELS + 2] * inv;
+  const float d11 = field[(static_cast<size_t>(yb) * w + xb) * GS_RGBA_CHANNELS + 2] * inv;
+
+  return gsLerpf(gsLerpf(d00, d10, tx), gsLerpf(d01, d11, tx), ty);
 }
 
 /**
@@ -699,6 +839,12 @@ void SplatStormKernel(float4* __restrict__ accum, int w, int h,
 struct CompositeArgs {
   const float4* accum;             ///< splat accumulation buffer, may be null
   const unsigned char* volume;     ///< density volume, may be null
+  /** RGBA8 equirect weather field; the B channel is the reflectivity the march
+   *  bands. Null outside the weather scene, which simply drops the colouring
+   *  back to the neutral fallback rather than skipping the volume. */
+  const unsigned char* field;
+  int fieldW;
+  int fieldH;
   cudaTextureObject_t earth;       ///< globe texture, 0 when not uploaded
   float timeSec;
   int hasGlobe;                    ///< 1 when the globe + its limb glow are drawn
@@ -793,10 +939,17 @@ __device__ float3 ShadePixel(int px, int py, int w, int h, const InputUniforms& 
         const float lightNoise = gsFbm3(gsScale(n, 26.0f), 3, 0x6E9Bu);
         const float lights = gsSmoothstep(0.30f, 0.55f, lightNoise) *
                              gsSmoothstep(0.0f, 0.15f, gsFbm3(gsScale(n, 1.7f), 5, 0x1A5Fu));
-        surface = gsAdd(surface, gsScale(NightColor(), lights * night * 0.55f));
+        // City lights lifted from 0.55: at the default camera the terminator
+        // covers enough of the disc that the CUDA globe read noticeably darker
+        // than the three.js one, and the emissive layer is the part a viewer
+        // actually reads as "the night side" rather than as absence of light.
+        surface = gsAdd(surface, gsScale(NightColor(), lights * night * 0.85f));
         // Never fully black - a pure-black night side reads as a hole punched
-        // in the frame rather than as unlit ground.
-        surface = gsAdd(surface, gsScale(albedo, night * 0.025f));
+        // in the frame rather than as unlit ground. Raised from 0.025 to lift
+        // the unlit floor a little; deliberately still small, because this term
+        // is flat and pushing it further is what would wash the terminator out
+        // into a uniformly grey planet with no day/night read at all.
+        surface = gsAdd(surface, gsScale(albedo, night * 0.055f));
       }
 
       // Specular sheen on water only. The land mask is recomputed rather than
@@ -841,7 +994,19 @@ __device__ float3 ShadePixel(int px, int py, int w, int h, const InputUniforms& 
     }
   }
 
-  /* --- volumetric clouds -------------------------------------------------- */
+  /* --- volumetric reflectivity columns ------------------------------------ */
+  // NEXRAD read, not clouds. CONTRACTS section 8: the CUDA raster extrudes the
+  // SAME reflectivity field into its volumetric march, coloured by the SAME
+  // 6-band ramp the surface radar uses, so storm cells appear as discrete
+  // coloured columns with vertical build proportional to reflectivity.
+  //
+  // The colour is keyed on the COLUMN's reflectivity (sampled from the 2D field
+  // along the ray's current radial direction), while the marched volume supplies
+  // the opacity and the vertical shape. That split is deliberate: banding the
+  // marched density instead would band an opacity that already has the altitude
+  // falloff and the erosion noise folded into it, so a single cell would change
+  // colour as the ray climbed through it - the exact opposite of the stepped,
+  // per-cell classification a radar mosaic shows.
   if (args.hasVolume && args.volume) {
     float tNear, tFar;
     if (ShellRange(ro, rd, globeHit, &tNear, &tFar)) {
@@ -868,31 +1033,67 @@ __device__ float3 ShadePixel(int px, int py, int w, int h, const InputUniforms& 
         const float density = SampleVolume(args.volume, sp, kShellOuter);
 
         if (density > 0.003f) {
-          // Beer-Lambert absorption over this segment.
-          const float sigma = density * kExtinction;
-          const float alpha = 1.0f - __expf(-sigma * stepLen);
+          // Column reflectivity for this sample's radial direction. One bilinear
+          // fetch of the 2D field - the same texels the renderer's overlay reads.
+          //
+          // Fallback when no field is published (the volume can legitimately be
+          // resident a frame before the field is, on the first weather frame):
+          // classify on the marched density instead. It is the wrong quantity to
+          // band, but it is monotonic in reflectivity, so the frame shows plausible
+          // cells for one frame rather than a volume that silently disappears
+          // because every sample tested below the echo floor.
+          const float refl = args.field
+                                 ? SampleReflectivity(args.field, args.fieldW, args.fieldH,
+                                                      gsNormalize(sp))
+                                 : density;
 
-          // Lighting: one cheap shadow estimate from the density a short step
-          // toward the sun. A full secondary march would be 6-8x the cost for a
-          // difference that the tonemap mostly swallows.
-          const float3 lightSample = gsAdd(sp, gsScale(sun, 0.035f));
-          const float occl = SampleVolume(args.volume, lightSample, kShellOuter);
-          const float shadow = __expf(-occl * 5.5f);
+          // Clear air contributes nothing at all. Skipping below the echo floor
+          // is what leaves the globe visible between cells instead of letting the
+          // long tail of near-zero samples accumulate into a grey wash.
+          if (refl >= kEchoFloor) {
+            // Quantise, then look the colour up. Stepped on purpose - the banding
+            // of a real NEXRAD mosaic is authentic and must not be smoothed away.
+            const int band = ReflectivityBand(refl);
+            const float3 bandColor = ReflectivityColor(band);
 
-          // Sun visibility at this point: the globe itself casts the night side
-          // into shadow, so clouds there must not be lit.
-          const float sunFacing = gsClampf(gsDot(gsNormalize(sp), sun) * 2.6f + 0.35f, 0.0f, 1.0f);
+            // Beer-Lambert absorption over this segment.
+            //
+            // Note there is deliberately NO per-band opacity multiplier here.
+            // The marched density already carries the reflectivity twice over -
+            // once because the extrusion scales density by the base reflectivity,
+            // and again because a stronger cell is given a taller column to march
+            // through - so scaling sigma by the band as well is a third helping
+            // of the same signal. Measured: with a band multiplier a light-green
+            // column integrates to ~2% opacity while a magenta one reaches ~89%,
+            // a 40x spread that makes the low bands invisible. Real reflectivity
+            // products are mostly green with small embedded cores, so losing the
+            // green is losing most of the picture.
+            const float sigma = density * kExtinction;
+            const float alpha = 1.0f - __expf(-sigma * stepLen);
 
-          // Henyey-Greenstein-ish forward scattering, approximated with a
-          // squared cosine lobe - one multiply instead of a pow and a divide.
-          const float cosT = gsDot(rd, sun);
-          const float forward = 0.55f + 0.45f * cosT * cosT * (cosT > 0.0f ? 1.0f : 0.35f);
+            // Self-shadowing, from the density a short step toward the sun. Kept
+            // (and kept cheap) because without it the columns are flat slabs of
+            // pure band colour with no sense of volume at all.
+            const float3 lightSample = gsAdd(sp, gsScale(sun, 0.035f));
+            const float occl = SampleVolume(args.volume, lightSample, kShellOuter);
+            const float shadow = __expf(-occl * 3.0f);
 
-          float3 lit = gsLerp3(CloudShadow(), CloudLit(), shadow * sunFacing);
-          lit = gsScale(lit, forward * (0.18f + 0.82f * sunFacing));
+            // Day/night: the globe casts its night side into shadow, so a cell
+            // over on the dark side must not glow at full strength. The floor is
+            // higher than a physical cloud's would be - this is an instrument
+            // layer, and a radar echo that vanishes at the terminator is useless.
+            const float sunFacing = gsClampf(gsDot(gsNormalize(sp), sun) * 2.6f + 0.35f, 0.0f, 1.0f);
 
-          scattered = gsAdd(scattered, gsScale(lit, alpha * transmittance));
-          transmittance *= (1.0f - alpha);
+            // Shade the band colour rather than lerping toward white/grey: the
+            // hue IS the data here, so lighting may only scale its brightness.
+            // Anything that desaturates it toward a cloud palette destroys the
+            // classification the viewer is meant to read.
+            const float lighting = 0.55f + 0.45f * shadow * (0.35f + 0.65f * sunFacing);
+            const float3 lit = gsScale(bandColor, lighting);
+
+            scattered = gsAdd(scattered, gsScale(lit, alpha * transmittance));
+            transmittance *= (1.0f - alpha);
+          }
         }
 
         dist += stepLen;
@@ -1106,6 +1307,27 @@ CompositeArgs BuildArgs(const ScenePasses& passes, float timeSec) {
   // volume belonging to a scene we have left never even reaches the kernel.
   args.volume = passes.volume ? st.densityVolume.load(std::memory_order_relaxed) : nullptr;
   args.hasVolume = (args.volume != nullptr) ? 1 : 0;
+
+  // The reflectivity source for the band colouring. Gated on the same pass flag
+  // as the volume for the same reason - a field left published by a scene we
+  // have left must not colour anything - and the dimensions are loaded together
+  // with the pointer so the kernel never sees a size that outlives its buffer.
+  if (args.hasVolume) {
+    args.field = st.weatherField.load(std::memory_order_relaxed);
+    args.fieldW = st.weatherW.load(std::memory_order_relaxed);
+    args.fieldH = st.weatherH.load(std::memory_order_relaxed);
+    // A published pointer with a zero/degenerate size is not usable. Retiring
+    // the whole triple keeps SampleReflectivity's null test sufficient.
+    if (!args.field || args.fieldW <= 1 || args.fieldH <= 1) {
+      args.field = nullptr;
+      args.fieldW = 0;
+      args.fieldH = 0;
+    }
+  } else {
+    args.field = nullptr;
+    args.fieldW = 0;
+    args.fieldH = 0;
+  }
   return args;
 }
 

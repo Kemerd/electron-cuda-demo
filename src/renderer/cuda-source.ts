@@ -96,6 +96,24 @@ export interface CudaSourceApi extends DataSource {
     height: number,
   ): void;
 
+  /**
+   * Push this frame's input to the engine WITHOUT asking for a payload.
+   *
+   * The native present modes (6/7) render entirely inside the addon -- the
+   * view's render thread steps the sim and writes the D3D11 surface, so no
+   * REQ/FRAME traffic flows. The camera, targets and pointer still originate
+   * here though, and the kernels only see them through setInput(). This posts
+   * exactly that: a few hundred bytes of uniforms, no buffer, no reply.
+   *
+   * Unlike frame()/requestRgba() it does NOT take the in-flight guard. There is
+   * no reply to wait for, and gating input on an outstanding payload request
+   * would make the camera stutter for no reason.
+   *
+   * @param scene engine scene id
+   * @param input shared per-frame input struct
+   */
+  sendInput(scene: SceneId, input: InputState): void;
+
   /** Register the RGBA sink used by the blit presenter. One sink; replaced on re-call. */
   onRgba(cb: (f: RgbaFrame) => void): void;
 
@@ -591,6 +609,36 @@ export async function createCudaSource(): Promise<CudaSourceApi> {
         inFlight = false;
         awaitingFrameId = 0;
       }
+    },
+
+    /**
+     * Input-only REQ for the native present modes. See the interface doc.
+     *
+     * `kind` is not a member of ReqMsg -- it is the marker the pump reads to
+     * know that no payload is wanted. The intersection type is how that extra
+     * field is expressed without a cast and without touching protocol.ts, which
+     * is orchestrator-owned.
+     */
+    sendInput(scene: SceneId, input: InputState): void {
+      if (!alive) return;
+      if (pendingConfigure) return;
+      if (!portReady()) return;
+
+      const req: ReqMsg & { kind: 'input' } = {
+        t: MSG.REQ,
+        frameId: nextFrameId++,
+        scene,
+        compute: COMPUTE.CUDA,
+        raster: RASTER.CUDA,
+        dtMs: 0,
+        wantField: false,
+        kind: 'input',
+        input,
+      };
+
+      // No in-flight bookkeeping: nothing comes back, so there is nothing to
+      // wait on and no guard to release.
+      post(req);
     },
 
     onEntities(cb: (f: EntityFrame) => void): void {

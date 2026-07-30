@@ -15,7 +15,14 @@
  *      screen spacing, re-decimated when the zoom changes. Barbs where spacing
  *      permits, arrows when dense. Rebuilt at ~2 Hz, NOT per frame.
  *
- *   3. The same dart swarm, flying the same field. Coherent with the vectors by
+ *   3. 2.5D storm-cell extrusion -- a stack of concentric translucent shells
+ *      from 1.005 R to 1.055 R sampling that same field, giving the cells
+ *      visible vertical build. It lives in storm-cells.ts; see the header there
+ *      for why it is one instanced draw rather than 16 meshes. Layers 1 and 2
+ *      stay underneath it: the extrusion is garnish on the EFB display, not a
+ *      replacement for it.
+ *
+ *   4. The same dart swarm, flying the same field. Coherent with the vectors by
  *      construction -- both read the same u/v.
  *
  * Why the vector layer is rebuilt on a timer rather than per frame: it is a CPU
@@ -38,6 +45,8 @@ import { createDartSwarm } from '../dart-swarm';
 import type { DartSwarmApi } from '../dart-swarm';
 import { createEarth } from '../earth';
 import type { EarthApi } from '../earth';
+import { createStormCells, slicesForFieldHeight } from './storm-cells';
+import type { StormCellsApi } from './storm-cells';
 
 /** Instance ceiling for the dart mesh. */
 const SWARM_CAPACITY = 2_000_000;
@@ -92,6 +101,9 @@ export default function createScene(): Scene {
   let radarMesh: THREE.Mesh | null = null;
   let radarMaterial: THREE.ShaderMaterial | null = null;
   let uHasField: { value: number } | null = null;
+
+  /** 2.5D storm-cell extrusion -- the instanced shell stack over the radar. */
+  let cells: StormCellsApi | null = null;
 
   /** Wind vector layer -- one LineSegments for the whole grid. */
   let vectorLines: THREE.LineSegments | null = null;
@@ -579,6 +591,12 @@ export default function createScene(): Scene {
       vectorLines = buildVectors();
       scene.add(vectorLines);
 
+      // Extrusion on top of the flat radar + barbs. It starts with no field and
+      // therefore draws nothing; the first setField() gives it a texture and
+      // sizes the stack to the preset.
+      cells = createStormCells({ field: null, intensity: 0.9 });
+      scene.add(cells.object);
+
       swarm = createDartSwarm({ capacity: SWARM_CAPACITY, color: 0xa8e8ff });
       scene.add(swarm.object);
 
@@ -595,6 +613,10 @@ export default function createScene(): Scene {
       if (rig) rig.dispose();
       if (swarm) swarm.dispose();
       if (earth) earth.dispose();
+      // Cells before the field texture: the layer drops its reference to the
+      // texture on dispose, so the texture is unreferenced by the time it is
+      // released below.
+      if (cells) cells.dispose();
       if (fieldTexture) fieldTexture.dispose();
 
       if (scene) {
@@ -629,6 +651,7 @@ export default function createScene(): Scene {
       earth = null;
       radarMesh = null;
       radarMaterial = null;
+      cells = null;
       uHasField = null;
       fieldTexture = null;
       fieldData = null;
@@ -705,7 +728,19 @@ export default function createScene(): Scene {
         }
         if (uHasField) uHasField.value = 1;
 
-        console.log(`[weather] field texture ${f.w}x${f.h}`);
+        // The extrusion samples the SAME texture object -- one upload feeds both
+        // layers. The slice count rides the field height because that IS the
+        // preset's weatherGrid (see slicesForFieldHeight), which is how the
+        // stack scales with fidelity without adding a hook to the scene
+        // interface.
+        let sliceCount = 0;
+        if (cells) {
+          cells.setField(fieldTexture);
+          cells.setSlices(slicesForFieldHeight(f.h));
+          sliceCount = cells.getSlices();
+        }
+
+        console.log(`[weather] field texture ${f.w}x${f.h}, ${sliceCount} storm-cell slices`);
       }
 
       if (fieldData) {

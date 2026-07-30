@@ -176,14 +176,19 @@ function capabilityGate(
     return webgpu?.ok === true ? { ok: true } : { ok: false, reason: webgpuReason };
   }
   if (value === PRESENT.NATIVE_VSYNC || value === PRESENT.NATIVE_UNLOCKED) {
-    // The native surface needs CUDA first, then the native view itself.
+    // Two gates in sequence, and the order is what makes the tooltip useful.
+    // Without a CUDA device the Present column is moot -- saying "the addon is
+    // stale" to someone with no NVIDIA card would send them down the wrong
+    // path entirely. So the device answer wins, and only once it is satisfied
+    // does the native-surface-specific reason (stale addon, wrong platform)
+    // get a chance to speak.
     if (cuda?.ok !== true) return { ok: false, reason: cudaReason };
     if (nview?.ok !== true) {
       return {
         ok: false,
         reason:
           (typeof nview?.reason === 'string' && nview.reason) ||
-          'native view arrives in a later phase',
+          'The native D3D11 surface is unavailable in this build',
       };
     }
     return { ok: true };

@@ -490,13 +490,28 @@ void VolumeExtrudeKernel(unsigned char* __restrict__ volume,
   const float fy = ((1.5707963f - lat) / 3.1415927f) * static_cast<float>(h) - 0.5f;
   float base = SampleScalar(density2d, w, h, fx, fy);
 
-  /* --- altitude falloff -------------------------------------------------- */
+  /* --- altitude falloff, capped by reflectivity -------------------------- */
   // Normalised height in the shell, 0 at the surface, 1 at the top.
   const float hn = (r - kVolumeInner) / fmaxf(1e-6f, kVolumeOuter - kVolumeInner);
-  // Cloud deck: fades in just off the surface, out well before the top. The
-  // low-altitude fade matters - clouds sitting exactly on the globe surface
-  // z-fight with the sphere shading in the composite.
-  const float altitude = gsSmoothstep(0.0f, 0.16f, hn) * gsSmoothstep(1.0f, 0.55f, hn);
+
+  // Storm tops scale with reflectivity: a weak return is a shallow deck, a
+  // strong one is a deep convective column. This is what CONTRACTS section 8
+  // means by "vertical build proportional to reflectivity (redder = taller)" -
+  // without it every cell tops out at the same height and the volume reads as
+  // one flat overcast layer no matter how the ramp colours it.
+  //
+  // The cap is a smooth function of the base reflectivity rather than a step per
+  // band. Quantising the HEIGHT as well as the colour would give the columns
+  // visible terraces, and the banding the spec asks for is in the classification,
+  // not in the geometry.
+  const float topCap = gsClampf(0.22f + 1.05f * base, 0.0f, 1.0f);
+
+  // Fades in just off the surface (a deck sitting exactly on the globe z-fights
+  // the sphere shading in the composite) and out at this column's own top. The
+  // upper edge is deliberately soft - a hard cut would read as a sliced-off
+  // cylinder rather than an anvil.
+  const float altitude = gsSmoothstep(0.0f, 0.16f, hn) *
+                         gsSmoothstep(topCap, topCap * 0.55f, hn);
 
   /* --- 3D detail --------------------------------------------------------- */
   // Three octaves of billowy noise. Taking 1 - |fbm| (rather than fbm directly)

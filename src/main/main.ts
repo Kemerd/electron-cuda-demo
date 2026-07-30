@@ -18,8 +18,18 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-import { probeCapabilities, registerCapabilityIpc, shutdownEngine } from './capabilities.js';
+import {
+  probeCapabilities,
+  registerCapabilityIpc,
+  setNativeViewSupport,
+  shutdownEngine,
+} from './capabilities.js';
 import { registerFramePump, shutdownFramePump, getPumpStats } from './frame-pump.js';
+import {
+  probeNativeViewSupport,
+  registerNativeViewIpc,
+  shutdownNativeView,
+} from './nview.js';
 import type { PumpStats } from './frame-pump.js';
 import type { Capabilities } from '../shared/protocol.js';
 
@@ -289,7 +299,10 @@ function finishSmoke(ok: boolean, detail: SmokeDetail): void {
   process.stdout.write(`${ok ? 'SMOKE_OK' : 'SMOKE_FAIL'} ${json}\n`);
 
   // Drop the engine before exiting so the CUDA context is released cleanly.
+  // Same ordering rule as will-quit: the render thread first, then the
+  // transport, then the device allocations it was reading.
   try {
+    shutdownNativeView();
     shutdownFramePump();
     shutdownEngine();
   } catch {
@@ -652,8 +665,19 @@ if (!gotLock) {
       console.error('[main] capability probe threw: %s', errText(err));
     }
 
+    // The native view's availability is a property of the LOADED addon, so it
+    // can only be answered after probeCapabilities() has required the .node --
+    // which is exactly why this sits between the probe and the IPC handlers
+    // rather than inside either.
+    try {
+      setNativeViewSupport(probeNativeViewSupport());
+    } catch (err) {
+      console.error('[main] native view probe threw: %s', errText(err));
+    }
+
     registerCapabilityIpc();
     registerFramePump();
+    registerNativeViewIpc();
 
     mainWindow = createWindow();
 
@@ -679,6 +703,11 @@ if (!gotLock) {
   // engine itself; this one closes the transport first so no in-flight frame is
   // touching device memory as it goes away.
   app.on('will-quit', () => {
+    // Order is load-bearing: the native view's render thread owns a CUDA stream
+    // and a D3D11 swapchain, so it has to be joined before the engine frees the
+    // device buffers that thread is reading. Its own 'close' hook usually got
+    // there first; this is the backstop for a quit that never closed a window.
+    shutdownNativeView();
     shutdownFramePump();
     shutdownEngine();
   });

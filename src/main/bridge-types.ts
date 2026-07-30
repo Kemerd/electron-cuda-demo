@@ -44,17 +44,21 @@ export interface NativeViewStartArgs {
 }
 
 /**
- * Stats from the native render thread. The fields are optional because until
- * the native view lands, main answers every nview channel with the shared
- * "arrives in a later phase" OkResult and no numbers at all.
+ * Stats from the native render thread.
+ *
+ * Every number stays optional: main re-validates each field coming out of the
+ * addon and simply omits anything non-finite, so a poll that lands between a
+ * stop and the next start legitimately answers ok:true with nothing in it.
  */
 export interface NativeViewStatsResult extends OkResult {
   fps?: number;
   frameMs?: number;
   simMs?: number;
+  /** True while main believes the render thread is running. */
+  running?: boolean;
 }
 
-/** Native D3D11 child-window controls. Stubbed main-side until that phase lands. */
+/** Native D3D11 child-window controls (CONTRACTS section 6). */
 export interface NativeViewBridge {
   create(rect?: Partial<NativeViewRect>): Promise<OkResult>;
   setRect(rect?: Partial<NativeViewRect>): Promise<OkResult>;

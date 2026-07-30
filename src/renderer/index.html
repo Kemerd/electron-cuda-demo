@@ -82,7 +82,17 @@
         </div>
 
         <!-- Scene modules mount their canvas/DOM into this element. -->
-        <div id="stage-surface" class="stage-surface"></div>
+        <div id="stage-surface" class="stage-surface">
+          <!--
+            Reserved box for the native D3D11 child window (matrix modes 6/7).
+            Hidden in every other mode. Chromium does not composite that window,
+            so nothing may be drawn on top of this element while it is active --
+            present/native-view.ts reports its box to main and the app shell
+            gains .native-present, which pushes the perf card into the gutter
+            beside it rather than over it (CONTRACTS section 6).
+          -->
+          <div id="native-view-slot" class="native-view-slot" aria-hidden="true"></div>
+        </div>
       </main>
 
       <div id="overlay-layer" class="overlay-layer" aria-live="off">

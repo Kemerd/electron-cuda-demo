@@ -78,6 +78,8 @@ import { findSource, hasSource } from './sources/registry';
 import { ageInteractions } from './interaction';
 import { createCudaBlit } from './present/cuda-blit';
 import type { CudaBlitApi } from './present/cuda-blit';
+import { createNativeView } from './present/native-view';
+import type { NativeViewApi } from './present/native-view';
 import type { CudaSourceApi, RgbaFrame } from './cuda-source';
 
 import { createSidebar } from './ui/sidebar';
@@ -144,7 +146,7 @@ const SCENE_REGISTRY: Readonly<Record<string, SceneRegistryEntry>> = Object.free
 let caps: MergedCaps = {
   cuda: { ok: false, reason: 'Capability probe not run.' },
   webgpu: { ok: false, reason: 'WebGPU probe not run.' },
-  nativeView: { ok: false, reason: 'native view arrives in a later phase' },
+  nativeView: { ok: false, reason: 'Native view capability not probed yet.' },
   versions: {},
 };
 
@@ -341,6 +343,31 @@ let blit: CudaBlitApi | null = null;
 let blitFailed = false;
 
 /* ------------------------------------------------------------------ *
+ *  Native view controller (modes 6/7)
+ *
+ *  The counterpart to the blit presenter, and the opposite of it in every way
+ *  that matters: the blit path ships pixels across the process boundary and
+ *  uploads them to a WebGL texture, while this one ships a RECTANGLE and lets
+ *  CUDA write a D3D11 swapchain Chromium never touches. Built once at boot
+ *  (it is a few listeners and no GPU resource of its own) and kept for the
+ *  session -- creating it lazily would mean the very first mode switch pays a
+ *  child-window creation inside a click handler.
+ * ------------------------------------------------------------------ */
+
+/** The controller, or null when the DOM slot it needs does not exist. */
+let nativeView: NativeViewApi | null = null;
+
+/**
+ * Latest stats from the native render thread, or null when it is not running.
+ *
+ * The overlay's RENDER fps is meaningless in these modes -- rAF measures how
+ * often Chromium composites a page whose scene is not being drawn, not how fast
+ * the CUDA surface is presenting. So the overlay is fed from here instead and
+ * the readout is labelled honestly (see applyNativeStats).
+ */
+let nativeStats: { fps: number; frameMs: number } | null = null;
+
+/* ------------------------------------------------------------------ *
  *  Capability probing
  * ------------------------------------------------------------------ */
 
@@ -489,12 +516,22 @@ function resetLinkAttempt(reason: string): void {
  * Paint the verified chip. Also clears any failure state, which is what makes
  * the verdict non-latching: a late first frame recovers the UI completely.
  */
-function markLinkVerified(count: number): void {
+function markLinkVerified(count: number, evidence?: string): void {
   const wasFailed = cudaLinkFailed;
   cudaLinkVerified = true;
   cudaLinkFailed = false;
   linkFailureReason = '';
   setChip('cuda-link', 'CUDA link verified', 'cuda');
+
+  // The smoke console tap in main.ts parses the record-count wording, so the
+  // two established phrasings are left byte-identical. An alternative evidence
+  // string (the native view, which delivers no records at all) takes a
+  // different branch rather than reporting "0 records" and teaching the tap to
+  // read a number that never existed.
+  if (evidence) {
+    console.log(`[app] CUDA link verified -- ${evidence}`);
+    return;
+  }
 
   if (wasFailed) {
     console.log(`[app] CUDA link recovered -- ${count} records after an earlier failure verdict`);
@@ -608,6 +645,12 @@ function applyMode(next: Partial<ModeState> | null | undefined): void {
   // Swap the visible surface. Cheap (a visibility toggle plus, on the first
   // entry into mode 5, one context creation) and independent of the source.
   updatePresentation();
+
+  // Start or stop the D3D11 child window for modes 6/7. Async, and deliberately
+  // not awaited: a mode click must not block on an IPC round trip plus a
+  // swapchain creation, and the controller serializes its own calls so a fast
+  // double-toggle cannot interleave a start with a stop.
+  syncNativeView();
 
   // A compute change swaps the backend under the scene. The scene itself is
   // untouched -- it consumes callbacks and does not know or care which backend
@@ -750,6 +793,9 @@ function asCudaSource(source: DataSource | null): CudaSourceApi | null {
   if (typeof probe.requestRgba !== 'function') return null;
   if (typeof probe.onRgba !== 'function') return null;
   if (typeof probe.onError !== 'function') return null;
+  // Native present (modes 6/7) rides on this one: no payload flows, but the
+  // uniforms still have to reach the kernels every frame.
+  if (typeof probe.sendInput !== 'function') return null;
 
   // Every method the extended surface declares is present, which is exactly what
   // the interface asserts -- the cast carries no claim the checks above did not.
@@ -1108,10 +1154,111 @@ function ensureBlit(): boolean {
 }
 
 /**
+ * Build the native-view controller. Called once during boot.
+ *
+ * Not lazy, unlike the blit presenter, and for the opposite reason: this object
+ * owns no GPU resource at all (a ResizeObserver, a media query and a couple of
+ * listeners), while the thing it would otherwise be built inside is a click
+ * handler on the matrix -- and creating a Win32 child window there would put a
+ * synchronous IPC round trip in the middle of a UI interaction.
+ */
+function ensureNativeView(): NativeViewApi | null {
+  if (nativeView) return nativeView;
+
+  const slot = document.getElementById('native-view-slot');
+  if (!slot) {
+    console.warn('[app] #native-view-slot missing; native present modes unavailable');
+    return null;
+  }
+
+  nativeView = createNativeView({
+    slot,
+    // Open or close the reserved region. This runs on INTENT, before anything
+    // is created, and it has to: the slot is display:none until this class
+    // lands, a hidden element has no box, and its box is the rect the child
+    // window is built from. It is also what pushes the perf card and the scene
+    // controls into the gutter, which is the CONTRACTS section 6 requirement
+    // that HTML sit beside the native surface rather than over it.
+    onReserve: (isReserved) => {
+      const shell = document.getElementById('app-shell');
+      if (shell) shell.classList.toggle('native-present', isReserved);
+
+      // The stage box changes size when the gutter opens, and the three.js
+      // scene is still rendering into it (hidden, but it owns the camera the
+      // ray-marcher follows -- so its aspect ratio still has to be right).
+      resizeActiveScene();
+    },
+
+    // Real state, as opposed to intent. A start that FAILED must not leave the
+    // overlay claiming a native present rate, so the stats source is cleared
+    // from here rather than from the reservation above.
+    onActiveChange: (active) => {
+      if (!active) applyNativeStats(null);
+    },
+    onStats: applyNativeStats,
+  });
+
+  return nativeView;
+}
+
+/**
+ * Feed one native stats snapshot into the overlay.
+ *
+ * Passing null hands the RENDER readout back to the rAF loop, which is exactly
+ * what should happen the moment the surface stops -- leaving a frozen native
+ * figure on screen would misreport a stopped view as a running one.
+ */
+function applyNativeStats(
+  stats: { fps?: number; frameMs?: number; running?: boolean } | null,
+): void {
+  if (!stats || stats.running === false || !isFiniteNumber(stats.fps) || stats.fps <= 0) {
+    nativeStats = null;
+    if (ui.overlay) ui.overlay.setNativeFps(null);
+    return;
+  }
+
+  nativeStats = {
+    fps: stats.fps,
+    frameMs: isFiniteNumber(stats.frameMs) ? stats.frameMs : 0,
+  };
+  if (ui.overlay) ui.overlay.setNativeFps(nativeStats.fps, nativeStats.frameMs);
+
+  // A render thread reporting a real present rate is proof of a live CUDA path
+  // just as an arriving FRAME is on the transport modes -- the kernels ran, the
+  // surface was written, DXGI presented it. It is the ONLY proof available
+  // here, since modes 6/7 deliberately move no frame data across the boundary.
+  if (mode.compute === COMPUTE.CUDA && (!cudaLinkVerified || cudaLinkFailed)) {
+    markLinkVerified(0, `native view presenting at ${Math.round(nativeStats.fps)} fps`);
+  }
+}
+
+/**
+ * True when the current mode presents through the native D3D11 child window.
+ *
+ * Both the present axis AND the raster axis are checked. isLegalMode already
+ * guarantees the pairing, but this predicate gates a path that starts an OS
+ * thread, so it does not lean on an invariant enforced somewhere else.
+ */
+function isNativePresentMode(): boolean {
+  if (mode.present !== PRESENT.NATIVE_VSYNC && mode.present !== PRESENT.NATIVE_UNLOCKED) {
+    return false;
+  }
+  return mode.raster === RASTER.CUDA && mode.compute === COMPUTE.CUDA;
+}
+
+/**
  * Point the display at whichever surface the current mode produces.
  *
- * Mode 5 hides the three.js scene and shows the blit canvas; every other mode
- * does the reverse. The scene is only HIDDEN, never unmounted -- it keeps its
+ * Three destinations now, in decreasing order of how much of the pipeline stays
+ * on this side:
+ *
+ *   composite + three.js/WebGPU raster -> the scene's own canvas;
+ *   composite + CUDA raster (mode 5)   -> the blit canvas, fed by RGBA frames;
+ *   native present (modes 6/7)         -> nothing here at all. CUDA writes a
+ *                                         D3D11 swapchain in its own thread and
+ *                                         this process contributes a rectangle.
+ *
+ * The scene is only ever HIDDEN, never unmounted, in any of them -- it keeps its
  * camera rig, and that rig is what feeds InputState.camera to the ray-marcher,
  * so unmounting it would leave the CUDA view with no camera to follow
  * (CONTRACTS section 8: the two paths must show the identical view).
@@ -1119,6 +1266,24 @@ function ensureBlit(): boolean {
 function updatePresentation(): void {
   const host = document.getElementById('stage-surface');
   const sceneRoot = host?.querySelector<HTMLElement>('.scene-root') ?? null;
+
+  // Native present: hide BOTH web surfaces. The blit canvas in particular would
+  // otherwise sit underneath the child window holding a stale frame, which
+  // becomes visible for one paint every time the native view is torn down.
+  //
+  // opacity:0, NOT visibility:hidden. The distinction is hit testing:
+  // visibility:hidden removes an element from elementFromPoint entirely, so the
+  // rig canvas under OrbitControls would never see another pointerdown and the
+  // camera would freeze the moment the scene stopped being drawn -- verified
+  // live (the hit target fell through to #stage-surface). An opacity-0 element
+  // paints nothing but still catches pointers, which is exactly the split these
+  // modes need: three.js pixels gone, orbit/pan/zoom still driving the camera
+  // the CUDA ray-marcher follows (CONTRACTS section 8 camera parity).
+  if (isNativePresentMode()) {
+    if (blit) blit.setVisible(false);
+    if (sceneRoot) sceneRoot.style.opacity = '0';
+    return;
+  }
 
   if (isCudaRasterMode()) {
     if (!ensureBlit()) {
@@ -1129,15 +1294,30 @@ function updatePresentation(): void {
     }
 
     if (blit) blit.setVisible(true);
-    // visibility rather than display:none -- the rig's pointer handlers stay
-    // live so orbit/pan/zoom keep driving the camera the ray-marcher reads,
-    // while the three.js pixels stop being composited.
-    if (sceneRoot) sceneRoot.style.visibility = 'hidden';
+    // Same opacity trick as the native branch, for the same reason: the blit
+    // canvas covers the stage (pointer events pass through it -- see the
+    // pointerEvents note in cuda-blit.ts) and the rig canvas beneath must stay
+    // hit-testable or the ray-marcher renders a camera nobody can move.
+    if (sceneRoot) sceneRoot.style.opacity = '0';
     return;
   }
 
   if (blit) blit.setVisible(false);
-  if (sceneRoot) sceneRoot.style.visibility = '';
+  if (sceneRoot) sceneRoot.style.opacity = '';
+}
+
+/**
+ * Bring the native surface in line with the current mode + scene.
+ *
+ * Called from every path that can change either: mode commits, scene mounts and
+ * the boot sequence. The controller is idempotent, so calling it when nothing
+ * changed is free.
+ */
+function syncNativeView(): void {
+  const view = ensureNativeView();
+  if (!view) return;
+
+  void view.sync(mode, activeEngineScene());
 }
 
 /* ------------------------------------------------------------------ *
@@ -1228,6 +1408,11 @@ async function mountScene(id: string): Promise<void> {
   // for the active mode -- otherwise a scene mounted while mode 5 is live would
   // paint over the blit canvas.
   updatePresentation();
+
+  // A scene change in a native mode is a real restart: the engine is about to
+  // reallocate device buffers under the render thread, so the surface comes
+  // down and back up around it rather than splatting a freed buffer.
+  syncNativeView();
 
   // Point the compute backend at whatever this scene needs. Non-fatal either
   // way: a scene renders its own geometry regardless of whether any records
@@ -1359,6 +1544,13 @@ function resizeActiveScene(): void {
   const rect = host.getBoundingClientRect();
   if (rect.width <= 0 || rect.height <= 0) return;
 
+  // The native surface tracks its own slot through a ResizeObserver, but a
+  // sidebar collapse resizes the STAGE without necessarily resizing the slot in
+  // the same frame -- the observer fires a frame later, which shows as the
+  // child window lagging the layout by one animation step. Nudging it here
+  // costs one rect comparison when nothing moved.
+  if (nativeView) nativeView.resync();
+
   if (blit && blit.ok) {
     try {
       blit.resize(rect.width, rect.height);
@@ -1440,7 +1632,14 @@ function driveSource(dtMs: number): void {
   // ---- CUDA link deadline -------------------------------------------
   // Runs before any early return below so a drive that is being throttled by
   // backoff still produces a verdict rather than hanging silently.
-  if (mode.compute === COMPUTE.CUDA) {
+  //
+  // NOT in the native present modes, though: the deadline is armed by FRAME
+  // messages arriving, and in those modes no FRAME ever arrives BY DESIGN. The
+  // chip would paint "CUDA link failed" ten seconds into a mode whose entire
+  // premise is that the link carries nothing. The native view has its own,
+  // better proof of life -- a non-zero fps from the render thread -- and the
+  // link chip is repainted from that instead.
+  if (mode.compute === COMPUTE.CUDA && !isNativePresentMode()) {
     const now = performance.now();
     if (
       !cudaLinkVerified &&
@@ -1453,6 +1652,25 @@ function driveSource(dtMs: number): void {
 
     // Backoff window after an engine error -- a slower retry, never a stop.
     if (now < nextRequestAllowedMs) return;
+  }
+
+  // ---- modes 6/7: input only, no payload ----------------------------
+  //
+  // The frame itself is produced entirely inside the addon: the native view's
+  // render thread steps the sim and writes the D3D11 surface, so asking for a
+  // payload here would step it a SECOND time and copy the result back for
+  // nobody to look at. What still has to travel is the input struct -- camera,
+  // rally targets, pointer -- because it originates in this process and the
+  // kernels only ever see it through setInput(). Without this the ray-marcher
+  // renders a frozen camera while the user drags the globe.
+  if (isNativePresentMode()) {
+    if (!cudaSource) return;
+    try {
+      cudaSource.sendInput(engineScene, inputState);
+    } catch (err) {
+      console.warn('[app] sendInput threw: %s', errText(err));
+    }
+    return;
   }
 
   // ---- mode 5: ask for pixels ---------------------------------------
@@ -1691,8 +1909,15 @@ async function boot(): Promise<void> {
   caps = {
     cuda: native?.cuda ?? { ok: false, reason: 'No CUDA capability reported.' },
     webgpu,
-    // Main answers the NVIEW_* channels with this reason until that phase lands.
-    nativeView: { ok: false, reason: 'native view arrives in a later phase' },
+    // Main fills this in from probeNativeViewSupport(): the addon has to be
+    // loaded AND export the whole nativeView* surface AND be on Windows. The
+    // fallback covers an older main process that predates the block entirely --
+    // in which case the Present column stays greyed with a truthful reason
+    // rather than offering a mode whose IPC handlers do not exist.
+    nativeView: native?.nativeView ?? {
+      ok: false,
+      reason: 'Main process reported no native view capability',
+    },
     versions: native?.versions ?? {},
   };
   frameState.caps = caps;
@@ -1760,6 +1985,11 @@ async function boot(): Promise<void> {
 
   installPointerHandlers();
 
+  // Build the native-view controller before the first scene mounts, so a boot
+  // that starts in a native mode (it cannot today, but a persisted mode would)
+  // finds it ready rather than creating a child window mid-mount.
+  ensureNativeView();
+
   // ---- scene + loop ----------------------------------------------------
   await mountScene('globe');
 
@@ -1787,7 +2017,15 @@ async function boot(): Promise<void> {
   // A renderer reload leaves the interval behind otherwise. pagehide rather
   // than beforeunload -- it fires for the bfcache path too, and Electron
   // dispatches it on navigation and window close alike.
-  window.addEventListener('pagehide', stopGpuStatsPoll);
+  window.addEventListener('pagehide', () => {
+    stopGpuStatsPoll();
+    // The child window is owned by main and survives a renderer reload, so the
+    // reload MUST take the render thread down with it -- otherwise a reloaded
+    // page finds a D3D11 surface presenting over a stage that no longer thinks
+    // it is in a native mode, and no code path left alive to stop it.
+    if (nativeView) nativeView.dispose();
+    nativeView = null;
+  });
 
   startFrameLoop();
 }

@@ -94,6 +94,25 @@ interface RasterSize {
   height: number;
 }
 
+/**
+ * Marker on a REQ that carries INPUT ONLY -- no payload is wanted back.
+ *
+ * This exists for the native present modes (6/7). There the frame is produced
+ * entirely inside the addon: the view's render thread steps the sim and writes
+ * a D3D11 surface, and nothing crosses the process boundary per frame. But the
+ * camera, the rally targets and the pointer still live in the renderer, and the
+ * kernels read them out of the device uniform block that only setInput() fills.
+ * So the renderer keeps posting REQs that say "take this input and produce
+ * nothing" -- a few hundred bytes on a port that would otherwise be idle,
+ * against a mode that is unusable without it (the ray-marcher would render a
+ * frozen camera while the user dragged the globe).
+ *
+ * It rides `kind`, a field protocol.ts does not put on ReqMsg -- handleRequest
+ * already reads that slot as untrusted extra data, and adding a marker there
+ * costs nothing and changes no existing message shape.
+ */
+const REQ_KIND_INPUT_ONLY = 'input';
+
 /* ------------------------------------------------------------------ *
  *  Pump state
  * ------------------------------------------------------------------ */
@@ -426,6 +445,12 @@ function handleRequest(req: Partial<ReqMsg> & { kind?: unknown }): void {
   const dtMs = Number.isFinite(req.dtMs) ? Math.max(0, Math.min(100, req.dtMs as number)) : 16.7;
 
   applyInput(engine, req.input);
+
+  // Native present modes: the uniforms were the entire point of the message.
+  // Returning here is what keeps the mode zero-copy -- serving a payload would
+  // step the sim a second time (the view's render thread already did) and copy
+  // it across the boundary for nobody to read.
+  if (req.kind === REQ_KIND_INPUT_ONLY) return;
 
   // Full CUDA raster path: one call does sim + rasterize into an RGBA8 frame.
   if (req.raster === RASTER.CUDA || req.kind === KIND.RGBA) {
@@ -819,15 +844,12 @@ function collectGpuStats(): GpuStats {
  *  IPC registration
  * ------------------------------------------------------------------ */
 
-/**
- * Native view channels. The D3D11 child window lands in a later phase; until
- * then every channel answers honestly instead of silently doing nothing, so the
- * UI can grey out the Present column with a real reason string.
+/*
+ * The IPC.NVIEW_* channels used to be stubbed here with a shared
+ * "arrives in a later phase" OkResult. They now live in nview.ts, which owns
+ * the child-window lifecycle end to end -- see that module's header for why it
+ * is not part of the pump. Nothing in this file touches the native view.
  */
-const NVIEW_PENDING: Readonly<OkResult> = Object.freeze({
-  ok: false,
-  reason: 'native view arrives in a later phase',
-});
 
 let pumpInstalled = false;
 
@@ -927,14 +949,6 @@ export function registerFramePump(): void {
       return { ok: false, reason: `gpu stats failed: ${errText(err)}` };
     }
   });
-
-  // Native-view surface: present but not yet implemented.
-  ipcMain.handle(IPC.NVIEW_CREATE, () => ({ ...NVIEW_PENDING }));
-  ipcMain.handle(IPC.NVIEW_RECT, () => ({ ...NVIEW_PENDING }));
-  ipcMain.handle(IPC.NVIEW_VISIBLE, () => ({ ...NVIEW_PENDING }));
-  ipcMain.handle(IPC.NVIEW_START, () => ({ ...NVIEW_PENDING }));
-  ipcMain.handle(IPC.NVIEW_STOP, () => ({ ...NVIEW_PENDING }));
-  ipcMain.handle(IPC.NVIEW_STATS, () => ({ ...NVIEW_PENDING, fps: 0, frameMs: 0, simMs: 0 }));
 
   // Seed the pool sizes from the default preset so an early request does not
   // land on a zero-sized pool.

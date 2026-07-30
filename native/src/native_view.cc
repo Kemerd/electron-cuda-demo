@@ -11,6 +11,10 @@
 #include <chrono>
 #include <cstdio>
 
+// The first-frame diagnostic reports which scene the rasterizer will actually
+// draw, which lives in the cross-TU registry rather than on the Engine.
+#include "kernels/scene_state.h"
+
 namespace geoswarm {
 
 namespace {
@@ -318,6 +322,44 @@ Status NativeView::CreateInteropTexture(int w, int h) {
     return Status::Fail(msg);
   }
 
+  // Which CUDA device backs the adapter this D3D11 device was created on?
+  //
+  // D3D11CreateDevice(nullptr, HARDWARE, ...) picks the DEFAULT adapter, which
+  // on a machine with an integrated GPU is frequently not the NVIDIA card the
+  // engine is running its kernels on. When that happens the registration below
+  // still succeeds - CUDA is happy to register a resource from another
+  // adapter's device - and every surf2Dwrite afterwards lands somewhere the
+  // swapchain will never read, which presents as a perfectly black surface with
+  // no error anywhere. Reporting the mismatch is the difference between a
+  // five-minute diagnosis and a five-hour one.
+  {
+    IDXGIDevice* dxgiDevice = nullptr;
+    if (SUCCEEDED(device_->QueryInterface(__uuidof(IDXGIDevice),
+                                          reinterpret_cast<void**>(&dxgiDevice))) &&
+        dxgiDevice) {
+      IDXGIAdapter* adapter = nullptr;
+      if (SUCCEEDED(dxgiDevice->GetAdapter(&adapter)) && adapter) {
+        int cudaDev = -1;
+        const cudaError_t mapErr = cudaD3D11GetDevice(&cudaDev, adapter);
+        int activeDev = -1;
+        cudaGetDevice(&activeDev);
+        if (mapErr != cudaSuccess) {
+          fprintf(stderr,
+                  "[cuda_engine] native view: the D3D11 adapter has no CUDA device (%s) - "
+                  "the surface will present black.\n",
+                  cudaGetErrorString(mapErr));
+        } else if (cudaDev != activeDev) {
+          fprintf(stderr,
+                  "[cuda_engine] native view: D3D11 adapter maps to CUDA device %d but the "
+                  "engine is on device %d - interop writes will not reach the swapchain.\n",
+                  cudaDev, activeDev);
+        }
+        SafeRelease(&adapter);
+      }
+      SafeRelease(&dxgiDevice);
+    }
+  }
+
   // SurfaceLoadStore is what makes cudaGraphicsSubResourceGetMappedArray
   // usable as a surface object target. Without it the array maps but every
   // surf2Dwrite silently does nothing.
@@ -362,7 +404,9 @@ Status NativeView::SetRect(int x, int y, int w, int h, double dpr) {
     return Status::Ok();
   }
 
-  if (!SetWindowPos(hwnd_, nullptr, px, py, pw, ph, SWP_NOZORDER | SWP_NOACTIVATE)) {
+  // HWND_TOP rather than SWP_NOZORDER: a layout change is exactly when Chromium
+  // re-asserts its own compositor windows above ours. See RaiseAboveSiblings().
+  if (!SetWindowPos(hwnd_, HWND_TOP, px, py, pw, ph, SWP_NOACTIVATE)) {
     const DWORD err = GetLastError();
     char msg[128];
     std::snprintf(msg, sizeof(msg), "SetWindowPos failed: %lu", err);
@@ -405,6 +449,26 @@ void NativeView::SetVisible(bool visible) {
     return;
   }
   ShowWindow(hwnd_, visible ? SW_SHOWNOACTIVATE : SW_HIDE);
+  if (visible) RaiseAboveSiblings();
+}
+
+void NativeView::RaiseAboveSiblings() {
+  if (!hwnd_) return;
+
+  // Chromium's compositor lives in sibling child HWNDs of the same parent -
+  // Chrome_RenderWidgetHostHWND and, under it, "Intermediate D3D Window". They
+  // are created before ours, but Chromium re-asserts their z-order on layout
+  // and paint, and when it does it lands ABOVE our child window. The surface
+  // then keeps rendering and presenting perfectly while Chromium paints its own
+  // (opaque) page contents straight over it, which reads on screen as a black
+  // rectangle with no error anywhere in the pipeline. It cost a diagnostic
+  // texel readback to prove the CUDA half was correct all along.
+  //
+  // HWND_TOP puts us at the top of the SIBLING order only - this is not
+  // topmost, it does not affect any other application, and it cannot escape the
+  // parent's client area.
+  SetWindowPos(hwnd_, HWND_TOP, 0, 0, 0, 0,
+               SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
 
 bool NativeView::ApplyResize(int w, int h) {
@@ -512,6 +576,7 @@ void NativeView::RenderLoop() {
   const auto startTime = clock::now();
   auto lastFrame = startTime;
   auto lastFpsSample = startTime;
+  auto lastRaise = startTime;
   int framesSinceSample = 0;
 
   while (!stop_requested_.load(std::memory_order_acquire)) {
@@ -540,8 +605,29 @@ void NativeView::RenderLoop() {
     const float timeSec =
         std::chrono::duration<float>(now - startTime).count();
 
+    // Re-assert the sibling z-order about once a second.
+    //
+    // Chromium raises its own compositor child windows whenever it repaints,
+    // and the moment it does, our surface disappears under an opaque page. A
+    // one-off raise at Start() therefore does not hold: the very next DOM
+    // update in the UI panels puts us back underneath. Once a second is far
+    // more often than a repaint actually needs and still costs nothing - it is
+    // a cross-thread SetWindowPos, which Windows posts to the owning thread's
+    // queue rather than blocking on.
+    if (std::chrono::duration<double>(now - lastRaise).count() >= 1.0) {
+      lastRaise = now;
+      RaiseAboveSiblings();
+    }
+
+    // Clamped the same way every other frame driver in this project clamps it:
+    // a resize stall or a debugger pause produces a multi-second delta that
+    // would launch the entire swarm out of its shell in one step.
+    float dtSec = static_cast<float>(frameMs) * 0.001f;
+    if (!(dtSec == dtSec) || dtSec < 0.0f) dtSec = 0.0f;
+    if (dtSec > 0.1f) dtSec = 0.1f;
+
     double simMs = 0.0;
-    if (!RenderOnce(timeSec, &simMs)) {
+    if (!RenderOnce(dtSec, timeSec, &simMs)) {
       // A failed frame is usually a transient device-removed; back off briefly
       // so a hard failure does not spin the CPU at 100%.
       std::this_thread::sleep_for(std::chrono::milliseconds(16));
@@ -566,7 +652,7 @@ void NativeView::RenderLoop() {
   running_.store(false, std::memory_order_release);
 }
 
-bool NativeView::RenderOnce(float timeSec, double* outSimMs) {
+bool NativeView::RenderOnce(float dtSec, float timeSec, double* outSimMs) {
   if (outSimMs) *outSimMs = 0.0;
 
   if (!swapchain_ || !context_ || !cuda_res_ || width_ <= 0 || height_ <= 0) {
@@ -612,13 +698,58 @@ bool NativeView::RenderOnce(float timeSec, double* outSimMs) {
     return false;
   }
 
+  /* --- advance the sim ------------------------------------------------ */
+  // Nothing else is driving it in this mode. The renderer stops sending REQs
+  // the moment a native present path goes live - that is the whole point, no
+  // per-frame data crosses the process boundary - so if this loop does not step
+  // the simulation, nothing does and the view renders a frozen scene forever.
+  //
+  // The step goes on OUR stream, immediately before the raster launch that
+  // consumes it, so stream ordering alone guarantees the rasterizer sees the
+  // records this step produced. No event, no sync, no cross-stream wait.
+  Engine& engine = GetEngine();
+  if (engine.initialized()) {
+    const cudaError_t simErr = engine.StepForView(static_cast<float>(dtSec), stream_);
+    if (simErr != cudaSuccess) {
+      fprintf(stderr, "[cuda_engine] native view sim step failed: %s\n",
+              cudaGetErrorString(simErr));
+      // Fall through and still draw: a frozen-but-visible frame beats a black
+      // window, and the next frame may well succeed (a transient here is
+      // usually a reconfigure landing mid-frame).
+    }
+  }
+
   /* --- write the frame ------------------------------------------------ */
   // Uniforms come from the engine's device copy when it is up; a view started
   // before init() falls through to the kernel's built-in default camera.
-  Engine& engine = GetEngine();
   const InputUniforms* uniforms = engine.initialized() ? engine.device_input() : nullptr;
 
-  err = LaunchRasterSurface(surf, width_, height_, uniforms, timeSec, stream_);
+  // The scene clock comes from the ENGINE's uniforms, not from this thread's
+  // own stopwatch: the renderer owns timeSec (it is part of InputState) and the
+  // weather field is animated from it. Using a private clock here would run the
+  // native view's weather on a different timeline to every other mode, so the
+  // side-by-side comparison the demo is built on would stop being a comparison.
+  // The thread's own elapsed time is the fallback for a view started before any
+  // setInput has landed.
+  const float sceneTime =
+      engine.initialized() ? engine.host_input().timeSec : timeSec;
+
+  // One-shot trace of the state the very first frame ran with. A native view
+  // that presents a black rectangle with no error is otherwise completely
+  // opaque: it could be a scene that was never configured, uniforms that never
+  // arrived, or an interop write that landed on another adapter. This says
+  // which, once, and then goes quiet.
+  if (!first_frame_logged_) {
+    first_frame_logged_ = true;
+    fprintf(stderr,
+            "[cuda_engine] native view first frame: %dx%d scene=%d uniforms=%s "
+            "engineInit=%s t=%.2f\n",
+            width_, height_, GetSceneState().scene.load(std::memory_order_relaxed),
+            uniforms ? "yes" : "no", engine.initialized() ? "yes" : "no",
+            static_cast<double>(sceneTime));
+  }
+
+  err = LaunchRasterSurface(surf, width_, height_, uniforms, sceneTime, stream_);
   if (err != cudaSuccess) {
     fprintf(stderr, "[cuda_engine] raster surface launch failed: %s\n", cudaGetErrorString(err));
     CUDA_CHECK_SOFT(cudaDestroySurfaceObject(surf));
@@ -634,6 +765,27 @@ bool NativeView::RenderOnce(float timeSec, double* outSimMs) {
     CUDA_CHECK_SOFT(cudaDestroySurfaceObject(surf));
     CUDA_CHECK_SOFT(cudaGraphicsUnmapResources(1, &cuda_res_, stream_));
     return false;
+  }
+
+  // One-shot proof that the interop write actually landed in the texture CUDA
+  // has mapped. Reading one texel back off the mapped array separates "the
+  // kernel produced nothing" from "the kernel produced pixels that never
+  // reached the swapchain" - two failure modes that look identical on screen
+  // and have completely different causes.
+  if (!first_pixel_logged_) {
+    first_pixel_logged_ = true;
+    unsigned char texel[4] = {0, 0, 0, 0};
+    const int mx = width_ / 2;
+    const int my = height_ / 2;
+    const cudaError_t rb = cudaMemcpy2DFromArray(texel, sizeof(texel), array,
+                                                 mx * 4, my, 4, 1, cudaMemcpyDeviceToHost);
+    if (rb != cudaSuccess) {
+      fprintf(stderr, "[cuda_engine] native view center texel readback failed: %s\n",
+              cudaGetErrorString(rb));
+    } else {
+      fprintf(stderr, "[cuda_engine] native view center texel after kernel: %u,%u,%u,%u\n",
+              texel[0], texel[1], texel[2], texel[3]);
+    }
   }
 
   CUDA_CHECK_SOFT(cudaDestroySurfaceObject(surf));

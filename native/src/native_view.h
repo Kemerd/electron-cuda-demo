@@ -123,8 +123,17 @@ class NativeView {
   /** @brief Render thread entry point. Owns all per-frame D3D/CUDA work. */
   void RenderLoop();
 
-  /** @brief Draw one frame: map, kernel, unmap, copy, present. */
-  bool RenderOnce(float timeSec, double* outSimMs);
+  /**
+   * @brief Draw one frame: step the sim, map, kernel, unmap, copy, present.
+   *
+   * @param dtSec     seconds since the previous frame on this thread; drives
+   *                  the simulation advance, which nothing else performs while
+   *                  a native present path is live
+   * @param timeSec   fallback scene clock, used only before the engine has any
+   *                  uniforms of its own
+   * @param outSimMs  receives the wall-clock cost of the CUDA half of the frame
+   */
+  bool RenderOnce(float dtSec, float timeSec, double* outSimMs);
 
   /* ---- device objects ----------------------------------------------- */
 
@@ -155,6 +164,19 @@ class NativeView {
   /** @brief Register the window class once per process. */
   static bool EnsureWindowClass();
 
+  /**
+   * @brief Put the child window at the top of its SIBLING z-order.
+   *
+   * Chromium's compositor lives in sibling child HWNDs of the same parent and
+   * re-asserts their z-order on every repaint. Losing that race means the
+   * surface renders and presents flawlessly while the page paints over it -
+   * indistinguishable on screen from a broken kernel. Called on show, on every
+   * rect change, and about once a second from the render thread.
+   *
+   * HWND_TOP is sibling-relative: not topmost, no effect outside the parent.
+   */
+  void RaiseAboveSiblings();
+
   /* ---- state --------------------------------------------------------- */
 
   HWND hwnd_ = nullptr;
@@ -175,6 +197,12 @@ class NativeView {
 
   bool allow_tearing_ = false;  ///< swapchain reports DXGI tearing support
   bool vsync_ = true;
+
+  /** One-shot guard for the first-frame diagnostic in RenderOnce(). */
+  bool first_frame_logged_ = false;
+
+  /** One-shot guard for the post-kernel texel readback in RenderOnce(). */
+  bool first_pixel_logged_ = false;
 
   // Render thread's own stream, so it never contends with the engine's
   // main-thread sim stream.

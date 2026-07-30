@@ -721,6 +721,85 @@ input[type='range']:active::-webkit-slider-thumb { transform: scale(1.06); }
 }
 
 /* ---------------------------------------------------------------------
+   Native view slot (matrix modes 6/7)
+
+   This element draws NOTHING. Its only job is to have a layout box, because
+   that box is what present/native-view.ts measures and reports to main as the
+   rect for the D3D11 child window. Chromium never composites that window, so
+   anything positioned over this element is simply painted out every vblank --
+   which is why the shell reflows the perf card into a gutter beside it while
+   the native path is live rather than letting it float on top.
+
+   Hidden by default: the slot only exists while a native present path is
+   selected, and a display:none element reports a zero box, which the manager
+   treats as "do not push a rect" rather than as a resize to nothing.
+   ------------------------------------------------------------------- */
+
+.native-view-slot {
+  display: none;
+  position: absolute;
+  inset: 0;
+  /* Pointer events fall through to the scene root underneath: the three.js rig
+     is still the thing driving the camera the CUDA ray-marcher renders from,
+     so orbit/pan/zoom must keep working over the native rect. The child HWND
+     itself answers WM_NCHITTEST with HTTRANSPARENT for the same reason. */
+  pointer-events: none;
+}
+
+/* While a native present path is live the slot becomes the reserved region,
+   inset on the right by the perf card's own column so the two never overlap. */
+.native-present .native-view-slot {
+  display: block;
+  right: var(--native-gutter);
+}
+
+/*
+   The reserved gutter. Wide enough for the 216px perf card plus the overlay
+   layer's 18px padding on both sides, with a little air so the card is not
+   pressed against the native surface's edge.
+*/
+#app-shell {
+  --native-gutter: 260px;
+}
+
+/* A visible hairline where the native surface begins. Without it the boundary
+   between "Chromium drew this" and "CUDA drew this" is invisible, and the
+   demo's entire point is that you can see exactly where that line is. */
+.native-present .native-view-slot::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: calc(var(--r-lg) - 1px);
+  border: 1px solid rgba(118, 185, 0, 0.28);
+  /* Under the native window it is invisible anyway; it reads during the brief
+     window between the layout change and the first Present. */
+  box-shadow: inset 0 0 24px rgba(118, 185, 0, 0.06);
+}
+
+/*
+   Push the floating chrome out of the reserved rect.
+
+   The overlay layer normally spans the whole shell and right-aligns its card
+   over the scene. In native present it is clamped to the gutter, so the card
+   lands beside the CUDA surface instead of inside it.
+*/
+.native-present .overlay-layer {
+  justify-content: flex-end;
+}
+
+/* The scene-control strip lives bottom-left inside the stage, which is INSIDE
+   the reserved rect -- so it is pulled out of it entirely rather than being
+   drawn where nobody can see it. */
+.native-present .scene-controls {
+  left: auto;
+  right: 18px;
+  bottom: 18px;
+  /* Narrowed to fit the gutter exactly: the default 232px would spill back
+     over the reserved rect by a few pixels and be clipped by the child window. */
+  width: calc(var(--native-gutter) - 36px);
+}
+
+/* ---------------------------------------------------------------------
    Overlay layer
    ------------------------------------------------------------------- */
 
@@ -842,7 +921,32 @@ input[type='range']:active::-webkit-slider-thumb { transform: scale(1.06); }
   color: var(--text-tertiary);
   letter-spacing: 0.1em;
   text-transform: uppercase;
+  /* Pushed right so the unit stays flush against the card edge once the source
+     tag joins it as a third child of the space-between row. */
+  margin-left: auto;
 }
+
+/* Source tag for the fps number (modes 6/7).
+
+   The figure it labels comes off the native render thread rather than
+   requestAnimationFrame, and the two measure different things -- so the tag is
+   loud enough to notice and carries the explanation in its title. */
+.fps-source {
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 2px 5px;
+  border-radius: 5px;
+  color: var(--cuda);
+  background: var(--cuda-dim);
+  border: 1px solid rgba(118, 185, 0, 0.32);
+  white-space: nowrap;
+  /* Appears on a mode switch; the same spring the status chips use. */
+  animation: chip-in var(--dur) var(--spring) both;
+}
+
+.fps-source.is-hidden { display: none; }
 
 /* GPU telemetry line -- directly under the FPS readout, above the sparkline.
    Same micro type as the stat cells so it reads as part of the same table

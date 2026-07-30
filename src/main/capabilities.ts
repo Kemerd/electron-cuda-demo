@@ -231,6 +231,38 @@ export function getEngine(): CudaEngine | null {
   return engine;
 }
 
+/**
+ * Attach the Present-column availability block to the cached capability model.
+ *
+ * This is a setter rather than a direct call into nview.ts because the
+ * dependency only runs one way: nview.ts reads getEngine() from here, so
+ * importing its probe from here would close an import cycle. main.ts owns the
+ * ordering instead -- probe the addon, ask nview whether the surface is
+ * complete, hand the answer back.
+ *
+ * Called before the window exists, so the renderer's first GET_CAPS already
+ * carries it and the matrix never has to re-grey a column it just enabled.
+ *
+ * @param support { ok } when the native view is usable, { ok:false, reason }
+ *                otherwise -- the reason is what the greyed cell's tooltip says
+ */
+export function setNativeViewSupport(support: { ok: boolean; reason?: string }): void {
+  if (!support || typeof support !== 'object') return;
+
+  // probeCapabilities() memoizes into `caps`; make sure it exists before we
+  // decorate it, otherwise this write is lost the moment the probe runs.
+  const model = probeCapabilities();
+  model.nativeView =
+    support.ok === true
+      ? { ok: true }
+      : { ok: false, reason: support.reason || 'native view unavailable' };
+
+  console.log(
+    '[caps] native view: %s',
+    support.ok === true ? 'available' : `unavailable (${model.nativeView.reason})`,
+  );
+}
+
 /** The cached capability model (probing on first call). */
 export function getCapabilities(): Capabilities {
   return probeCapabilities();

@@ -732,6 +732,51 @@ double Engine::ElapsedMs(cudaEvent_t start, cudaEvent_t stop) const {
  *  Step
  * ====================================================================== */
 
+cudaError_t Engine::StepForView(float dtSec, cudaStream_t stream) {
+  // Called every frame from a thread that is NOT the Node main thread, so the
+  // guard is not decoration: a shutdown() racing this would otherwise hand the
+  // kernels a freed pointer. Bailing with cudaSuccess (rather than an error)
+  // keeps the view rendering the last good frame instead of logging once per
+  // vblank while the engine comes up.
+  if (!initialized_ || !stream) return cudaSuccess;
+
+  const SceneId scene = scene_;
+  if (scene == SceneId::kNone) return cudaSuccess;
+
+  // NaN fails every comparison, so it has to be tested for explicitly. The
+  // clamp matches Step()'s [0,100] ms contract, expressed in seconds.
+  if (!(dtSec == dtSec)) dtSec = 0.0f;
+  if (dtSec < 0.0f) dtSec = 0.0f;
+  if (dtSec > 0.1f) dtSec = 0.1f;
+
+  cudaError_t err = cudaSuccess;
+
+  if (scene == SceneId::kSwarm) {
+    if (d_swarm_ && swarm_count_ > 0) {
+      err = LaunchSwarmStep(d_swarm_, swarm_count_, dtSec, d_input_, stream);
+    }
+  } else if (scene == SceneId::kWeather) {
+    // Same ordering as Step()/RenderFrame(): the field advances first, then the
+    // agents are advected through the field they will be drawn over. Doing it
+    // the other way round makes the swarm visibly lag the storm cells by a
+    // frame, which is exactly the coherence the scene exists to show off.
+    if (d_weather_ && weather_grid_ > 0) {
+      err = LaunchWeatherStep(d_weather_, static_cast<int>(weather_grid_ * 2u),
+                              static_cast<int>(weather_grid_), host_input_.timeSec, d_input_,
+                              stream);
+    }
+    if (err == cudaSuccess && d_swarm_ && swarm_count_ > 0) {
+      err = LaunchSwarmStep(d_swarm_, swarm_count_, dtSec, d_input_, stream);
+    }
+  } else {
+    if (d_storm_ && storm_count_ > 0) {
+      err = LaunchStormStep(d_storm_, storm_count_, dtSec, d_input_, stream);
+    }
+  }
+
+  return err;
+}
+
 StepResult Engine::Step(SceneId scene, double dtMs, void* out, size_t outBytes) {
   StepResult res;
 

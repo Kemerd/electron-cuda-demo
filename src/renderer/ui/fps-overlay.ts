@@ -61,6 +61,24 @@ export interface FpsOverlayApi {
    * deferred write would make the readout lag its own poll.
    */
   setGpuStats(stats: GpuStats | null | undefined): void;
+  /**
+   * Take the RENDER fps readout over from the native view's own render thread.
+   *
+   * In the native present modes (matrix 6/7) the rAF-derived number is not a
+   * measurement of anything the user is looking at: Chromium is compositing a
+   * page whose scene has stopped drawing, while a separate thread presents a
+   * D3D11 swapchain at whatever rate it manages. Reporting the rAF figure there
+   * would be a straight-up lie -- it would read 60 while the surface ran at 400.
+   *
+   * So the number is replaced and the unit line SAYS SO: the label gains a
+   * "native" tag so nobody compares a native-thread figure against a rAF one
+   * without noticing they are different measurements.
+   *
+   * @param fps present rate from nativeViewStats(), or null to hand the readout
+   *            back to the rAF loop
+   * @param frameMs the same thread's frame time, used for the per-frame cell
+   */
+  setNativeFps(fps: number | null, frameMs?: number): void;
   /** Per-frame update. @param nowMs performance.now() from the frame loop */
   tick(nowMs: number): void;
 }
@@ -81,6 +99,7 @@ export function createFpsOverlay(host: HTMLElement | null): FpsOverlayApi {
       setCount() {},
       pushSimStep() {},
       setGpuStats() {},
+      setNativeFps() {},
       tick() {},
     };
   }
@@ -122,6 +141,17 @@ export function createFpsOverlay(host: HTMLElement | null): FpsOverlayApi {
 
   let lastReadoutMs = 0;
 
+  /**
+   * Present rate reported by the native view's render thread, or null when the
+   * rAF loop is the authority. Non-null takes over the RENDER readout entirely
+   * -- see setNativeFps() for why the rAF number is not merely inaccurate but
+   * measuring a different thing in those modes.
+   */
+  let nativeFps: number | null = null;
+
+  /** Frame time from the same thread, shown in place of the rAF frame cost. */
+  let nativeFrameMs = 0;
+
   /* ---- DOM -------------------------------------------------------- */
 
   host.replaceChildren();
@@ -144,7 +174,23 @@ export function createFpsOverlay(host: HTMLElement | null): FpsOverlayApi {
     'rate regardless of which compute backend is selected -- compare backends ' +
     'with the sim rate, not this number.';
 
-  head.append(fpsValue, fpsUnit);
+  /**
+   * Source tag for the fps number.
+   *
+   * Hidden by default. It appears only when setNativeFps() takes the readout
+   * over, and its whole job is to stop the number being read as a rAF figure --
+   * the two are not comparable and the difference between them (60 vs 400+) is
+   * exactly what the native mode exists to demonstrate.
+   */
+  const fpsSource = document.createElement('span');
+  fpsSource.className = 'fps-source is-hidden';
+  fpsSource.textContent = 'native';
+  fpsSource.title =
+    'This number comes from the native D3D11 render thread (nativeViewStats), ' +
+    'not from requestAnimationFrame. Chromium does not composite that surface, ' +
+    'so the page frame rate says nothing about how fast it is presenting.';
+
+  head.append(fpsValue, fpsUnit, fpsSource);
 
   /**
    * GPU telemetry line -- sits directly under the FPS readout per CONTRACTS
@@ -464,6 +510,43 @@ export function createFpsOverlay(host: HTMLElement | null): FpsOverlayApi {
     },
 
     /**
+     * Hand the RENDER readout to (or back from) the native render thread.
+     *
+     * Called at the native stats cadence (~2 Hz), not per frame, so writing the
+     * DOM immediately here costs nothing and keeps the tag from lagging a mode
+     * switch by up to a readout interval.
+     */
+    setNativeFps(fps, frameMs) {
+      const usable = typeof fps === 'number' && Number.isFinite(fps) && fps > 0 ? fps : null;
+
+      nativeFps = usable;
+      nativeFrameMs =
+        typeof frameMs === 'number' && Number.isFinite(frameMs) && frameMs > 0 ? frameMs : 0;
+
+      // The unit line changes wording with the source: "render fps" is the rAF
+      // presentation rate, "present fps" is what a swapchain actually did.
+      if (usable !== null) {
+        setText(fpsUnit, 'present fps');
+        fpsUnit.title =
+          'Present rate of the native D3D11 swapchain, measured on its own ' +
+          'render thread. Not capped by the page frame rate -- in the unlocked ' +
+          'mode it is not capped by vsync either.';
+        if (fpsSource.classList.contains('is-hidden')) fpsSource.classList.remove('is-hidden');
+        // Repaint the number now rather than at the next readout tick, so the
+        // switch does not briefly show a rAF figure under a "native" tag.
+        setText(fpsValue, String(Math.round(usable)));
+        return;
+      }
+
+      setText(fpsUnit, 'render fps');
+      fpsUnit.title =
+        'Presentation rate (requestAnimationFrame). Capped by the monitor refresh ' +
+        'rate regardless of which compute backend is selected -- compare backends ' +
+        'with the sim rate, not this number.';
+      if (!fpsSource.classList.contains('is-hidden')) fpsSource.classList.add('is-hidden');
+    },
+
+    /**
      * Draws the sparkline every call; refreshes the text and percentiles on the
      * slower cadence.
      */
@@ -498,7 +581,13 @@ export function createFpsOverlay(host: HTMLElement | null): FpsOverlayApi {
       simSteps = 0;
       renderWindowStartMs = nowMs;
 
-      setText(fpsValue, displayFps > 0 ? String(Math.round(displayFps)) : '--');
+      // The native thread owns this cell while it is presenting; overwriting it
+      // with the rAF figure here would undo setNativeFps() twice a second.
+      if (nativeFps === null) {
+        setText(fpsValue, displayFps > 0 ? String(Math.round(displayFps)) : '--');
+      } else {
+        setText(fpsValue, String(Math.round(nativeFps)));
+      }
       setText(
         simRateEl,
         displaySimHz > 0
@@ -506,8 +595,18 @@ export function createFpsOverlay(host: HTMLElement | null): FpsOverlayApi {
           : '--',
       );
       setText(stepMsEl, `${ms(displayStepMs)} ms`);
-      setText(p50El, `${ms(percentile(0.5))} ms`);
-      setText(p99El, `${ms(percentile(0.99))} ms`);
+      // Percentiles come off the rAF ring, which in a native present mode is
+      // sampling the page's compositing cadence rather than the surface that is
+      // actually on screen. The native thread publishes one frame time and no
+      // distribution, so p50 shows that and p99 goes to dashes rather than
+      // reporting a percentile of the wrong signal.
+      if (nativeFps === null) {
+        setText(p50El, `${ms(percentile(0.5))} ms`);
+        setText(p99El, `${ms(percentile(0.99))} ms`);
+      } else {
+        setText(p50El, `${ms(nativeFrameMs)} ms`);
+        setText(p99El, '--');
+      }
       setText(simEl, `${ms(simMs)} ms`);
       setText(copyEl, `${ms(copyMs)} ms`);
       setText(drawEl, `${ms(drawMs)} ms`);

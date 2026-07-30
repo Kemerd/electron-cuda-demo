@@ -271,6 +271,35 @@ class Engine {
   RenderResult RenderFrame(SceneId scene, int w, int h, double dtMs,
                            void* out, size_t outBytes);
 
+  /**
+   * @brief Advance the simulation for the native view's render thread.
+   *
+   * The zero-copy path has no Step()/RenderFrame() call behind it - by design,
+   * because the entire point of modes 6/7 is that no frame data crosses a
+   * process boundary. Something still has to move the sim forward, and the only
+   * thread running per-frame in those modes is the view's own. So it calls this.
+   *
+   * Differences from Step(), all of them deliberate:
+   *  - launches on the CALLER's stream, so the work is ordered against the same
+   *    stream the raster kernels use and no cross-stream sync is needed;
+   *  - no device-to-host copy and no CUDA events - there is nothing to read back
+   *    and nothing on the Node side waiting for a timing number;
+   *  - never blocks. The render thread's own cudaStreamSynchronize before
+   *    CopyResource is the only sync point in that loop.
+   *
+   * Thread safety: reads the scene id, the device pointers and the counts, all
+   * of which are only mutated by ConfigureScene() on the main thread. A
+   * reconfigure racing this can at worst launch a kernel over a buffer that is
+   * about to be freed, which is the same window the scene-state registry already
+   * documents and guards with its zero-the-count-first ordering; the caller
+   * re-checks initialized() every frame.
+   *
+   * @param dtSec  frame delta in seconds, clamped internally to [0, 0.1]
+   * @param stream the render thread's stream
+   * @return cudaSuccess, or the first launch failure
+   */
+  cudaError_t StepForView(float dtSec, cudaStream_t stream);
+
   /* ---- accessors used by the native view thread --------------------- */
 
   /** @brief Device pointer to the current input uniforms (never null once initialised). */

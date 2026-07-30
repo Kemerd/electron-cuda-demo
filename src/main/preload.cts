@@ -297,7 +297,14 @@ const api: GeoSwarmBridge = {
     return enginePort !== null;
   },
 
-  /** Native D3D11 child-window controls. Stubbed main-side until that phase lands. */
+  /**
+   * Native D3D11 child-window controls (CONTRACTS section 6).
+   *
+   * Every one of these is a plain invoke: the native view has NO per-frame
+   * traffic by design, so nothing here belongs on the MessagePort. create /
+   * setRect are called on mount and on layout changes, start/stop on mode and
+   * tab switches, and stats at ~2 Hz -- rates where an IPC round trip is free.
+   */
   nview: {
     create(rect?: Partial<NativeViewRect>): Promise<OkResult> {
       return invokeSafe(CH.NVIEW_CREATE, rect || {});
