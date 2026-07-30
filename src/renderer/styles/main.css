@@ -948,6 +948,35 @@ input[type='range']:active::-webkit-slider-thumb { transform: scale(1.06); }
 
 .fps-source.is-hidden { display: none; }
 
+/* Secondary display-rate readout, directly under the headline.
+
+   Deliberately quiet: it is the rAF spin rate, which used to BE the headline
+   and is now context for it. Same micro type and tabular figures as the stat
+   cells so the eye reads it as an annotation on the big number rather than
+   competing with it. The negative top margin pulls it against the readout it
+   belongs to, the same trick the GPU line uses. */
+.display-line {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: -2px;
+  font-size: var(--fs-micro);
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1;
+}
+
+.display-label {
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.display-value {
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
 /* GPU telemetry line -- directly under the FPS readout, above the sparkline.
    Same micro type as the stat cells so it reads as part of the same table
    rather than a second headline, tinted with the CUDA green because that is

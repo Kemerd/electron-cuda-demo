@@ -167,6 +167,20 @@ struct InputUniforms {
   float fovYDeg;     ///< vertical field of view in degrees
   float aspect;      ///< width / height
 
+  /* --- appearance ------------------------------------------------------ */
+  /**
+   * Storm splat size multiplier, premultiplied on the JS side with the
+   * renderer's device pixel ratio (capped at 2, matching the three.js scenes).
+   *
+   * This rides InputState as an optional extra property rather than a protocol
+   * field - same pattern as the input-only REQ marker - because the value is a
+   * live UI knob (the storm scene's size slider), not simulation state. The
+   * raster storm splat multiplies its projected point size by it so the slider
+   * drives the CUDA path and the three.js path identically. Absent/garbage
+   * input parses to 1.0 (addon.cc guards the range).
+   */
+  float pointScale;
+
   /* --- clock ---------------------------------------------------------- */
   float timeSec;     ///< monotonic scene clock, seconds
   float _pad;        ///< explicit tail padding so sizeof() is stable

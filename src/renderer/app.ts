@@ -191,8 +191,17 @@ let sceneControls: SceneControlsApi | null = null;
  * write `state.input.camera` every frame and the router reads it back out on
  * the way to the compute backend. Exactly one camera exists in the system --
  * see the FrameState doc comment in types.ts for why that matters.
+ *
+ * `pointScale` rides along as an extra property, expressed as an intersection
+ * type exactly like the input-only REQ marker in cuda-source.ts: it is not a
+ * protocol field (protocol.ts is orchestrator-owned) but the engine's
+ * setInput() reads it when present. It carries the storm size slider already
+ * premultiplied with the renderer's pixel ratio, so the CUDA storm splat can
+ * reproduce the three.js point-size formula term for term -- without it the
+ * slider only ever reached the WebGL path and the CUDA particles stayed at a
+ * fixed (and much smaller) size.
  */
-const inputState: InputState = {
+const inputState: InputState & { pointScale: number } = {
   mouse: { x: 0.5, y: 0.5, down: false, mode: 1 },
   pointerWorld: null,
   targets: [],
@@ -204,6 +213,7 @@ const inputState: InputState = {
     aspect: 1.6,
   },
   timeSec: 0,
+  pointScale: 1,
 };
 
 /**
@@ -675,6 +685,10 @@ function applyMode(next: Partial<ModeState> | null | undefined): void {
 function onSourceEntities(f: EntityFrame): void {
   if (!f || !(f.records instanceof Float32Array)) return;
 
+  // New state landed: whichever tick draws next is presenting something the
+  // viewer has not seen. See the freshness block above the frame loop.
+  framePayloadArrived = true;
+
   if (activeScene && typeof activeScene.setEntities === 'function') {
     try {
       activeScene.setEntities(f);
@@ -707,6 +721,12 @@ function onSourceEntities(f: EntityFrame): void {
 /** Deliver one weather field to the active scene. */
 function onSourceField(f: FieldFrame): void {
   if (!f || !(f.data instanceof Uint8Array)) return;
+
+  // Marked before the delivery guard below: a new field IS new state even if
+  // the current scene has no setField to hand it to, and the freshness latch
+  // should not depend on which scene happens to be mounted.
+  framePayloadArrived = true;
+
   if (!activeScene || typeof activeScene.setField !== 'function') return;
 
   try {
@@ -729,6 +749,11 @@ function onSourceRgba(f: RgbaFrame): void {
   if (!blit || !blit.ok) return;
 
   const uploadMs = blit.present(f.data, f.w, f.h);
+
+  // A rastered frame is the most literal kind of fresh state there is -- these
+  // ARE the pixels. Marked after present() so a failed upload does not credit a
+  // frame nobody saw.
+  framePayloadArrived = true;
 
   if (ui.overlay) {
     // simMs/copyMs come from the engine; the draw figure is renderMs (the CUDA
@@ -1592,6 +1617,13 @@ function refreshInputState(dt: number): void {
     frameState.pointer.mode === 2 ? 2 : frameState.pointer.mode === 3 ? 3 : 1;
   inputState.timeSec = frameState.timeSec;
 
+  // Storm splat size for the CUDA raster path: the live slider value times the
+  // same capped pixel ratio the three.js scenes render at, refreshed every
+  // frame because the DPR changes when the window crosses monitors. See the
+  // inputState doc comment for why this rides outside the protocol type.
+  inputState.pointScale =
+    stormPointScale * Math.min(window.devicePixelRatio || 1, 2);
+
   // Age targets and shockwaves, dropping the expired ones.
   ageInteractions(inputState, dt);
 
@@ -1751,6 +1783,147 @@ function installPointerHandlers(): void {
 
 let lastFrameTime = 0;
 
+/* ------------------------------------------------------------------ *
+ *  Frame freshness (CONTRACTS section 8 -- the effective-FPS headline)
+ *
+ *  The overlay's big number counts ticks that presented something NEW. This is
+ *  where "new" is decided, and it is three independent questions ORed together:
+ *
+ *    (a) did a payload land since the last tick -- an EntityFrame, a weather
+ *        FieldFrame or a CUDA-rastered RGBA frame;
+ *    (b) did the camera or the interactive input move in a way that changes the
+ *        picture;
+ *    (c) does the mounted scene animate on its own clock regardless of both.
+ *
+ *  (b) is measured rather than inferred. The scene owns the camera rig -- it
+ *  runs OrbitControls and writes inputState.camera during frame() -- so the
+ *  honest test is whether the numbers it wrote actually changed, which catches
+ *  orbit, pan, wheel zoom, damping inertia settling after the pointer is
+ *  released, and an aspect change from a resize. Asking OrbitControls "are you
+ *  active" would miss the settle, and asking the pointer handlers would count a
+ *  mouse moved across a scene it does not interact with.
+ *
+ *  Everything here is scalar state compared in place -- no snapshot objects, no
+ *  allocation on the frame path.
+ * ------------------------------------------------------------------ */
+
+/** Set by the payload sinks; consumed and cleared by the next tick(). */
+let framePayloadArrived = false;
+
+/**
+ * Last camera the scene serialized, flattened into a plain scalar list:
+ * pos xyz, quat xyzw, fovYDeg, aspect. Preallocated and written in place.
+ */
+const lastCamera = new Float64Array(9);
+
+/** False until the first tick has seeded lastCamera, so frame 1 counts. */
+let cameraSeeded = false;
+
+/**
+ * True when the scene's serialized camera differs from the previous tick, and
+ * update the stored copy either way.
+ *
+ * An exact inequality rather than an epsilon: these values come straight out of
+ * OrbitControls, and its damping drives the delta smoothly to zero rather than
+ * stopping at some floor. A tolerance would declare the camera "still" while it
+ * was visibly still gliding, which is the same perception lie in miniature.
+ */
+function cameraChanged(): boolean {
+  const cam = inputState.camera;
+  const p = cam.pos;
+  const q = cam.quat;
+
+  // Defensive: a scene that mangles the shared struct must not crash the loop.
+  if (!Array.isArray(p) || p.length < 3 || !Array.isArray(q) || q.length < 4) return false;
+
+  let moved = false;
+  if (lastCamera[0] !== p[0]) moved = true;
+  if (lastCamera[1] !== p[1]) moved = true;
+  if (lastCamera[2] !== p[2]) moved = true;
+  if (lastCamera[3] !== q[0]) moved = true;
+  if (lastCamera[4] !== q[1]) moved = true;
+  if (lastCamera[5] !== q[2]) moved = true;
+  if (lastCamera[6] !== q[3]) moved = true;
+  if (lastCamera[7] !== cam.fovYDeg) moved = true;
+  if (lastCamera[8] !== cam.aspect) moved = true;
+
+  lastCamera[0] = p[0];
+  lastCamera[1] = p[1];
+  lastCamera[2] = p[2];
+  lastCamera[3] = q[0];
+  lastCamera[4] = q[1];
+  lastCamera[5] = q[2];
+  lastCamera[6] = q[3];
+  lastCamera[7] = cam.fovYDeg;
+  lastCamera[8] = cam.aspect;
+
+  // The first comparison is against a zeroed array, which would read as a huge
+  // camera move; treat the seeding tick as fresh (it is -- the scene just
+  // appeared) and let real comparisons start from the next one.
+  if (!cameraSeeded) {
+    cameraSeeded = true;
+    return true;
+  }
+  return moved;
+}
+
+/**
+ * Pointer state that has a visible effect, tracked across ticks.
+ *
+ * Only a pointer that is DOWN changes the picture: a button-down drag orbits the
+ * globe or pushes the storm's force field, while a mouse drifting across a
+ * scene with no button held changes nothing anyone can see. Tracking the
+ * position too catches the drag itself on frames where the camera happens not to
+ * have moved yet.
+ */
+let lastPointerX = 0;
+let lastPointerY = 0;
+let lastPointerDown = false;
+
+/** True when the interactive pointer did something with a visible effect. */
+function pointerChanged(): boolean {
+  const p = frameState.pointer;
+  const moved = lastPointerDown && (p.x !== lastPointerX || p.y !== lastPointerY);
+  const toggled = p.down !== lastPointerDown;
+
+  lastPointerX = p.x;
+  lastPointerY = p.y;
+  lastPointerDown = p.down;
+
+  return moved || toggled;
+}
+
+/**
+ * Decide whether this tick presented new state.
+ *
+ * Called once per tick AFTER the scene has drawn, because the scene is what
+ * writes the camera being compared. Clears the payload latch on the way out so
+ * one arriving frame credits exactly one tick.
+ */
+function consumeFreshness(): boolean {
+  const hadPayload = framePayloadArrived;
+  framePayloadArrived = false;
+
+  // Both are called unconditionally: each maintains the state it compares
+  // against, and short-circuiting past one would leave it stale and make the
+  // NEXT tick report a change that already happened.
+  const camMoved = cameraChanged();
+  const ptrMoved = pointerChanged();
+
+  // A scene that animates on its own clock makes every tick fresh by
+  // definition. Read as `=== true` so an absent flag is simply false.
+  const animating = activeScene?.selfAnimates === true;
+
+  // The native present modes are excluded outright: no payload crosses the
+  // boundary and this process draws nothing at all, so a rAF tick here is not
+  // evidence of anything. The overlay's headline is fed from the render
+  // thread's own present rate in those modes (setNativeFps), and letting the
+  // rAF loop also mark ticks fresh would fight that readout.
+  if (isNativePresentMode()) return false;
+
+  return hadPayload || camMoved || ptrMoved || animating;
+}
+
 /**
  * One iteration of the render loop. Runs unconditionally so FPS and frame times
  * are always real measurements of this process, whatever backend is selected.
@@ -1776,7 +1949,10 @@ function tick(now: number): void {
   frameState.timeSec += dt;
   frameState.frameId++;
 
-  if (ui.overlay) ui.overlay.pushFrame(frameMs);
+  // NOTE: pushFrame() is NOT called here any more. Whether this tick counts
+  // toward the effective-FPS headline depends on the camera the scene writes
+  // during frame() below, so the sample is pushed after the draw instead. The
+  // measured frameMs is unaffected -- it is the delta that was just read.
 
   // Refresh the shared input BEFORE kicking the backend, so this frame's
   // pointer state and this frame's target ages are what the sim integrates.
@@ -1812,7 +1988,13 @@ function tick(now: number): void {
   }
   const drawMs = performance.now() - drawStart;
 
+  // Freshness is evaluated AFTER the draw because the scene is what serializes
+  // the camera this compares against. Called unconditionally, even with no
+  // overlay mounted, so the comparison state it maintains never goes stale.
+  const fresh = consumeFreshness();
+
   if (ui.overlay) {
+    ui.overlay.pushFrame(frameMs, fresh);
     // In the blit mode the RGBA callback is the authority on draw cost; leave
     // whatever it last reported in place rather than clobbering it with the
     // cost of a render nobody is looking at.

@@ -215,6 +215,23 @@ export interface SceneMountContext {
  * tests before calling any of them.
  */
 export interface Scene {
+  /**
+   * True when the scene's picture keeps changing on its own, with no new sim
+   * data and no camera movement -- a shader driven by a clock, a rolling chart,
+   * a layer that rebuilds on its own cadence.
+   *
+   * The effective-FPS headline (CONTRACTS section 8) reads this. A tick only
+   * counts toward the big number if the frame presented something NEW, and for
+   * a self-animating scene every tick qualifies by definition. For a scene that
+   * only changes when data or the camera does -- the globe -- it must not be
+   * set, or the counter goes straight back to reporting the rAF spin rate under
+   * a different name.
+   *
+   * Optional and read as `=== true`, so the scenes that do not animate simply
+   * omit it rather than every scene carrying a `false`.
+   */
+  readonly selfAnimates?: boolean;
+
   mount(ctx: SceneMountContext): void;
   unmount(): void;
   /** @param w CSS pixels @param h CSS pixels */

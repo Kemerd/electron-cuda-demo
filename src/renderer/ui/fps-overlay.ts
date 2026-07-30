@@ -1,10 +1,26 @@
 /**
  * fps-overlay.ts -- the performance HUD.
  *
+ * The headline number is EFFECTIVE fps, not the rAF spin rate (CONTRACTS
+ * section 8). A tick only counts if the frame it drew presented something new:
+ * a sim payload was consumed, the camera/input moved, or the scene animates on
+ * its own clock. Redrawing a byte-identical picture at 240 Hz is not 240 fps in
+ * any sense a viewer would recognize, and the old headline said it was -- an
+ * 18 Hz CPU baseline read "240" while the swarm visibly stepped in slow motion.
+ * The rAF rate is still measured and still shown, demoted to the small "display"
+ * readout beside the headline, because it is the right denominator for "how much
+ * of the display's refresh am I actually using".
+ *
+ * app.ts decides freshness and calls pushFrame(frameMs, fresh); everything here
+ * just keeps two counts over one measured wall-clock window.
+ *
  * Hard requirement: ZERO allocation per frame. An overlay that measures frame
  * time while generating garbage every frame measures its own GC pauses. So:
  *
- *  - Frame times live in a preallocated Float32Array ring (240 samples).
+ *  - Effective frame intervals live in a preallocated Float32Array ring (240
+ *    samples). A STALE tick adds no sample -- it accumulates into the next fresh
+ *    one instead, so the trace plots the interval between things a viewer could
+ *    actually see rather than the compositor's heartbeat.
  *  - The p50/p99 sort works in a second preallocated Float32Array that is
  *    refilled in place -- no slice(), no sort() on a fresh array.
  *  - Text updates go through a small string cache: assigning the same string to
@@ -27,14 +43,49 @@ const SAMPLES = 240;
 const READOUT_INTERVAL_MS = 160;
 
 /** Sparkline vertical range in ms. Clamped so one 400ms hitch does not flatten
- *  the entire trace for the next four seconds. */
+ *  the entire trace for the next four seconds.
+ *
+ *  The ceiling is generous because the trace now plots EFFECTIVE intervals: a
+ *  CPU baseline delivering ~6 steps/s legitimately samples at ~160 ms, and a
+ *  50 ms clamp would render that as a flat line pinned to the top with no shape
+ *  left to read. */
 const SPARK_MIN_MS = 8;
-const SPARK_MAX_MS = 50;
+const SPARK_MAX_MS = 250;
+
+/**
+ * Tooltip strings. Module constants rather than inline literals because the
+ * headline swaps between two of them at runtime (rAF vs native render thread)
+ * and a string built at the swap site would allocate on every mode change.
+ */
+const EFFECTIVE_TITLE =
+  'Frames per second that actually presented NEW state: a sim payload was ' +
+  'consumed, the camera moved, or the scene animates on its own. Ticks that ' +
+  'redrew an identical picture are excluded, so this number matches what you ' +
+  'see rather than how often the compositor ran.';
+
+const PRESENT_TITLE =
+  'Present rate of the native D3D11 swapchain, measured on its own render ' +
+  'thread. Every one of those frames is freshly ray-marched, so the present ' +
+  'rate already is the effective rate. Not capped by the page frame rate -- in ' +
+  'the unlocked mode it is not capped by vsync either.';
+
+const DISPLAY_TITLE =
+  'Raw requestAnimationFrame rate -- how often the page was given a chance to ' +
+  'draw, which tracks the monitor refresh. The gap between this and the ' +
+  'headline is how much of the display the current backend is leaving unused.';
 
 /** Public surface of the mounted overlay. */
 export interface FpsOverlayApi {
-  /** Record one frame's wall-clock duration. */
-  pushFrame(frameMs: number): void;
+  /**
+   * Record one rAF tick.
+   *
+   * @param frameMs wall-clock duration of the tick
+   * @param fresh   true when this tick actually presented new state -- a
+   *                consumed payload, moved camera/input, or a self-animating
+   *                scene. Only fresh ticks reach the headline and the trace;
+   *                stale ones count toward the display rate and nothing else.
+   */
+  pushFrame(frameMs: number, fresh: boolean): void;
   /** Feed engine-reported timings from a FRAME message. */
   setTimings(t: Partial<FrameTimings> | null | undefined): void;
   /** Renderer-side draw cost, measured around the scene's frame() call. */
@@ -62,13 +113,18 @@ export interface FpsOverlayApi {
    */
   setGpuStats(stats: GpuStats | null | undefined): void;
   /**
-   * Take the RENDER fps readout over from the native view's own render thread.
+   * Take the headline fps readout over from the native view's own render thread.
    *
    * In the native present modes (matrix 6/7) the rAF-derived number is not a
    * measurement of anything the user is looking at: Chromium is compositing a
    * page whose scene has stopped drawing, while a separate thread presents a
    * D3D11 swapchain at whatever rate it manages. Reporting the rAF figure there
    * would be a straight-up lie -- it would read 60 while the surface ran at 400.
+   *
+   * The effective-fps logic does not apply here and must not be layered on top:
+   * every frame that thread presents IS a fresh frame -- it re-ray-marches the
+   * scene from device-resident state each time -- so the present rate already is
+   * the perception-true number.
    *
    * So the number is replaced and the unit line SAYS SO: the label gains a
    * "native" tag so nobody compares a native-thread figure against a rAF one
@@ -112,16 +168,34 @@ export function createFpsOverlay(host: HTMLElement | null): FpsOverlayApi {
   let ringCount = 0; // valid samples, saturating at SAMPLES
 
   /**
-   * Render-rate accounting.
+   * Rate accounting -- two counts, one window.
    *
    * Frames are counted against REAL elapsed wall-clock time between readouts,
    * not against the sum of the (clamped) frame samples. Summing samples makes
    * the divisor drift away from the true window as soon as any sample is
    * clamped, which biases the rate; measuring the window directly cannot.
+   *
+   * `freshFrames` drives the headline and `rafFrames` the small display cell.
+   * Sharing the window is what makes the pair directly comparable: "18 of 240"
+   * is a statement about the same second of wall time, not two measurements
+   * taken over different intervals that happen to sit next to each other.
    */
-  let renderFrames = 0;
+  let freshFrames = 0;
+  let rafFrames = 0;
   let renderWindowStartMs = 0;
+  let effectiveFps = 0;
   let displayFps = 0;
+
+  /**
+   * Wall-clock ms accumulated since the last sample landed in the ring.
+   *
+   * A stale tick still costs real time, and that time belongs to the interval
+   * the viewer is waiting through -- so it is carried here and folded into the
+   * next fresh sample rather than dropped. Without this the trace would show a
+   * CPU baseline's 160 ms gaps as whatever the last rAF tick happened to cost,
+   * which is the same lie in graph form.
+   */
+  let pendingIntervalMs = 0;
 
   /**
    * Simulation-rate accounting, counted the same way over the same window.
@@ -165,14 +239,11 @@ export function createFpsOverlay(host: HTMLElement | null): FpsOverlayApi {
 
   const fpsUnit = document.createElement('span');
   fpsUnit.className = 'fps-unit';
-  // Labelled RENDER, not "fps": this is presentation rate and it is pinned to
-  // the display's refresh in every mode. The number that says whether the
-  // compute backend is keeping up is the sim rate below.
-  fpsUnit.textContent = 'render fps';
-  fpsUnit.title =
-    'Presentation rate (requestAnimationFrame). Capped by the monitor refresh ' +
-    'rate regardless of which compute backend is selected -- compare backends ' +
-    'with the sim rate, not this number.';
+  // EFFECTIVE, not "render": this counts the ticks that put something new on
+  // screen. It is the number that matches what eyes see, which is the entire
+  // reason it is the big one.
+  fpsUnit.textContent = 'effective fps';
+  fpsUnit.title = EFFECTIVE_TITLE;
 
   /**
    * Source tag for the fps number.
@@ -191,6 +262,29 @@ export function createFpsOverlay(host: HTMLElement | null): FpsOverlayApi {
     'so the page frame rate says nothing about how fast it is presenting.';
 
   head.append(fpsValue, fpsUnit, fpsSource);
+
+  /**
+   * Secondary display-rate readout -- the raw rAF spin rate, demoted.
+   *
+   * It keeps its own row under the headline rather than joining the stat grid
+   * below: it is a property of the same measurement the big number came from
+   * (same window, same counter), and burying it among sim/copy/draw would read
+   * as another per-frame cost. Two spans so the label and the figure can be
+   * styled independently without building a string per readout.
+   */
+  const displayLine = document.createElement('div');
+  displayLine.className = 'display-line';
+  displayLine.title = DISPLAY_TITLE;
+
+  const displayLabel = document.createElement('span');
+  displayLabel.className = 'display-label';
+  displayLabel.textContent = 'display';
+
+  const displayValue = document.createElement('span');
+  displayValue.className = 'display-value';
+  displayValue.textContent = '--';
+
+  displayLine.append(displayLabel, displayValue);
 
   /**
    * GPU telemetry line -- sits directly under the FPS readout per CONTRACTS
@@ -246,6 +340,8 @@ export function createFpsOverlay(host: HTMLElement | null): FpsOverlayApi {
     return v;
   }
 
+  // Percentiles of the EFFECTIVE interval, matching the trace above them: how
+  // long a typical picture stayed on screen, and how long the worst one did.
   const p50El = makeStat('p50');
   const p99El = makeStat('p99');
 
@@ -267,7 +363,7 @@ export function createFpsOverlay(host: HTMLElement | null): FpsOverlayApi {
   const drawEl = makeStat('draw', 'accent');
   const countEl = makeStat('records');
 
-  host.append(head, gpuLine, spark, stats);
+  host.append(head, displayLine, gpuLine, spark, stats);
 
   /* ---- canvas sizing ---------------------------------------------- */
 
@@ -364,9 +460,14 @@ export function createFpsOverlay(host: HTMLElement | null): FpsOverlayApi {
   /* ---- sparkline --------------------------------------------------- */
 
   /**
-   * Redraw the frame-time trace. Oldest sample on the left, newest on the right.
-   * The fill under the line uses the accent at low alpha so the shape reads even
-   * where the stroke is thin.
+   * Redraw the effective-interval trace: how long each visibly-new frame stayed
+   * on screen. Oldest sample on the left, newest on the right. The fill under
+   * the line uses the accent at low alpha so the shape reads even where the
+   * stroke is thin.
+   *
+   * A stalled backend now shows as a genuinely tall, sparse trace rather than a
+   * flat 4 ms line -- the flat line was the compositor's heartbeat, which was
+   * never the thing worth charting.
    */
   function drawSpark(): void {
     if (!ctx) return;
@@ -423,19 +524,34 @@ export function createFpsOverlay(host: HTMLElement | null): FpsOverlayApi {
   /* ---- public API --------------------------------------------------- */
 
   return {
-    pushFrame(frameMs) {
+    pushFrame(frameMs, fresh) {
       if (!Number.isFinite(frameMs) || frameMs <= 0) return;
       // Cap absurd deltas (tab restore, debugger pause) so one outlier does not
       // poison the percentiles for four seconds.
       const v = Math.min(frameMs, 1000);
 
-      ring[ringHead] = v;
+      // Every tick is a display tick, fresh or not -- that is what the display
+      // readout measures. Only the count is accumulated; the divisor is real
+      // elapsed time, read in tick(). See the counter declarations for why.
+      rafFrames++;
+
+      // A stale tick contributes its wall time to the interval the viewer is
+      // still waiting through, and nothing else. No sample, no headline credit.
+      if (fresh !== true) {
+        pendingIntervalMs = Math.min(pendingIntervalMs + v, 1000);
+        return;
+      }
+
+      // Fresh: the sample is this tick plus however long the stale ticks before
+      // it spent showing the previous picture.
+      const interval = Math.min(v + pendingIntervalMs, 1000);
+      pendingIntervalMs = 0;
+
+      ring[ringHead] = interval;
       ringHead = (ringHead + 1) % SAMPLES;
       if (ringCount < SAMPLES) ringCount++;
 
-      // Only the count is accumulated; the divisor is real elapsed time, read
-      // in tick(). See the renderFrames declaration for why.
-      renderFrames++;
+      freshFrames++;
     },
 
     setTimings(t) {
@@ -523,14 +639,12 @@ export function createFpsOverlay(host: HTMLElement | null): FpsOverlayApi {
       nativeFrameMs =
         typeof frameMs === 'number' && Number.isFinite(frameMs) && frameMs > 0 ? frameMs : 0;
 
-      // The unit line changes wording with the source: "render fps" is the rAF
-      // presentation rate, "present fps" is what a swapchain actually did.
+      // The unit line changes wording with the source: "effective fps" is this
+      // process counting its own fresh ticks, "present fps" is what a swapchain
+      // actually did on a thread we do not tick at all.
       if (usable !== null) {
         setText(fpsUnit, 'present fps');
-        fpsUnit.title =
-          'Present rate of the native D3D11 swapchain, measured on its own ' +
-          'render thread. Not capped by the page frame rate -- in the unlocked ' +
-          'mode it is not capped by vsync either.';
+        fpsUnit.title = PRESENT_TITLE;
         if (fpsSource.classList.contains('is-hidden')) fpsSource.classList.remove('is-hidden');
         // Repaint the number now rather than at the next readout tick, so the
         // switch does not briefly show a rAF figure under a "native" tag.
@@ -538,11 +652,8 @@ export function createFpsOverlay(host: HTMLElement | null): FpsOverlayApi {
         return;
       }
 
-      setText(fpsUnit, 'render fps');
-      fpsUnit.title =
-        'Presentation rate (requestAnimationFrame). Capped by the monitor refresh ' +
-        'rate regardless of which compute backend is selected -- compare backends ' +
-        'with the sim rate, not this number.';
+      setText(fpsUnit, 'effective fps');
+      fpsUnit.title = EFFECTIVE_TITLE;
       if (!fpsSource.classList.contains('is-hidden')) fpsSource.classList.add('is-hidden');
     },
 
@@ -566,28 +677,46 @@ export function createFpsOverlay(host: HTMLElement | null): FpsOverlayApi {
       if (nowMs - lastReadoutMs < READOUT_INTERVAL_MS) return;
       lastReadoutMs = nowMs;
 
-      // One measured window drives BOTH rates, so render fps and sim rate are
-      // directly comparable -- they are counts over the identical interval.
+      // One measured window drives ALL THREE rates, so effective fps, display
+      // fps and sim rate are directly comparable -- they are counts over the
+      // identical interval rather than three separately-timed measurements.
       const windowMs = nowMs - renderWindowStartMs;
       if (windowMs > 0) {
-        displayFps = (renderFrames * 1000) / windowMs;
+        effectiveFps = (freshFrames * 1000) / windowMs;
+        displayFps = (rafFrames * 1000) / windowMs;
         displaySimHz = (simSteps * 1000) / windowMs;
         // Cost of one step, inverted from the rate. Reporting this rather than
         // the engine's self-reported simMs makes a backend that is merely SLOW
         // to answer look slow, which self-reported kernel time never does.
         displayStepMs = displaySimHz > 0 ? 1000 / displaySimHz : 0;
       }
-      renderFrames = 0;
+      freshFrames = 0;
+      rafFrames = 0;
       simSteps = 0;
       renderWindowStartMs = nowMs;
 
       // The native thread owns this cell while it is presenting; overwriting it
       // with the rAF figure here would undo setNativeFps() twice a second.
       if (nativeFps === null) {
-        setText(fpsValue, displayFps > 0 ? String(Math.round(displayFps)) : '--');
+        // Sub-1 fps is a real state on a heavy CPU preset and rounding it to "0"
+        // reads as a stall rather than a slow scene, so one decimal survives
+        // below 10 -- same treatment the sim rate already gets.
+        setText(
+          fpsValue,
+          effectiveFps <= 0
+            ? '--'
+            : effectiveFps >= 10
+              ? String(Math.round(effectiveFps))
+              : effectiveFps.toFixed(1),
+        );
       } else {
         setText(fpsValue, String(Math.round(nativeFps)));
       }
+
+      // The display cell is always the rAF figure, even while the native thread
+      // owns the headline: in modes 6/7 the two measure genuinely different
+      // surfaces, and showing both is exactly how that difference gets noticed.
+      setText(displayValue, displayFps > 0 ? String(Math.round(displayFps)) : '--');
       setText(
         simRateEl,
         displaySimHz > 0

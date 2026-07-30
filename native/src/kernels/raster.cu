@@ -13,11 +13,14 @@
  *
  *   1. ClearSplatKernel   - zero the float4 accumulation buffer.
  *   2. SplatSwarmKernel   - project agents to screen, draw velocity-aligned
- *                           streaks with a small gaussian footprint.
- *      SplatStormKernel   - project particles, draw energy-ramped points.
- *   3. CompositeKernel    - sky gradient, analytic globe (textured or
- *                           procedural), volumetric march, then the tone-mapped
- *                           splat buffer on top. Writes RGBA8.
+ *                           streaks sized from the projected dart glyph.
+ *      SplatStormKernel   - project particles, draw energy-ramped points at
+ *                           the three.js Points path's size and brightness.
+ *   3. CompositeKernel    - per-scene background (matching the WebGL clear),
+ *                           analytic globe (textured or procedural),
+ *                           volumetric march, then the splat buffer on top -
+ *                           coverage-composited for the swarm, additive for
+ *                           the storm. Writes RGBA8.
  *
  * Both entry points run the identical pipeline. Only the final store differs
  * (linear memory vs. surf2Dwrite), which is handled by a template parameter on
@@ -118,14 +121,32 @@ ScenePasses PassesForScene(int sceneId) {
  *  Look
  * ===================================================================== */
 
-/** Sky gradient endpoints - near-black at the top, a faint cool wash below. */
-__device__ __forceinline__ float3 SkyTop() { return gsMake(0.006f, 0.008f, 0.020f); }
-__device__ __forceinline__ float3 SkyBottom() { return gsMake(0.020f, 0.030f, 0.055f); }
+/**
+ * Per-scene background colors - copied from the three.js scenes' clear colors,
+ * NOT invented here. A backend switch must change performance, not the picture
+ * (CONTRACTS section 8), and the background is the first thing the eye compares
+ * in a side-by-side. The old gradient + wash read visibly brighter and bluer
+ * than the WebGL scenes' near-black clears, which is exactly the kind of drift
+ * this table exists to stop.
+ *
+ * Values are the setClearColor hex constants converted to linear with the same
+ * 2.2 power the rest of this file uses (the composite works in linear and
+ * applies the transfer function at the end, so an sRGB byte b becomes
+ * (b/255)^2.2 here and lands back on exactly b after ToSrgb).
+ *
+ *   swarm/globe scene:  0x05060a  (src/renderer/scenes/globe/index.ts)
+ *   weather scene:      0x04050a  (src/renderer/scenes/weather/index.ts)
+ *   storm scene:        0x04040a  (src/renderer/scenes/storm/index.ts)
+ */
+__device__ __forceinline__ float3 BgSwarm() { return gsMake(1.747e-4f, 2.614e-4f, 8.045e-4f); }
+__device__ __forceinline__ float3 BgWeather() { return gsMake(1.072e-4f, 1.747e-4f, 8.045e-4f); }
+__device__ __forceinline__ float3 BgStorm() { return gsMake(1.072e-4f, 1.072e-4f, 8.045e-4f); }
 
-/** Flat deep-space background for the storm scene, which has no globe and so no
- *  atmosphere to justify a gradient. Darker than SkyTop so the particle splats
- *  have the full dynamic range to themselves. */
-__device__ __forceinline__ float3 SpaceColor() { return gsMake(0.004f, 0.005f, 0.012f); }
+/** Starfield tint, linear. Mirrors the globe scene's star sprite color
+ *  vec3(0.85, 0.90, 1.0) raised to 2.2. Only the swarm/globe scene draws stars
+ *  - the three.js weather and storm scenes have none, so parity says the CUDA
+ *  ones must not either. */
+__device__ __forceinline__ float3 StarTint() { return gsMake(0.699f, 0.793f, 1.0f); }
 
 /** Procedural globe palette, used when no earth texture has been uploaded. */
 __device__ __forceinline__ float3 OceanColor() { return gsMake(0.035f, 0.098f, 0.196f); }
@@ -255,14 +276,15 @@ constexpr float kShellOuter = GS_ALTITUDE_MAX * 1.5f;
  *  Splat parameters
  * ===================================================================== */
 
-/** Half-width of the gaussian footprint, in pixels. A 2-pixel radius (5x5
- *  stamp) is the smallest that still antialiases; anything larger turns 2M
- *  agents into an opaque wash and multiplies the atomic traffic by the area. */
-constexpr int kSplatRadius = 2;
-
-/** Gaussian sigma, in pixels. Tuned so the footprint has decayed to ~2% at the
- *  radius, which is where truncation stops being visible as a square edge. */
-constexpr float kSplatSigma = 0.85f;
+/**
+ * Base world-space size of one swarm dart. Mirrors DART_SCALE in
+ * src/renderer/scenes/dart-swarm.ts - the three.js glyph spans y in [-1, 1]
+ * of dart space, so its world height is 2x this. The splat pass projects the
+ * same world size to pixels and sizes its footprint from it, which is what
+ * keeps the CUDA swarm and the instanced-mesh swarm the same apparent size at
+ * any zoom.
+ */
+constexpr float kDartScale = 0.0075f;
 
 /** Samples along a swarm agent's velocity vector, forming the streak. */
 constexpr int kStreakSamples = 3;
@@ -272,10 +294,47 @@ constexpr int kStreakSamples = 3;
  *  fixed factor reads correctly across the whole speed band. */
 constexpr float kStreakScale = 0.055f;
 
-/** Brightness scales. Small because thousands of splats land on the same pixel
- *  at these counts and the tonemap has to have headroom to work with. */
-constexpr float kSwarmBrightness = 0.0075f;
-constexpr float kStormBrightness = 0.0095f;
+/**
+ * Coverage deposited by the head sample of one agent's streak.
+ *
+ * The swarm splat layer is composited as COVERAGE, not additive energy (see
+ * the splat section of ShadePixel): the composite turns the accumulated weight
+ * w into opacity via 1 - exp(-w), so a lone agent's head lands at
+ * 1 - exp(-2.6) = 0.93 - within a couple of percent of the 0.95 fill alpha of
+ * the three.js dart. This is the number that fixed "swarm invisible in CUDA
+ * raster": the old additive weight was 0.0075 per agent, i.e. a ~0.3% linear
+ * nudge on top of a lit globe, hundreds of times below a visible contrast.
+ */
+constexpr float kSwarmHeadWeight = 2.6f;
+
+/** Trailing-sample fade, matching the old streak taper: the tail reads as a
+ *  direction cue, not a solid bar. */
+constexpr float kStreakTaper = 0.55f;
+
+/** Footprint ceilings, in pixels. Zoomed far in, an unbounded projected size
+ *  would turn each agent into a hundreds-of-pixels stamp of atomics; past this
+ *  radius the glyph is already unambiguous. */
+constexpr int kSwarmMaxRadius = 9;
+constexpr int kStormMaxRadius = 12;
+
+/**
+ * Storm point sizing - the three.js storm scene's vertex shader, verbatim
+ * (src/renderer/scenes/storm/index.ts):
+ *
+ *   gl_PointSize = (2.6 + energy * 3.4) * uPointScale * uPixelRatio / dist
+ *   floor:         0.8 * uPixelRatio * uPointScale
+ *   alpha:         falloff * (0.18 + energy * 0.82)
+ *
+ * InputUniforms::pointScale arrives premultiplied with the pixel ratio, so the
+ * kernel's copy of the formula is term-for-term identical. Keeping the numbers
+ * as named mirrors (rather than folding them) is what keeps the two paths
+ * reviewable side by side.
+ */
+constexpr float kStormSizeBase = 2.6f;
+constexpr float kStormSizeEnergy = 3.4f;
+constexpr float kStormSizeFloor = 0.8f;
+constexpr float kStormAlphaBase = 0.18f;
+constexpr float kStormAlphaEnergy = 0.82f;
 
 /* ===================================================================== *
  *  Camera
@@ -294,12 +353,18 @@ __device__ __forceinline__ float3 PrimaryRay(float px, float py, int w, int h,
   const float ndcX = (2.0f * px / static_cast<float>(w)) - 1.0f;
   const float ndcY = 1.0f - (2.0f * py / static_cast<float>(h));
 
-  // Guard the projection inputs: a zero fov or aspect from an uninitialised
-  // uniform block would collapse every ray onto the view axis.
+  // Guard the projection inputs: a zero fov from an uninitialised uniform block
+  // would collapse every ray onto the view axis.
   const float fovY = (in.fovYDeg > 1.0f && in.fovYDeg < 179.0f) ? in.fovYDeg : 50.0f;
-  const float aspect = (in.aspect > 0.01f && in.aspect < 100.0f)
-                           ? in.aspect
-                           : (static_cast<float>(w) / static_cast<float>(h));
+
+  // Aspect comes from the surface being written, NEVER from the uniforms.
+  // InputState.camera.aspect describes the WEB canvas the renderer measured,
+  // which is a different viewport from the native view's child window - using
+  // it there rendered the globe as an ellipse whenever the two rects differed
+  // (they always do: the native rect excludes the HTML gutter). The target's
+  // own w/h is authoritative by construction for every consumer of this
+  // projection, including the blit path where the two happen to agree.
+  const float aspect = (h > 0) ? (static_cast<float>(w) / static_cast<float>(h)) : 1.0f;
 
   const float tanHalf = tanf(fovY * 0.5f * 0.01745329f);  // deg -> rad
   const float3 camDir = gsMake(ndcX * tanHalf * aspect, ndcY * tanHalf, -1.0f);
@@ -335,9 +400,10 @@ __device__ __forceinline__ bool ProjectPoint(const float3& p, const InputUniform
   if (depth <= 1e-4f) return false;
 
   const float fovY = (in.fovYDeg > 1.0f && in.fovYDeg < 179.0f) ? in.fovYDeg : 50.0f;
-  const float aspect = (in.aspect > 0.01f && in.aspect < 100.0f)
-                           ? in.aspect
-                           : (static_cast<float>(w) / static_cast<float>(h));
+  // Target-derived aspect, for the same reason PrimaryRay ignores in.aspect:
+  // the splats must project through the identical camera the ray-marcher uses,
+  // or entities drift off the geometry under them on a non-web viewport.
+  const float aspect = (h > 0) ? (static_cast<float>(w) / static_cast<float>(h)) : 1.0f;
   const float tanHalf = tanf(fovY * 0.5f * 0.01745329f);
   if (tanHalf < 1e-6f) return false;
 
@@ -615,41 +681,48 @@ __global__ void ClearSplatKernel(float4* __restrict__ accum, int count) {
 /**
  * @brief Additively deposit a coloured gaussian footprint at a screen position.
  *
- * Three atomicAdds per covered pixel (RGB; alpha is tracked in the w channel by
- * the caller when it wants coverage). Float atomics on global memory are a
+ * Four atomicAdds per covered pixel: RGB carries color * weight, w carries the
+ * raw weight, so the composite can recover both a mean colour (rgb / w) and a
+ * coverage (1 - exp(-w)) per pixel. Float atomics on global memory are a
  * single instruction on this hardware and the contention is spread over the
- * whole frame, so even at 4M particles the atomic traffic is not the
+ * whole frame, so even at millions of entities the atomic traffic is not the
  * bottleneck - the record reads are.
+ *
+ * The footprint is now sized per call rather than by a compile-time constant:
+ * the swarm glyph is world-proportional (CONTRACTS section 8's zoom ladder),
+ * so a zoomed-in agent must cover more pixels than a subpixel one.
  *
  * @param accum  float4 accumulation buffer, w*h
  * @param w,h    frame dimensions
  * @param sx,sy  sub-pixel screen position
- * @param color  premultiplied colour contribution
- * @param weight overall intensity multiplier
+ * @param color  linear colour of the entity
+ * @param weight peak (centre) deposit weight
+ * @param sigma  gaussian sigma, pixels
+ * @param radius footprint half-width, pixels (caller clamps to its ceiling)
  */
 __device__ __forceinline__ void SplatGaussian(float4* __restrict__ accum, int w, int h, float sx,
-                                              float sy, const float3& color, float weight) {
+                                              float sy, const float3& color, float weight,
+                                              float sigma, int radius) {
   if (weight <= 1e-5f) return;
+  if (radius < 1) radius = 1;
+  if (sigma < 0.3f) sigma = 0.3f;
 
   const int cx = static_cast<int>(floorf(sx));
   const int cy = static_cast<int>(floorf(sy));
 
   // Cheap whole-footprint reject before the loop. Saves the inner bounds checks
   // for the overwhelming majority of off-screen entities at these counts.
-  if (cx < -kSplatRadius || cy < -kSplatRadius || cx >= w + kSplatRadius ||
-      cy >= h + kSplatRadius) {
+  if (cx < -radius || cy < -radius || cx >= w + radius || cy >= h + radius) {
     return;
   }
 
-  const float invTwoSigmaSq = 1.0f / (2.0f * kSplatSigma * kSplatSigma);
+  const float invTwoSigmaSq = 1.0f / (2.0f * sigma * sigma);
 
-  #pragma unroll
-  for (int dy = -kSplatRadius; dy <= kSplatRadius; ++dy) {
+  for (int dy = -radius; dy <= radius; ++dy) {
     const int py = cy + dy;
     if (py < 0 || py >= h) continue;
 
-    #pragma unroll
-    for (int dx = -kSplatRadius; dx <= kSplatRadius; ++dx) {
+    for (int dx = -radius; dx <= radius; ++dx) {
       const int px = cx + dx;
       if (px < 0 || px >= w) continue;
 
@@ -671,23 +744,100 @@ __device__ __forceinline__ void SplatGaussian(float4* __restrict__ accum, int w,
 }
 
 /**
- * @brief Colour ramp for a swarm agent, keyed on its type.
+ * @brief Deposit a soft round point sprite, matching the three.js storm scene's
+ *        fragment profile.
  *
- * Four types (protocol.js puts the type in the low 4 bits of the flags float),
- * four hues. Kept high-chroma and reasonably bright because the splats go
- * through a tonemap that compresses hard at high accumulation.
+ * The WebGL path draws gl_PointSize-sized squares and discards outside r=0.5,
+ * fading with 1 - smoothstep(0, 0.25, r2). This reproduces that exact radial
+ * profile over a splat of diameter @p sizePx so the two backends' particles are
+ * the same shape as well as the same size - a gaussian reads visibly "softer"
+ * than the sprite at equal diameter.
+ *
+ * @param accum  float4 accumulation buffer, w*h
+ * @param w,h    frame dimensions
+ * @param sx,sy  sub-pixel screen position
+ * @param color  linear colour of the particle
+ * @param weight peak (centre) deposit weight
+ * @param sizePx sprite diameter, pixels
  */
-__device__ __forceinline__ float3 SwarmColor(unsigned int type, float phase) {
-  float3 base;
-  switch (type & 3u) {
-    case 0: base = gsMake(0.30f, 0.75f, 1.00f); break;  // cyan
-    case 1: base = gsMake(1.00f, 0.62f, 0.22f); break;  // amber
-    case 2: base = gsMake(0.62f, 0.42f, 1.00f); break;  // violet
-    default: base = gsMake(0.40f, 1.00f, 0.62f); break; // mint
+__device__ __forceinline__ void SplatDisc(float4* __restrict__ accum, int w, int h, float sx,
+                                          float sy, const float3& color, float weight,
+                                          float sizePx) {
+  if (weight <= 1e-5f) return;
+
+  // A sub-pixel sprite still lights one pixel (the WebGL floor rasterizes a
+  // 1 px point); scale its energy by covered area so a dense far cloud sums to
+  // the same haze it does on the Points path instead of a field of full-alpha
+  // singles.
+  float areaScale = 1.0f;
+  if (sizePx < 1.0f) {
+    areaScale = fmaxf(sizePx * sizePx, 0.04f);
+    sizePx = 1.0f;
   }
-  // The animation phase modulates brightness, which is what turns a static dot
-  // into something that reads as a flapping/pulsing body at these scales.
-  return gsScale(base, 0.72f + 0.28f * sinf(phase));
+
+  const float half = sizePx * 0.5f;
+  int radius = static_cast<int>(ceilf(half + 0.5f));
+  if (radius < 1) radius = 1;
+  if (radius > kStormMaxRadius) radius = kStormMaxRadius;
+
+  const int cx = static_cast<int>(floorf(sx));
+  const int cy = static_cast<int>(floorf(sy));
+  if (cx < -radius || cy < -radius || cx >= w + radius || cy >= h + radius) {
+    return;
+  }
+
+  // r2 in the sprite's own normalized space: gl_PointCoord spans 0..1 across
+  // the point, so r2 = 0.25 at the rim. Map pixel distance to that space.
+  const float invDiamSq = 1.0f / (sizePx * sizePx);
+
+  for (int dy = -radius; dy <= radius; ++dy) {
+    const int py = cy + dy;
+    if (py < 0 || py >= h) continue;
+
+    for (int dx = -radius; dx <= radius; ++dx) {
+      const int px = cx + dx;
+      if (px < 0 || px >= w) continue;
+
+      const float ox = (static_cast<float>(px) + 0.5f) - sx;
+      const float oy = (static_cast<float>(py) + 0.5f) - sy;
+      const float r2 = (ox * ox + oy * oy) * invDiamSq;
+      if (r2 > 0.25f) continue;  // outside the sprite, exactly like the discard
+
+      const float falloff = 1.0f - gsSmoothstep(0.0f, 0.25f, r2);
+      const float g = weight * falloff * areaScale;
+      if (g < 1e-5f) continue;
+
+      float4* dst = accum + static_cast<size_t>(py) * w + px;
+      atomicAdd(&dst->x, color.x * g);
+      atomicAdd(&dst->y, color.y * g);
+      atomicAdd(&dst->z, color.z * g);
+      atomicAdd(&dst->w, g);
+    }
+  }
+}
+
+/**
+ * @brief Colour for a swarm agent, keyed on its type.
+ *
+ * Parity source: the dart material in src/renderer/scenes/dart-swarm.ts. The
+ * three.js swarm is the accent-cyan family (uColor 0x4fd1ff) with a subtle
+ * per-type nudge - mix(base, base * vec3(0.72, 0.95, 1.15), type * 0.12) - not
+ * four distinct hues, so the CUDA swarm may not be a rainbow either. The sRGB
+ * constants are converted to linear here (this path composites in linear and
+ * applies the transfer function at the end).
+ *
+ * The old phase-driven brightness pulse is gone for the same reason: the mesh
+ * path has no pulse, and the coverage composite renders these as opaque bodies
+ * whose brightness IS the fill colour.
+ */
+__device__ __forceinline__ float3 SwarmColor(unsigned int type) {
+  // 0x4fd1ff -> (0.310, 0.820, 1.0) sRGB -> linear via ^2.2.
+  const float3 base = gsMake(0.0762f, 0.6461f, 1.0f);
+  // The shader's nudge runs in sRGB space; at 12% steps the difference from
+  // applying it in linear is under a code value, so the cheap version wins.
+  // vec3(0.72, 0.95, 1.15)^2.2 = (0.4855, 0.8934, 1.3600).
+  const float t = static_cast<float>(type & 3u) * 0.12f;
+  return gsMul(base, gsLerp3(gsSplat(1.0f), gsMake(0.4855f, 0.8934f, 1.36f), t));
 }
 
 /**
@@ -719,7 +869,6 @@ void SplatSwarmKernel(float4* __restrict__ accum, int w, int h,
   const float* rec = records + static_cast<size_t>(i) * GS_SWARM_FLOATS;
   const float3 p = gsMake(rec[0], rec[1], rec[2]);
   const float3 v = gsMake(rec[3], rec[4], rec[5]);
-  const float phase = rec[6];
   const unsigned int type = static_cast<unsigned int>(rec[7]) & 15u;
 
   // A poisoned record projects to garbage screen coordinates; drop it rather
@@ -742,13 +891,32 @@ void SplatSwarmKernel(float4* __restrict__ accum, int w, int h,
   float sx, sy, depth;
   if (!ProjectPoint(p, in, w, h, &sx, &sy, &depth)) return;
 
-  const float3 color = SwarmColor(type, phase);
+  const float3 color = SwarmColor(type);
 
-  // Attenuate with depth so the far side of the shell does not read as bright
-  // as the near side. Inverse-square would be physically right but crushes the
-  // far half to nothing; inverse-linear keeps the whole formation legible.
-  const float atten = 1.0f / (0.55f + depth * 0.55f);
-  const float weight = kSwarmBrightness * atten;
+  /* --- projected glyph size -------------------------------------------- */
+  // The same conversion the dart shader uses: a world length L at view depth d
+  // projects to L * viewportH / (2 * d * tan(fovY/2)) pixels. The dart spans
+  // 2 * kDartScale in world space, and the footprint tracks that so the CUDA
+  // swarm matches the mesh swarm's apparent size at ANY zoom - which is also
+  // what makes agents readable close up (the old fixed 2 px stamp vanished
+  // against the globe the moment the glyph should have been tens of pixels).
+  const float fovY = (in.fovYDeg > 1.0f && in.fovYDeg < 179.0f) ? in.fovYDeg : 50.0f;
+  const float tanHalf = tanf(fovY * 0.5f * 0.01745329f);
+  const float pxSize =
+      (kDartScale * 2.0f * static_cast<float>(h)) / fmaxf(2.0f * depth * tanHalf, 1e-4f);
+
+  // Footprint from projected size. The sigma factor puts the visible core of
+  // the gaussian at roughly the glyph's height; the radius covers it to ~2%.
+  float sigma = pxSize * 0.30f;
+  if (sigma < 0.55f) sigma = 0.55f;
+  if (sigma > 4.5f) sigma = 4.5f;
+  int radius = static_cast<int>(ceilf(sigma * 2.2f));
+  if (radius > kSwarmMaxRadius) radius = kSwarmMaxRadius;
+
+  // No depth-based brightness attenuation: the mesh dart's fill alpha is the
+  // same at any distance (only its projected SIZE attenuates), and this layer
+  // is composited as coverage, so brightness parity means a constant weight.
+  const float weight = kSwarmHeadWeight;
 
   /* --- streak --------------------------------------------------------- */
   // Project the streak endpoints rather than the midpoint plus a screen-space
@@ -758,21 +926,19 @@ void SplatSwarmKernel(float4* __restrict__ accum, int w, int h,
 
   float tx, ty, tdepth;
   if (ProjectPoint(tail, in, w, h, &tx, &ty, &tdepth)) {
-    // Split the intensity across the samples so a streak and a point deposit
-    // the same total energy - otherwise fast agents would be brighter purely
-    // because they cover more pixels.
-    const float per = weight * (1.0f / static_cast<float>(kStreakSamples));
-
     #pragma unroll
     for (int s = 0; s < kStreakSamples; ++s) {
       const float f = static_cast<float>(s) / static_cast<float>(kStreakSamples - 1);
       // Fade toward the tail so the streak reads as a direction, not a bar.
-      const float taper = 1.0f - 0.55f * f;
-      SplatGaussian(accum, w, h, gsLerpf(sx, tx, f), gsLerpf(sy, ty, f), color, per * taper);
+      // Coverage saturates rather than sums (1 - exp(-w)), so overlapping
+      // samples cannot blow the head out - no energy split needed.
+      const float taper = 1.0f - kStreakTaper * f;
+      SplatGaussian(accum, w, h, gsLerpf(sx, tx, f), gsLerpf(sy, ty, f), color, weight * taper,
+                    sigma, radius);
     }
   } else {
     // Tail behind the camera - just draw the head.
-    SplatGaussian(accum, w, h, sx, sy, color, weight);
+    SplatGaussian(accum, w, h, sx, sy, color, weight, sigma, radius);
   }
 }
 
@@ -812,20 +978,37 @@ void SplatStormKernel(float4* __restrict__ accum, int w, int h,
   if (!ProjectPoint(p, in, w, h, &sx, &sy, &depth)) return;
 
   /* --- energy colour ramp ---------------------------------------------- */
-  // Deep blue at rest -> cyan -> white-hot at full energy. Two lerps rather
-  // than a lookup table: the table would be a constant-memory read per
-  // particle, and at 4M particles that is real bandwidth for three colours.
-  const float3 cold = gsMake(0.12f, 0.26f, 0.85f);
-  const float3 mid = gsMake(0.25f, 0.90f, 1.00f);
-  const float3 hot = gsMake(1.00f, 0.95f, 0.82f);
+  // The three.js storm fragment shader's ramp, verbatim (sRGB), converted to
+  // linear via ^2.2 for this pipeline. Two lerps rather than a lookup table:
+  // the table would be a constant-memory read per particle, and at 4M
+  // particles that is real bandwidth for three colours.
+  //   cold (0.10, 0.22, 0.75)  mid (0.20, 0.85, 1.00)  hot (1, 1, 1)
+  const float3 cold = gsMake(0.00631f, 0.03594f, 0.53102f);
+  const float3 mid = gsMake(0.02899f, 0.69939f, 1.00000f);
+  const float3 hot = gsMake(1.00000f, 1.00000f, 1.00000f);
 
   const float3 color = (energy < 0.5f) ? gsLerp3(cold, mid, energy * 2.0f)
                                        : gsLerp3(mid, hot, (energy - 0.5f) * 2.0f);
 
-  const float atten = 1.0f / (0.55f + depth * 0.55f);
-  // Energy squared: makes the hot cores stand out sharply instead of the whole
-  // cloud brightening uniformly.
-  SplatGaussian(accum, w, h, sx, sy, color, kStormBrightness * energy * energy * atten);
+  /* --- projected point size --------------------------------------------- */
+  // Term-for-term the three.js vertex shader (see the kStorm* mirror block):
+  // size falls as 1/depth, scaled by the slider x pixel-ratio product carried
+  // in the uniforms, floored so far particles stay a 1 px haze.
+  const float ps = (in.pointScale > 0.05f && in.pointScale < 64.0f) ? in.pointScale : 1.0f;
+  float sizePx = (kStormSizeBase + energy * kStormSizeEnergy) * ps / fmaxf(depth, 0.05f);
+  sizePx = fmaxf(sizePx, kStormSizeFloor * ps);
+
+  /* --- deposit weight ---------------------------------------------------- */
+  // The WebGL path adds alpha * color straight into an sRGB framebuffer; this
+  // path accumulates linear energy that the composite maps through
+  // 1 - exp(-x) and then ^(1/2.2). Inverting that chain at the sprite centre -
+  // w = -ln(1 - a^2.2) - is what makes a lone particle of a given energy land
+  // on the same display value on both backends instead of ~500x dimmer (the
+  // old fixed 0.0095 weight, which is the root cause of "can barely see").
+  const float aDisp = gsClampf(kStormAlphaBase + energy * kStormAlphaEnergy, 0.0f, 0.985f);
+  const float weight = -__logf(1.0f - __powf(aDisp, 2.2f));
+
+  SplatDisc(accum, w, h, sx, sy, color, weight, sizePx);
 }
 
 /* ===================================================================== *
@@ -849,6 +1032,18 @@ struct CompositeArgs {
   float timeSec;
   int hasGlobe;                    ///< 1 when the globe + its limb glow are drawn
   int hasVolume;                   ///< 1 when the volumetric pass should run
+  /** Published SceneId snapshot (the same one the passes were resolved from).
+   *  The passes stay authoritative for WHAT is drawn; this exists for the two
+   *  purely cosmetic choices that are scene identity rather than pass
+   *  composition: the background colour and the starfield, both of which must
+   *  match their three.js counterpart scene exactly (CONTRACTS section 8 -
+   *  backend switches change performance, not the picture). */
+  int sceneId;
+  /** 1 = composite the splat layer additively (storm: the WebGL path is
+   *  additive-blended Points, overlaps sum toward white). 0 = composite it as
+   *  coverage (swarm/weather: the WebGL darts are opaque glyphs, overlaps stay
+   *  opaque cyan instead of blowing out). */
+  int additiveSplats;
 };
 
 /**
@@ -885,23 +1080,46 @@ __device__ float3 ShadePixel(int px, int py, int w, int h, const InputUniforms& 
   const float3 ro = gsMake(in.camPos[0], in.camPos[1], in.camPos[2]);
   const float3 rd = PrimaryRay(px + 0.5f, py + 0.5f, w, h, in);
 
-  /* --- sky ------------------------------------------------------------- */
-  // The globe scenes get the atmosphere-tinted gradient (it reads as looking at
-  // a planet from orbit). The storm scene has no planet, so that cool wash along
-  // the bottom would just look like an unexplained light source - it gets flat
-  // deep space instead, which also gives the particle splats the most contrast.
-  const float v = (py + 0.5f) / static_cast<float>(h);
-  float3 color = args.hasGlobe ? gsLerp3(SkyTop(), SkyBottom(), v) : SpaceColor();
+  /* --- background -------------------------------------------------------- */
+  // Flat per-scene clears, copied from the three.js scenes (see the Bg*
+  // constants). No gradient, no wash: the WebGL scenes clear to a constant and
+  // the pictures must match across the backend switch.
+  float3 color;
+  switch (static_cast<SceneId>(args.sceneId)) {
+    case SceneId::kWeather: color = BgWeather(); break;
+    case SceneId::kStorm:   color = BgStorm(); break;
+    case SceneId::kSwarm:
+    default:                color = BgSwarm(); break;
+  }
 
-  // Starfield. A hash on the quantised ray direction gives stars that are fixed
-  // in world space (they rotate correctly with the camera) and cost one hash.
-  {
+  // Starfield - SWARM SCENE ONLY. The three.js globe scene has a starfield
+  // (buildStars in scenes/globe/index.ts); its weather and storm scenes do
+  // not, so the CUDA versions of those scenes may not either - the stray stars
+  // over the storm backdrop were pure backend drift.
+  if (static_cast<SceneId>(args.sceneId) == SceneId::kSwarm) {
+    // A hash on the quantised ray direction gives stars fixed in world space
+    // (they rotate correctly with the camera) for one hash per pixel. The lit
+    // region is shrunk to a soft disc around the cell centre so a star is a
+    // 1-3 px round point like the WebGL sprite ladder (0.9-2.5 px), not a
+    // cell-sized blob.
     const float3 q = gsScale(rd, 220.0f);
-    const unsigned int hs = gsHash3i(static_cast<int>(floorf(q.x)), static_cast<int>(floorf(q.y)),
-                                     static_cast<int>(floorf(q.z)), 0x57A2u);
+    const float3 cell = gsMake(floorf(q.x), floorf(q.y), floorf(q.z));
+    const unsigned int hs = gsHash3i(static_cast<int>(cell.x), static_cast<int>(cell.y),
+                                     static_cast<int>(cell.z), 0x57A2u);
     if ((hs & 1023u) < 3u) {
-      const float mag = (hs >> 12) * (1.0f / 1048576.0f);
-      color = gsAdd(color, gsSplat(0.25f + 0.75f * mag));
+      // Offset from the cell centre, with the along-ray component removed so
+      // the falloff measures apparent (screen) distance, not depth.
+      const float3 fo = gsSub(gsSub(q, cell), gsSplat(0.5f));
+      const float3 perp = gsSub(fo, gsScale(rd, gsDot(fo, rd)));
+      const float rr = gsLength(perp) * 2.0f;  // 0 centre .. ~1.4 corner
+      const float falloff = 1.0f - gsSmoothstep(0.05f, 0.42f, rr);
+      if (falloff > 0.0f) {
+        // Brightness ladder mirrors the sprite alpha (bright in 0.25..1, x0.85),
+        // pushed through ^2.2 so it lands at the same display value.
+        const float mag = 0.25f + 0.75f * ((hs >> 12) * (1.0f / 1048576.0f));
+        const float lin = __powf(mag * 0.85f * falloff, 2.2f);
+        color = gsAdd(color, gsScale(StarTint(), lin));
+      }
     }
   }
 
@@ -1111,21 +1329,31 @@ __device__ float3 ShadePixel(int px, int py, int w, int h, const InputUniforms& 
   /* --- splats ------------------------------------------------------------- */
   if (args.accum) {
     const float4 s = args.accum[static_cast<size_t>(py) * w + px];
-    // Tonemap the splat layer on its own before adding. Tonemapping the sum
-    // would let a bright globe crush the entity layer into invisibility; doing
-    // it separately keeps the entities readable over any background.
-    const float3 splat = Tonemap(gsMake(s.x, s.y, s.z));
-
-    // Coverage-weighted composite instead of a straight add. The w channel is
-    // the accumulated gaussian weight, i.e. how much of this pixel the entities
-    // actually cover, and it is already being written by SplatGaussian - it was
-    // simply never read. Using it to attenuate the background means a dense
-    // patch of agents reads as opaque bodies sitting ON the globe rather than a
-    // bright haze glowing through it, while sparse coverage (the common case at
-    // these counts, where most agents are subpixel) still composites additively
-    // and keeps its soft antialiased edge.
-    const float coverage = 1.0f - __expf(-s.w * 1.35f);
-    color = gsAdd(gsScale(color, 1.0f - 0.55f * coverage), splat);
+    if (s.w > 1e-4f) {
+      if (args.additiveSplats) {
+        // STORM: the WebGL path is additive-blended Points, so overlapping
+        // particles sum toward white. Tonemap the splat layer on its own
+        // before adding - tonemapping the sum would let the background eat the
+        // entity layer - then attenuate the (near-black) backdrop by coverage
+        // so a dense core reads as body rather than glow.
+        const float3 splat = Tonemap(gsMake(s.x, s.y, s.z));
+        const float coverage = 1.0f - __expf(-s.w * 1.35f);
+        color = gsAdd(gsScale(color, 1.0f - 0.55f * coverage), splat);
+      } else {
+        // SWARM: the WebGL darts are OPAQUE glyphs (fill alpha 0.95), so this
+        // layer composites as coverage, not energy. rgb / w recovers the mean
+        // entity colour at the pixel and 1 - exp(-w) turns the accumulated
+        // weight into opacity: a lone agent reads as a solid cyan dart over
+        // the globe, a dense band saturates to opaque cyan instead of blowing
+        // out to additive white, and a footprint edge (small w) still blends
+        // softly for free antialiasing. This replaced a straight tonemap-add
+        // whose per-agent contribution was ~0.3% of a lit globe pixel - the
+        // "swarm invisible in CUDA raster" defect.
+        const float3 avg = gsScale(gsMake(s.x, s.y, s.z), 1.0f / s.w);
+        const float alpha = 1.0f - __expf(-s.w);
+        color = gsLerp3(color, avg, alpha);
+      }
+    }
   }
 
   return color;
@@ -1291,9 +1519,13 @@ cudaError_t RunSplatPasses(int w, int h, const ScenePasses& passes, const InputU
  * @brief Assemble the composite arguments for the scene being drawn.
  *
  * @param passes  composition for the currently published scene
+ * @param sceneId the SceneId snapshot the passes were resolved from - the SAME
+ *                snapshot, so the cosmetic choices (background, starfield,
+ *                splat blend mode) can never disagree with the pass set during
+ *                a scene switch
  * @param timeSec scene clock
  */
-CompositeArgs BuildArgs(const ScenePasses& passes, float timeSec) {
+CompositeArgs BuildArgs(const ScenePasses& passes, int sceneId, float timeSec) {
   const SceneState& st = GetSceneState();
 
   CompositeArgs args;
@@ -1301,6 +1533,10 @@ CompositeArgs BuildArgs(const ScenePasses& passes, float timeSec) {
   args.earth = static_cast<cudaTextureObject_t>(st.earthTex.load(std::memory_order_relaxed));
   args.timeSec = timeSec;
   args.hasGlobe = passes.globe ? 1 : 0;
+  args.sceneId = sceneId;
+  // Storm particles composite additively (their WebGL counterpart is additive
+  // Points); everything else carries the opaque dart glyphs.
+  args.additiveSplats = passes.storm ? 1 : 0;
 
   // Only the weather scene reads the density volume. Loading the pointer under
   // the pass flag (rather than loading it always and gating the use) means a
@@ -1371,13 +1607,13 @@ cudaError_t LaunchRasterFrame(uint8_t* frame, int w, int h, size_t pitch,
   // the splat passes and the composite. Re-reading the registry between the two
   // would let a scene switch land in the middle of a frame and produce a hybrid
   // - storm particles composited over a globe, or worse.
-  const ScenePasses passes =
-      PassesForScene(GetSceneState().scene.load(std::memory_order_relaxed));
+  const int sceneId = GetSceneState().scene.load(std::memory_order_relaxed);
+  const ScenePasses passes = PassesForScene(sceneId);
 
   CUDA_CHECK(EnsureRasterScratch(w, h));
   CUDA_CHECK(RunSplatPasses(w, h, passes, input, stream));
 
-  const CompositeArgs args = BuildArgs(passes, timeSec);
+  const CompositeArgs args = BuildArgs(passes, sceneId, timeSec);
 
   const dim3 block(GS_TILE_X, GS_TILE_Y);
   const dim3 grid(gsDivUp(w, GS_TILE_X), gsDivUp(h, GS_TILE_Y));
@@ -1398,13 +1634,13 @@ cudaError_t LaunchRasterSurface(cudaSurfaceObject_t surf, int w, int h,
   // Same one-snapshot-per-frame rule for the scene, and it matters more here:
   // this runs on the native view's render thread while the main thread is the
   // one reconfiguring scenes underneath it.
-  const ScenePasses passes =
-      PassesForScene(GetSceneState().scene.load(std::memory_order_relaxed));
+  const int sceneId = GetSceneState().scene.load(std::memory_order_relaxed);
+  const ScenePasses passes = PassesForScene(sceneId);
 
   CUDA_CHECK(EnsureRasterScratch(w, h));
   CUDA_CHECK(RunSplatPasses(w, h, passes, input, stream));
 
-  const CompositeArgs args = BuildArgs(passes, timeSec);
+  const CompositeArgs args = BuildArgs(passes, sceneId, timeSec);
 
   const dim3 block(GS_TILE_X, GS_TILE_Y);
   const dim3 grid(gsDivUp(w, GS_TILE_X), gsDivUp(h, GS_TILE_Y));

@@ -109,13 +109,20 @@ export interface PresetDef {
   readonly swarmCount: number;
   readonly weatherGrid: number; // equirect field HEIGHT; width is 2x this
   readonly stormCount: number;
+  /**
+   * Default storm point-size multiplier for this preset. Fewer particles get
+   * larger points so the scene stays full; millions get a finer grain so the
+   * cloud reads as density. The live size slider adjusts from this baseline
+   * and re-baselines whenever the preset changes.
+   */
+  readonly stormPointScale: number;
 }
 
 export const PRESETS = Object.freeze({
-  ultra:  Object.freeze({ label: 'Ultra',  swarmCount: 2_000_000, weatherGrid: 2048, stormCount: 4_000_000 }),
-  high:   Object.freeze({ label: 'High',   swarmCount:   500_000, weatherGrid: 1024, stormCount: 1_000_000 }),
-  medium: Object.freeze({ label: 'Medium', swarmCount:   100_000, weatherGrid:  512, stormCount:   250_000 }),
-  low:    Object.freeze({ label: 'Low',    swarmCount:    20_000, weatherGrid:  256, stormCount:    50_000 }),
+  ultra:  Object.freeze({ label: 'Ultra',  swarmCount: 2_000_000, weatherGrid: 2048, stormCount: 4_000_000, stormPointScale: 0.8 }),
+  high:   Object.freeze({ label: 'High',   swarmCount:   500_000, weatherGrid: 1024, stormCount: 1_000_000, stormPointScale: 1.0 }),
+  medium: Object.freeze({ label: 'Medium', swarmCount:   100_000, weatherGrid:  512, stormCount:   250_000, stormPointScale: 1.5 }),
+  low:    Object.freeze({ label: 'Low',    swarmCount:    20_000, weatherGrid:  256, stormCount:    50_000, stormPointScale: 2.0 }),
 } as const) satisfies Readonly<Record<string, PresetDef>>;
 export type PresetId = keyof typeof PRESETS;
 export const DEFAULT_PRESET: PresetId = 'ultra';

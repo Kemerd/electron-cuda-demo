@@ -34,6 +34,10 @@ export default function createScene(): Scene {
   let filled = 0;
 
   return {
+    // The drifting backdrop wash and the rolling frame-time chart both advance
+    // off timeSec, so this scene redraws something different every single tick.
+    selfAnimates: true,
+
     mount(ctx: SceneMountContext) {
       root = document.createElement('div');
       root.className = 'scene-root';

@@ -15,6 +15,15 @@
  *      screen spacing, re-decimated when the zoom changes. Barbs where spacing
  *      permits, arrows when dense. Rebuilt at ~2 Hz, NOT per frame.
  *
+ *      The layer shows the SYSTEM, not a carpet. Every rebuild first runs the
+ *      analyzer in wind-field.ts over the same decimated cells it is about to
+ *      draw: glyphs appear only above the ~40th percentile of the CURRENT
+ *      field's speed range, so calm regions stay completely blank; length and
+ *      brightness scale with speed; and glyphs stretch along coherent flow so a
+ *      jet or an outflow draws as one continuous band instead of a field of
+ *      unrelated ticks. The strongest cells are clustered and each cluster gets
+ *      ONE knots callout (knots-labels.ts), never one per glyph.
+ *
  *   3. 2.5D storm-cell extrusion -- a stack of concentric translucent shells
  *      from 1.005 R to 1.055 R sampling that same field, giving the cells
  *      visible vertical build. It lives in storm-cells.ts; see the header there
@@ -47,6 +56,10 @@ import { createEarth } from '../earth';
 import type { EarthApi } from '../earth';
 import { createStormCells, slicesForFieldHeight } from './storm-cells';
 import type { StormCellsApi } from './storm-cells';
+import { createWindAnalyzer } from './wind-field';
+import type { WindAnalyzerApi, WindGridSpec } from './wind-field';
+import { createKnotsLabels } from './knots-labels';
+import type { KnotsLabelsApi } from './knots-labels';
 
 /** Instance ceiling for the dart mesh. */
 const SWARM_CAPACITY = 2_000_000;
@@ -56,6 +69,10 @@ const RADAR_SHELL = GLOBE_RADIUS * 1.005;
 
 /** Wind-barb shell -- above the radar so barbs are never buried in a cell. */
 const BARB_SHELL = GLOBE_RADIUS * 1.012;
+
+/** Knots callouts float above the storm-cell stack so a tall cell cannot bury
+ *  the one label that names it. The stack tops out at 1.055 R. */
+const LABEL_SHELL = GLOBE_RADIUS * 1.068;
 
 /** Target on-screen spacing between wind glyphs, in CSS px. */
 const TARGET_SPACING_PX = 32;
@@ -67,9 +84,70 @@ const VECTOR_REBUILD_MS = 500;
  *  wide zoom-out asks for a very dense grid. */
 const MAX_VECTOR_SEGMENTS = 6000;
 
-/** Knots per field unit. The field carries u/v in -1..1; this is what turns
- *  that into the barb count aviation symbology expects. */
-const KNOTS_PER_UNIT = 90;
+/**
+ * Speed -> knots display mapping. CONTRACTS section 8 pins it: "field magnitude
+ * 1.0 = 150 kt (a renderer-side constant, commented where defined)".
+ *
+ * It is a DISPLAY mapping, not a physical one -- the field's u/v are normalized
+ * flow, and 150 kt is the number that makes the barb decomposition and the
+ * cluster callouts land in the range an EFB winds-aloft page actually shows.
+ * Everything that turns a field magnitude into knots (barb pennants, cluster
+ * labels, the analyzer's label values) goes through this one constant.
+ */
+const KNOTS_PER_UNIT = 150;
+
+/**
+ * Magnitude ceiling applied before the knots conversion.
+ *
+ * The field stores u and v as INDEPENDENTLY clamped -1..1 components, so the
+ * magnitude of a corner cell is sqrt(2) = 1.414, not 1.0 -- measured, not
+ * assumed: a probe of the live layer reported max = 1.4142135 exactly, which is
+ * the diagonal and nothing else. Feeding that straight through the mapping
+ * prints 212 kt for what the field means as "full scale", and since a broad
+ * fraction of a strong system sits on the rails, every callout on screen
+ * saturated at the same number and the labels stopped carrying information.
+ *
+ * The spec defines magnitude 1.0 as full scale, so full scale is where the
+ * display tops out. Clamping here rather than rescaling by 1/sqrt(2) is the
+ * right choice: dividing would misreport ordinary axis-aligned flow (a pure
+ * 1.0 easterly is full scale, and would print 106 kt) to accommodate a corner
+ * case that only exists because of how the components were stored.
+ */
+const KNOTS_MAG_CEILING = 1.0;
+
+/** Ceiling on simultaneous knots callouts. The analyzer clusters down to a
+ *  handful; this is the allocation bound for the label layer. */
+const MAX_KNOTS_LABELS = 8;
+
+/**
+ * How far the camera dot-product has to clear before a cell counts as visible.
+ * Shared by the glyph walk and the analyzer so both see exactly the same cells
+ * -- a percentile computed over a different set than the one being drawn would
+ * put the significance floor in the wrong place.
+ */
+const FACING_CUTOFF = GLOBE_RADIUS * 0.15;
+
+/**
+ * Emphasis envelope. A glyph at the significance floor draws at EMPHASIS_MIN of
+ * the grid step; the fastest cell in the field draws at EMPHASIS_MAX. Anchoring
+ * to the field's own maximum rather than an absolute speed is what keeps the
+ * contrast readable through a calm phase -- the strongest thing on screen is
+ * always the longest, brightest glyph, whatever the absolute wind is doing.
+ */
+const EMPHASIS_MIN = 0.42;
+const EMPHASIS_MAX = 1.35;
+
+/**
+ * Extra length a fully coherent cell earns, as a fraction of its emphasis
+ * length. This is the CONTRACTS clause "glyphs elongate along strong flow bands
+ * so a system reads as coherent movement": inside a jet, neighbouring glyphs
+ * all stretch along the same axis and visually chain into one stroke, while a
+ * cell with disagreeing neighbours stays short and reads as noise.
+ */
+const COHERENCE_STRETCH = 0.85;
+
+/** Shared empty placement list, so clearing the labels allocates nothing. */
+const EMPTY_LABELS: readonly never[] = Object.freeze([]);
 
 export default function createScene(): Scene {
   let root: HTMLElement | null = null;
@@ -111,6 +189,33 @@ export default function createScene(): Scene {
   /** Preallocated vertex/color storage; the rebuild refills, never reallocates. */
   let vectorPos: Float32Array | null = null;
   let vectorCol: Float32Array | null = null;
+
+  /**
+   * Field statistics behind the layer: the significance floor, the emphasis
+   * normalization and the label clusters. Built once at mount and reused, so
+   * the 2 Hz rebuild allocates nothing.
+   */
+  const wind: WindAnalyzerApi = createWindAnalyzer();
+
+  /** Sparse "45 kt" callouts at the clustered cores. */
+  let labels: KnotsLabelsApi | null = null;
+
+  /**
+   * Grid spec handed to the analyzer. Mutated in place every rebuild rather
+   * than rebuilt, for the same reason everything else here is: this runs twice
+   * a second forever and a fresh object each time is a pointless garbage source.
+   */
+  const gridSpec: {
+    rows: number; stepRad: number;
+    camX: number; camY: number; camZ: number;
+    facingCutoff: number; knotsPerUnit: number; knotsMagCeiling: number;
+  } = {
+    rows: 0, stepRad: 0,
+    camX: 0, camY: 0, camZ: 1,
+    facingCutoff: FACING_CUTOFF,
+    knotsPerUnit: KNOTS_PER_UNIT,
+    knotsMagCeiling: KNOTS_MAG_CEILING,
+  };
 
   /** performance.now() of the last vector rebuild. */
   let lastVectorBuildMs = 0;
@@ -293,6 +398,13 @@ export default function createScene(): Scene {
    *
    * Glyph choice follows the CONTRACTS spec: aviation barbs when the spacing
    * gives them room to be legible, clean arrows when the grid is dense.
+   *
+   * What the analyzer changes here: the walk is unchanged, but each cell now
+   * has to clear the field's own 40th-percentile speed before it draws anything
+   * at all, and the glyph it draws is sized and brightened by where it sits
+   * between that floor and the field maximum. Calm regions therefore emit
+   * nothing -- not a faint short glyph, NOTHING -- which is the difference
+   * between a picture of a weather system and a carpet of ticks.
    */
   function rebuildVectors(): void {
     const pos = vectorPos;
@@ -301,6 +413,7 @@ export default function createScene(): Scene {
     if (!pos || !col || !geo || !rig) return;
     if (!fieldData || fieldW <= 0) {
       geo.setDrawRange(0, 0);
+      if (labels) labels.setLabels(EMPTY_LABELS);
       return;
     }
 
@@ -322,6 +435,41 @@ export default function createScene(): Scene {
     // the spec says fall back to arrows.
     const spacingPx = pxPerRadian * (Math.PI / rows);
     const useBarbs = spacingPx >= 26;
+
+    // ---- statistics pass ------------------------------------------------
+    //
+    // Runs BEFORE any geometry is written, over exactly the cells the walk
+    // below will visit. That ordering is the whole design: percentiles are a
+    // property of the visible field, so they have to be known before the first
+    // glyph is placed, and they have to be measured on the same cell set or the
+    // floor lands in the wrong place.
+    const cam = rig.camera.position;
+    gridSpec.rows = rows;
+    gridSpec.stepRad = Math.PI / rows;
+    gridSpec.camX = cam.x;
+    gridSpec.camY = cam.y;
+    gridSpec.camZ = cam.z;
+
+    const stats = wind.analyze(gridSpec as WindGridSpec, sampleField);
+    // SCRATCH-PROBE
+    (window as unknown as { __windStats?: unknown }).__windStats = {
+      n: stats.sampleCount, floor: stats.floorSpeed, label: stats.labelSpeed,
+      max: stats.maxSpeed, kts: stats.labels.map((l) => l.knots), rows, useBarbs,
+    };
+
+    // Nothing measurable in view: clear both layers rather than drawing a
+    // stale picture over a field that has gone quiet.
+    if (stats.sampleCount === 0 || !(stats.maxSpeed > 0)) {
+      geo.setDrawRange(0, 0);
+      if (labels) labels.setLabels(EMPTY_LABELS);
+      return;
+    }
+
+    if (labels) labels.setLabels(stats.labels);
+
+    // Normalization span for emphasis: floor -> 0, field maximum -> 1.
+    const floor = stats.floorSpeed;
+    const span = Math.max(1e-4, stats.maxSpeed - floor);
 
     let seg = 0; // segments written so far
 
@@ -363,15 +511,23 @@ export default function createScene(): Scene {
 
         // Back-face cull against the camera: half the glyphs are on the far
         // side of the globe and drawing them wastes the segment budget on
-        // things hidden behind the sphere.
-        const cam = rig.camera.position;
-        if (px * cam.x + py * cam.y + pz * cam.z < GLOBE_RADIUS * 0.15) continue;
+        // things hidden behind the sphere. Same test the analyzer ran.
+        if (px * cam.x + py * cam.y + pz * cam.z < FACING_CUTOFF) continue;
 
         sampleField(lat, lon, sample);
         const u = sample[0] ?? 0;
         const v = sample[1] ?? 0;
         const speed = Math.hypot(u, v);
-        if (speed < 0.02) continue; // calm: no glyph at all
+
+        // THE significance floor. Everything below the field's own ~40th
+        // percentile draws nothing at all -- calm air is blank, and blank is
+        // what makes the remaining glyphs read as a system.
+        if (speed < floor) continue;
+
+        // Where this cell sits in the significant range, 0 at the floor and 1
+        // at the fastest thing on screen. Drives length AND brightness, which
+        // is the spec's "emphasis scales with speed".
+        const emphasis = Math.min(1, (speed - floor) / span);
 
         // east = normalize(cross(+Y, radial)); north = cross(radial, east).
         let ex = pz;
@@ -394,19 +550,40 @@ export default function createScene(): Scene {
         const by0 = py * BARB_SHELL;
         const bz0 = pz * BARB_SHELL;
 
+        // How well this cell's neighbours agree with its own direction. High
+        // inside a jet band or a well-formed outflow, low in churn.
+        const coherence = wind.coherenceAt(lat, lon, u, v);
+
+        // Glyph length: the emphasis envelope, stretched further where the flow
+        // is coherent. Adjacent glyphs in a band therefore nearly touch and the
+        // eye joins them into one stroke; isolated strong cells stay discrete.
+        const baseLen = stepRad * (EMPHASIS_MIN + emphasis * (EMPHASIS_MAX - EMPHASIS_MIN));
+        const glyphLen = baseLen * (1 + coherence * emphasis * COHERENCE_STRETCH);
+
         // Speed -> color. Same progression as the radar ramp's cool end so the
-        // two layers read as one instrument.
+        // two layers read as one instrument. The bands are cut on the
+        // NORMALIZED emphasis, not the raw speed: an absolute ladder paints the
+        // whole layer one flat color whenever the field is uniformly fast or
+        // uniformly slow, which is exactly when the structure matters most.
         let r = 0.55, g = 0.85, b = 1.0;
-        if (speed > 0.75) { r = 1.0; g = 0.45; b = 0.35; }
-        else if (speed > 0.5) { r = 1.0; g = 0.78; b = 0.35; }
-        else if (speed > 0.28) { r = 0.75; g = 0.95; b = 0.6; }
+        if (emphasis > 0.80) { r = 1.0; g = 0.45; b = 0.35; }
+        else if (emphasis > 0.55) { r = 1.0; g = 0.78; b = 0.35; }
+        else if (emphasis > 0.28) { r = 0.75; g = 0.95; b = 0.6; }
+
+        // Brightness is the other half of "emphasis scales with speed". A cell
+        // just over the floor sits at ~55% intensity so it is legible but
+        // clearly secondary; the cores burn at full. Vertex colors on an
+        // additive-free LineBasicMaterial mean this is a straight multiply, no
+        // extra state and no second draw call.
+        const bright = 0.55 + emphasis * 0.45;
+        r *= bright; g *= bright; b *= bright;
 
         if (useBarbs) {
-          if (!drawBarb(push, bx0, by0, bz0, dx, dy, dz, px, py, pz, speed, stepRad, r, g, b)) {
+          if (!drawBarb(push, bx0, by0, bz0, dx, dy, dz, px, py, pz, speed, glyphLen, baseLen, r, g, b)) {
             break outer;
           }
         } else {
-          if (!drawArrow(push, bx0, by0, bz0, dx, dy, dz, px, py, pz, speed, stepRad, r, g, b)) {
+          if (!drawArrow(push, bx0, by0, bz0, dx, dy, dz, px, py, pz, glyphLen, r, g, b)) {
             break outer;
           }
         }
@@ -432,17 +609,24 @@ export default function createScene(): Scene {
    * The barbs are drawn on ONE side of the shaft, angled back, exactly as the
    * symbology specifies -- a barb drawn perpendicular or on alternating sides
    * is a different (wrong) symbol.
+   *
+   * @param shaftLen shaft length in world units, already carrying the emphasis
+   *                 and flow-coherence stretch from the caller. The barb COUNT
+   *                 still comes from the raw speed -- that is the symbol's
+   *                 meaning and it must not move with a visual emphasis term.
+   * @param baseLen  the same length WITHOUT the coherence stretch, used to size
+   *                 the feathers (see below).
    */
   function drawBarb(
     push: PushFn,
     ox: number, oy: number, oz: number,
     dx: number, dy: number, dz: number,
     nx: number, ny: number, nz: number,
-    speed: number, stepRad: number,
+    speed: number, shaftLen: number, baseLen: number,
     r: number, g: number, b: number,
   ): boolean {
-    // Shaft length scales with the grid step so barbs never overlap neighbours.
-    const L = stepRad * 0.75;
+    const L = Math.max(1e-4, shaftLen * 0.75);
+    const stepBarbLen = Math.max(1e-4, baseLen * 0.75);
 
     // Shaft runs from the station INTO the wind (the barbs sit at the tail).
     const tx = ox + dx * L;
@@ -456,8 +640,11 @@ export default function createScene(): Scene {
     const sz = nx * dy - ny * dx;
 
     // Decompose the speed into pennants / full / half barbs, rounding to the
-    // nearest 5 kt as real plotted barbs do.
-    let knots = Math.round((speed * KNOTS_PER_UNIT) / 5) * 5;
+    // nearest 5 kt as real plotted barbs do. Through the same magnitude ceiling
+    // the labels use, so a barb and the callout naming its system agree -- a
+    // three-pennant barb under a "150 kt" label is coherent, a four-pennant one
+    // under it is a bug the reader would (correctly) trust over the label.
+    let knots = Math.round((Math.min(KNOTS_MAG_CEILING, speed) * KNOTS_PER_UNIT) / 5) * 5;
     const pennants = Math.floor(knots / 50);
     knots -= pennants * 50;
     const fulls = Math.floor(knots / 10);
@@ -465,8 +652,14 @@ export default function createScene(): Scene {
     const halves = knots >= 5 ? 1 : 0;
 
     // Barbs march back from the tail toward the station.
-    const barbLen = L * 0.42;
-    const spacing = L * 0.16;
+    //
+    // The feathers are sized off a length that EXCLUDES the coherence stretch,
+    // capped at a fraction of the shaft. Otherwise a long band glyph grows
+    // giant feathers and a 50 kt pennant inside a jet ends up bigger than a
+    // 90 kt one outside it -- the elongation is a flow cue, and letting it
+    // rescale the symbology would corrupt the reading it exists to support.
+    const barbLen = Math.min(L * 0.42, stepBarbLen * 0.5);
+    const spacing = Math.min(L * 0.16, stepBarbLen * 0.2);
     let along = 0;
 
     /** Place one barb element at the current offset from the tail. */
@@ -515,16 +708,21 @@ export default function createScene(): Scene {
    * Dense fallback: a clean arrow. Length carries speed, which barbs cannot do
    * at small sizes -- so the two glyphs encode the same information in the way
    * each does best.
+   *
+   * @param shaftLen full glyph length, emphasis and coherence stretch included.
+   *                 Unlike the barb, the arrow has no symbology to protect: its
+   *                 whole vocabulary IS length, so it uses the stretched value
+   *                 directly and bands draw as visibly longer strokes.
    */
   function drawArrow(
     push: PushFn,
     ox: number, oy: number, oz: number,
     dx: number, dy: number, dz: number,
     nx: number, ny: number, nz: number,
-    speed: number, stepRad: number,
+    shaftLen: number,
     r: number, g: number, b: number,
   ): boolean {
-    const L = stepRad * (0.35 + Math.min(1, speed) * 0.5);
+    const L = Math.max(1e-4, shaftLen);
 
     const tx = ox + dx * L;
     const ty = oy + dy * L;
@@ -554,6 +752,12 @@ export default function createScene(): Scene {
   }
 
   return {
+    // The radar picture keeps moving without any new field arriving: the wind
+    // layer re-decimates on its own VECTOR_REBUILD_MS cadence and the storm-cell
+    // shell stack rides the same clock. Every tick shows something new, so every
+    // tick counts toward the effective-FPS headline.
+    selfAnimates: true,
+
     mount(ctx: SceneMountContext) {
       root = document.createElement('div');
       root.className = 'scene-root';
@@ -597,6 +801,12 @@ export default function createScene(): Scene {
       cells = createStormCells({ field: null, intensity: 0.9 });
       scene.add(cells.object);
 
+      // Knots callouts last of the field layers: they are the only text on the
+      // display and nothing may draw over them. The atlas is rasterized here,
+      // once -- see knots-labels.ts for why the vocabulary is pre-baked.
+      labels = createKnotsLabels({ capacity: MAX_KNOTS_LABELS, radius: LABEL_SHELL });
+      scene.add(labels.object);
+
       swarm = createDartSwarm({ capacity: SWARM_CAPACITY, color: 0xa8e8ff });
       scene.add(swarm.object);
 
@@ -617,6 +827,9 @@ export default function createScene(): Scene {
       // texture on dispose, so the texture is unreferenced by the time it is
       // released below.
       if (cells) cells.dispose();
+      // The label layer owns its atlas texture, so it must release it before
+      // the generic scene traversal below only gets as far as geometry+material.
+      if (labels) labels.dispose();
       if (fieldTexture) fieldTexture.dispose();
 
       if (scene) {
@@ -652,6 +865,7 @@ export default function createScene(): Scene {
       radarMesh = null;
       radarMaterial = null;
       cells = null;
+      labels = null;
       uHasField = null;
       fieldTexture = null;
       fieldData = null;

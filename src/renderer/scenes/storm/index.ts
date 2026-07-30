@@ -319,6 +319,11 @@ export default function createScene(): Scene {
   }
 
   return {
+    // uTime is written and consumed by the point shader every frame, and the
+    // shockwave rings expand on their own age -- the picture changes with no new
+    // particle batch and no camera input, so every tick is a fresh frame.
+    selfAnimates: true,
+
     mount(ctx: SceneMountContext) {
       root = document.createElement('div');
       root.className = 'scene-root';

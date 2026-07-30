@@ -233,6 +233,13 @@ export default function createScene(): Scene {
   }
 
   return {
+    // NO selfAnimates flag here, and that is the interesting case rather than an
+    // oversight. The earth is lit by a fixed sun and does not spin; the rally
+    // rings only pulse while a target is alive. With the camera still and the
+    // sim stalled this scene redraws a byte-identical picture, so its ticks must
+    // NOT count toward the effective-FPS headline -- that is precisely the
+    // "reads 240 while the scene steps at 18" defect CONTRACTS section 8 names.
+
     mount(ctx: SceneMountContext) {
       root = document.createElement('div');
       root.className = 'scene-root';

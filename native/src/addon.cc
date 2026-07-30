@@ -277,6 +277,16 @@ void ParseInputState(const Napi::Object& obj, InputUniforms* out) {
     }
   }
 
+  /* --- appearance ------------------------------------------------------ */
+  // Optional extra property on the input object (see InputUniforms::pointScale).
+  // The renderer premultiplies the storm size slider with its pixel ratio; a
+  // missing or out-of-range value falls back to 1 so an older renderer build
+  // keeps rendering at the default size instead of at zero.
+  {
+    const double ps = GetNumberOr(obj, "pointScale", 1.0);
+    out->pointScale = (ps > 0.05 && ps < 64.0) ? static_cast<float>(ps) : 1.0f;
+  }
+
   /* --- clock ---------------------------------------------------------- */
   out->timeSec = static_cast<float>(GetNumberOr(obj, "timeSec", 0.0));
 }
