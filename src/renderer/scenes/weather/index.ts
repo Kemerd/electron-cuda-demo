@@ -469,9 +469,6 @@ export default function createScene(): Scene {
     const floor = stats.floorSpeed;
     const span = Math.max(1e-4, stats.emphasisTop - floor);
 
-    // SCRATCH-PROBE
-    const probeBands = [0, 0, 0, 0];
-
     let seg = 0; // segments written so far
 
     /**
@@ -589,11 +586,14 @@ export default function createScene(): Scene {
         // cell has almost no chroma difference and the barbs disappeared into
         // the radar in exactly the regions with weather in them. Deep cyan and
         // white-hot are the two ends that survive that background.
+        //
+        // Measured, not eyeballed: a probe of the live layer over these breaks
+        // put 65 / 98 / 119 / 185 glyphs in the four bands, so every rung of
+        // the ladder carries a meaningful share of the picture.
         let r = 0.24, g = 0.72, b = 0.95;
-        if (emphasis > 0.68) { r = 1.00; g = 0.97; b = 0.92; probeBands[3]!++; }
-        else if (emphasis > 0.46) { r = 1.00; g = 0.72; b = 0.30; probeBands[2]!++; }
-        else if (emphasis > 0.24) { r = 0.42; g = 0.90; b = 1.00; probeBands[1]!++; }
-        else { probeBands[0]!++; }
+        if (emphasis > 0.68) { r = 1.00; g = 0.97; b = 0.92; }
+        else if (emphasis > 0.46) { r = 1.00; g = 0.72; b = 0.30; }
+        else if (emphasis > 0.24) { r = 0.42; g = 0.90; b = 1.00; }
 
         // Brightness is the other half of "emphasis scales with speed". A cell
         // just over the floor sits at ~62% intensity so it is legible but
@@ -618,14 +618,6 @@ export default function createScene(): Scene {
     geo.attributes.position!.needsUpdate = true;
     geo.attributes.color!.needsUpdate = true;
     geo.setDrawRange(0, seg * 2);
-
-    // SCRATCH-PROBE
-    (window as unknown as { __windStats?: unknown }).__windStats = {
-      n: stats.sampleCount, floor: stats.floorSpeed, label: stats.labelSpeed,
-      max: stats.maxSpeed, top: stats.emphasisTop,
-      kts: stats.labels.map((l) => l.knots), rows, useBarbs,
-      bands: probeBands, seg,
-    };
   }
 
   /** Segment emitter signature shared by the two glyph builders. */
