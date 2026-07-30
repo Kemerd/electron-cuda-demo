@@ -126,8 +126,27 @@ const poolSizes: Record<PayloadKind, number> = {
 /** Diagnostics: how many times we had to allocate outside warmup. */
 let underflowAllocations = 0;
 
-/** Warmup grace -- the first few frames legitimately allocate the pool. */
+/**
+ * FRAME messages posted since the last handshake. Purely a diagnostics counter
+ * (the smoke gate reads it); it does NOT gate the warmup grace, because one
+ * request can produce two FRAMEs of different kinds and a shared counter would
+ * therefore declare one pool warm on the strength of another pool's traffic.
+ */
 let framesServed = 0;
+
+/**
+ * Per-kind warmup grace. A pool legitimately allocates its first POOL_DEPTH
+ * buffers; only allocations past that mean a posted buffer failed to come back,
+ * which is the bug worth logging. Counted per kind because the weather scene
+ * serves entities and field from the same request -- with one shared counter the
+ * field pool inherited the entity pool's warmup and reported a false underflow
+ * on its very first fill.
+ */
+const acquisitions: Record<PayloadKind, number> = {
+  [KIND.ENTITIES]: 0,
+  [KIND.FIELD]: 0,
+  [KIND.RGBA]: 0,
+};
 
 /** Message extraction that survives a thrown non-Error (a string, null, ...). */
 function errText(err: unknown): string {
@@ -168,15 +187,22 @@ function entityBytesFor(scene: SceneId, params: SceneParams | null | undefined):
 }
 
 /**
- * Weather field size. The grid constant is the equirect WIDTH; height is half
- * of it (W = 2*H per protocol.ts).
+ * Weather field size.
+ *
+ * `weatherGrid` is the equirect HEIGHT and the width is twice it (protocol.ts:
+ * "W = 2*H = weatherGrid*2", and the PresetDef field comment says the same).
+ * This read it the other way round and halved it, which produced a buffer FOUR
+ * times too small -- at the Low preset 256*128*4 = 131072 bytes against the
+ * 512*256*4 = 524288 the engine demands. getWeatherField() correctly refused
+ * every one of them ("Field buffer too small"), so the CUDA weather path could
+ * not deliver a single field frame.
  *
  * @param params sizing parameters for the active scene
  * @returns bytes
  */
 function fieldBytesFor(params: SceneParams | null | undefined): number {
-  const w = clampCount(params?.weatherGrid, PRESETS[DEFAULT_PRESET].weatherGrid);
-  const h = Math.max(1, Math.floor(w / 2));
+  const h = clampCount(params?.weatherGrid, PRESETS[DEFAULT_PRESET].weatherGrid);
+  const w = h * 2;
   return w * h * FIELD_CHANNELS;
 }
 
@@ -224,8 +250,10 @@ function applyPoolSize(kind: PayloadKind, bytes: number): void {
   if (dropped > 0) {
     console.log('[pump] pool %s resized to %d bytes (dropped %d stale)', kind, size, dropped);
   }
-  // Reset warmup so refilling the new pool does not spam underflow warnings.
-  framesServed = 0;
+  // Reset THIS pool's warmup so refilling it does not spam underflow warnings.
+  // Only this kind: a resize of the entity pool says nothing about whether the
+  // field pool is still warm.
+  acquisitions[kind] = 0;
 }
 
 /**
@@ -252,6 +280,8 @@ function acquire(kind: PayloadKind, bytes: number): ArrayBuffer | null {
     return null;
   }
 
+  acquisitions[kind]++;
+
   // Pull from the tail; the buffer we posted most recently is the most likely
   // to still be warm in cache.
   while (pool.length > 0) {
@@ -264,7 +294,7 @@ function acquire(kind: PayloadKind, bytes: number): ArrayBuffer | null {
   // Warmup allocations are expected (we fill POOL_DEPTH lazily). Past that, an
   // allocation means a post failed to re-pool its buffer -- worth seeing, since
   // the pool is self-sufficient and nothing external can starve it.
-  if (framesServed > POOL_DEPTH) {
+  if (acquisitions[kind] > POOL_DEPTH) {
     underflowAllocations++;
     console.warn(
       '[pump] pool underflow for %s (%d bytes) -- allocating; total underflows %d',
@@ -402,13 +432,19 @@ function handleRequest(req: Partial<ReqMsg> & { kind?: unknown }): void {
     return;
   }
 
-  // Weather scene with a non-CUDA raster wants the field grid, not agent records.
+  // Entity records always come first: they are what advances the sim, and the
+  // weather field is a READ of state that step() has just produced. Serving the
+  // field alone (which this used to do when wantField was set) meant the weather
+  // scene in a CUDA/three.js mode got a radar overlay draped on a swarm that
+  // never moved -- getWeatherField() does not step anything.
+  serveEntities(engine, frameId, scene, dtMs);
+
+  // Second payload, same frameId. protocol.ts is explicit that one request may
+  // produce several FRAMEs; the renderer routes them by `kind`, so ordering is
+  // the only coupling and it is satisfied by doing this after the step.
   if (req.wantField === true) {
     serveField(engine, frameId, scene);
-    return;
   }
-
-  serveEntities(engine, frameId, scene, dtMs);
 }
 
 /**
@@ -616,7 +652,10 @@ function establishPort(webContents: WebContents | null | undefined): void {
 
   // A reload resets the frame counters, so drop the pooled memory with them
   // rather than carrying buffers sized for whatever the last session was doing.
-  for (const kind of Object.values(KIND)) pools[kind].length = 0;
+  for (const kind of Object.values(KIND)) {
+    pools[kind].length = 0;
+    acquisitions[kind] = 0;
+  }
   framesServed = 0;
   underflowAllocations = 0;
 

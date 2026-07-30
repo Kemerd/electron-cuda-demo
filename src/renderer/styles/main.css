@@ -832,6 +832,24 @@ input[type='range']:active::-webkit-slider-thumb { transform: scale(1.06); }
   inset: 0;
 }
 
+/* ---------------------------------------------------------------------
+   CUDA blit surface (mode 5)
+
+   A dedicated WebGL canvas that presents framebuffers rasterized in CUDA.
+   It lives alongside the three.js scene rather than replacing it: mode
+   switches toggle visibility, so neither side pays a context teardown and
+   rebuild every time the matrix changes. It sits one layer above the scene
+   canvas and below the overlay chrome (.overlay-layer is z-index 10).
+   ------------------------------------------------------------------- */
+
+.cuda-blit-canvas {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  /* The blit is the whole picture -- nothing underneath should show through. */
+  background: #05060a;
+}
+
 .scene-caption {
   position: absolute;
   left: 20px;

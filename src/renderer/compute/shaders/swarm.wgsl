@@ -382,8 +382,8 @@ fn seed(@builtin(global_invocation_id) gid : vec3<u32>) {
 
   // Tangential start, so no agent begins by punching through the shell and
   // having the spring slam it back on frame one.
-  let ref  = select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), abs(dir.y) < 0.9);
-  let tanA = safeNormalize(cross(dir, ref));
+  let refAxis = select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), abs(dir.y) < 0.9);
+  let tanA = safeNormalize(cross(dir, refAxis));
   let tanB = cross(dir, tanA);
   let ang  = randRange(i, 0x3333u, 0.0, TAU);
   let velDir = tanA * cos(ang) + tanB * sin(ang);
@@ -796,8 +796,8 @@ fn force(@builtin(global_invocation_id) gid : vec3<u32>) {
     } else {
       // Dead stop: kick it along a deterministic tangent so it rejoins the flow
       // instead of sitting there as a permanently frozen dot.
-      let ref = select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), abs(radial.y) < 0.9);
-      vel = safeNormalize(cross(radial, ref)) * minS;
+      let refAxis = select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), abs(radial.y) < 0.9);
+      vel = safeNormalize(cross(radial, refAxis)) * minS;
     }
   }
 

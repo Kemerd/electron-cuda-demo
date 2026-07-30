@@ -267,6 +267,16 @@ export class WebGpuDataSource implements DataSource {
   /** Most recent GPU-measured sim time, carried into the next frame's report. */
   private lastGpuSimMs = 0;
 
+  /**
+   * Interval between issuing mapAsync and its callback running, in ms.
+   *
+   * Kept separate from copyMs deliberately: it cannot settle before the caller
+   * yields to the event loop, so it measures host scheduling as much as GPU
+   * completion. Surfaced through getMapLatencyMs() for the overlay, never
+   * folded into the transport number the benchmark compares against CUDA.
+   */
+  private lastMapLatencyMs = 0;
+
   private entityCb: ((f: EntityFrame) => void) | null = null;
   private fieldCb: ((f: FieldFrame) => void) | null = null;
 
@@ -558,10 +568,14 @@ export class WebGpuDataSource implements DataSource {
     });
 
     const cellBytes = GRID_CELLS * 4;
+    // COPY_SRC on the two grid arrays so the self-test can read them back and
+    // check the counting sort arithmetically (see debugGridBuffers). The flag
+    // costs nothing on the frame path -- it only widens what the buffer is
+    // allowed to be used for, not how it is allocated.
     const cellCount = device.createBuffer({
       label: 'swarm-cell-count',
       size: cellBytes,
-      usage: GPUBufferUsage.STORAGE,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
     });
     // Over-allocated: the scan parks its per-block sums immediately after the
     // real cells (see swarm.wgsl scanBlocks), so nothing has to be a separate
@@ -569,7 +583,7 @@ export class WebGpuDataSource implements DataSource {
     const cellStart = device.createBuffer({
       label: 'swarm-cell-start',
       size: cellBytes + SCAN_BLOCK_SUMS * 4,
-      usage: GPUBufferUsage.STORAGE,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
     });
     const cellCursor = device.createBuffer({
       label: 'swarm-cell-cursor',
@@ -1573,6 +1587,22 @@ export class WebGpuDataSource implements DataSource {
    * it: the mapped range is invalidated by unmap(), and a consumer holding a
    * view past that point would read detached memory. The copy is the honest
    * readback cost this path exists to measure, so it is timed and reported.
+   *
+   * WHAT copyMs MEANS, AND WHAT IT DELIBERATELY EXCLUDES. An earlier version of
+   * this function folded the mapAsync latency into copyMs on the reasoning that
+   * the fence wait is part of the readback cost. Measurement showed that is not
+   * what the number actually captures: mapAsync's promise cannot settle until
+   * the caller yields to the event loop, so the interval from mapAsync() to its
+   * callback includes however long the CALLER spent before returning. Driving
+   * the sim in a tight loop with a 12 ms pause per iteration produced a
+   * "copyMs" of 762 on a transfer that genuinely costs single-digit
+   * milliseconds -- it was reporting the harness's own pacing as GPU time.
+   *
+   * copyMs is therefore the memcpy out of the mapped range, which is the part
+   * that is unambiguously this path's cost and is directly comparable to the
+   * CUDA pump's copy number. The queue-to-callback latency is reported
+   * separately as mapLatencyMs, which is real and worth seeing but is a
+   * scheduling property of the host, not a transfer cost.
    */
   private mapAndEmitEntities(slot: StagingSlot, count: number, stride: number, submitMs: number): void {
     const mapStart = performance.now();
@@ -1602,14 +1632,13 @@ export class WebGpuDataSource implements DataSource {
         if (!records || !this.entityCb || this.disposed) return;
 
         const copyMs = performance.now() - copyStart;
-        // mapAsync latency is a real part of this path's cost -- it is the
-        // fence wait for the GPU to finish and the copy to land -- so it is
-        // folded into copyMs rather than quietly dropped.
-        const fenceMs = copyStart - mapStart;
+        // Recorded for the overlay, NOT added to copyMs -- see the note above on
+        // why this interval is a host-scheduling number rather than a GPU one.
+        this.lastMapLatencyMs = copyStart - mapStart;
 
         const timings: FrameTimings = {
           simMs: this.lastGpuSimMs > 0 ? this.lastGpuSimMs : submitMs,
-          copyMs: fenceMs + copyMs,
+          copyMs,
         };
 
         const frame: DeviceResidentEntityFrame = {
@@ -1678,13 +1707,13 @@ export class WebGpuDataSource implements DataSource {
         if (!data || !this.fieldCb || this.disposed) return;
 
         const copyMs = performance.now() - copyStart;
-        const fenceMs = copyStart - mapStart;
+        this.lastMapLatencyMs = copyStart - mapStart;
 
         const frame: DeviceResidentFieldFrame = {
           data,
           w,
           h,
-          timings: { simMs: this.lastGpuSimMs > 0 ? this.lastGpuSimMs : submitMs, copyMs: fenceMs + copyMs },
+          timings: { simMs: this.lastGpuSimMs > 0 ? this.lastGpuSimMs : submitMs, copyMs },
           deviceResident: false,
         };
         this.fieldCb(frame);
@@ -1893,6 +1922,37 @@ export class WebGpuDataSource implements DataSource {
     this.layouts.clear();
     this.configuredScene = null;
     this.configuredParams = {};
+  }
+
+  /**
+   * Expose the spatial-grid buffers for verification.
+   *
+   * The counting sort is the one part of this backend whose failure mode is
+   * silent: a wrong prefix sum still produces plausible-looking flocking,
+   * because agents simply gather against the wrong neighbours. Reading the
+   * arrays back and checking the arithmetic is the only way to catch it, so the
+   * handles are exposed rather than kept private. Nothing on the frame path
+   * calls this -- it is for webgpu-selftest.ts.
+   *
+   * @returns the buffers plus the sizes needed to interpret them, or null when
+   *          the swarm sim is not currently allocated
+   */
+  debugGridBuffers(): { cellCount: GPUBuffer; cellStart: GPUBuffer; cells: number; count: number } | null {
+    const s = this.swarm;
+    if (!s) return null;
+    return { cellCount: s.cellCount, cellStart: s.cellStart, cells: GRID_CELLS, count: s.count };
+  }
+
+  /**
+   * Most recent mapAsync-to-callback latency, in ms.
+   *
+   * Read by the overlay to show the readback path's end-to-end delay alongside
+   * the pure transfer cost. A caller driving frames back to back sees single
+   * digits here; a caller that sleeps between frames sees its own sleep, which
+   * is exactly why this is not part of copyMs.
+   */
+  getMapLatencyMs(): number {
+    return this.lastMapLatencyMs;
   }
 
   /** The scene the source is currently allocated for, or null. */

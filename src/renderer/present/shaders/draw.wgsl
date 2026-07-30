@@ -324,8 +324,8 @@ fn dartVs(@builtin(vertex_index) vi : u32,
   var forward = vel - normal * dot(vel, normal);
   let fLen2 = dot(forward, forward);
   if (fLen2 < 1e-12) {
-    let ref = select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), abs(normal.y) < 0.9);
-    forward = normalize(cross(normal, ref));
+    let refAxis = select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), abs(normal.y) < 0.9);
+    forward = normalize(cross(normal, refAxis));
   } else {
     forward = forward * inverseSqrt(fLen2);
   }

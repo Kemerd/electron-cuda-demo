@@ -14,12 +14,19 @@
  * not the engine's self-reported kernel time. Engine timings are shown
  * alongside, clearly separated.
  *
- * CUDA link proof (phase 1): when CUDA is live we run a REQ/FRAME cycle against
- * the frame pump every tick and hand the resulting swarm records to the globe
- * scene, which plots them. One request in flight at a time -- the pump is
- * synchronous per request, and queueing more would just build latency. Frame
- * buffers are read and then dropped for GC; nothing goes back across the port
- * (CONTRACTS section 7).
+ * Every compute backend -- CPU, WebGPU and CUDA alike -- reaches the scenes
+ * through the DataSource seam (CONTRACTS section 8). This file used to carry a
+ * second, parallel path: an inline REQ/FRAME client for the pump, left over from
+ * the phase-1 link proof, which meant the CUDA backend had its own request
+ * bookkeeping, its own buffer views and its own error handling that no other
+ * backend shared. That is gone. The transport details now live in
+ * cuda-source.ts and this file only knows "kick the active source, receive
+ * callbacks" -- which is what makes mode switching a registry lookup.
+ *
+ * The CUDA LINK VERDICT still lives here, because it is a UI question rather
+ * than a transport one: the chip, its deadline, its non-latching behavior and
+ * its reason tooltips are all about what the user is told, and a data source
+ * that paints chips is a data source you cannot reuse.
  *
  * Two things in here are not obvious and are worth reading before changing:
  *
@@ -41,13 +48,10 @@ import {
   COMPUTE,
   RASTER,
   PRESENT,
-  MSG,
-  KIND,
   PRESETS,
   DEFAULT_PRESET,
-  SWARM_FLOATS,
-  STORM_FLOATS,
   MAX_TARGETS,
+  MAX_SHOCKWAVES,
   isLegalMode,
 } from '../shared/protocol';
 import type {
@@ -55,8 +59,6 @@ import type {
   ComputeBackend,
   InputState,
   ModeState,
-  PumpToRendererMsg,
-  ReqMsg,
   SceneId,
 } from '../shared/protocol';
 
@@ -66,15 +68,17 @@ import type {
   EntityFrame,
   FieldFrame,
   FrameState,
-  GeoswarmBridge,
   MergedCaps,
   Scene,
   SceneModule,
   WebGpuCaps,
 } from './types';
 
-import { findSource } from './sources/registry';
+import { findSource, hasSource } from './sources/registry';
 import { ageInteractions } from './interaction';
+import { createCudaBlit } from './present/cuda-blit';
+import type { CudaBlitApi } from './present/cuda-blit';
+import type { CudaSourceApi, RgbaFrame } from './cuda-source';
 
 import { createSidebar } from './ui/sidebar';
 import { createMatrix } from './ui/matrix';
@@ -222,16 +226,6 @@ const ui: UiHandles = {
 const statusChips = new Map<string, HTMLElement>();
 
 /* ------------------------------------------------------------------ *
- *  Engine frame cycle state
- * ------------------------------------------------------------------ */
-
-/** True when a REQ has been sent and its FRAME has not come back yet. */
-let requestInFlight = false;
-
-/** Monotonic request id. */
-let nextFrameId = 1;
-
-/* ------------------------------------------------------------------ *
  *  CUDA link verdict
  *
  *  This used to be a plain error counter: twelve consecutive MSG.ERRORs and
@@ -304,6 +298,34 @@ let sourceToken = 0;
 
 /** True once the active source has been configured for the current scene. */
 let sourceConfigured = false;
+
+/**
+ * The active source narrowed to its CUDA surface, or null when the live backend
+ * is not CUDA.
+ *
+ * Mode 5 needs two things no other backend can offer -- requestRgba() and
+ * onRgba() -- so the router feature-tests for them once at swap time and caches
+ * the result rather than re-testing every frame. Widening DataSource with
+ * "render the whole frame for me" instead would force CPU and WebGPU to
+ * implement a method that is meaningless to a backend with no rasterizer.
+ */
+let cudaSource: CudaSourceApi | null = null;
+
+/* ------------------------------------------------------------------ *
+ *  CUDA blit presenter (mode 5)
+ *
+ *  Built lazily on the first entry into a CUDA-raster mode and then kept alive,
+ *  hidden, for the rest of the session. Tearing a WebGL context down and
+ *  rebuilding it on every mode toggle would make the switch cost tens of
+ *  milliseconds and burn through the per-process context budget; hiding a canvas
+ *  costs a style recalculation.
+ * ------------------------------------------------------------------ */
+
+/** The blit surface, once mode 5 has been entered at least once. */
+let blit: CudaBlitApi | null = null;
+
+/** Set when the blit surface could not be built -- reported once, not per frame. */
+let blitFailed = false;
 
 /* ------------------------------------------------------------------ *
  *  Capability probing
@@ -503,11 +525,19 @@ function clearLinkState(): void {
  * combination anyway.
  */
 function pickInitialMode(): ModeState {
-  const compute = caps.cuda && caps.cuda.ok
-    ? COMPUTE.CUDA
-    : caps.webgpu && caps.webgpu.ok
-      ? COMPUTE.WEBGPU
-      : COMPUTE.CPU;
+  // Preference order is CUDA > WebGPU > CPU, but a backend is only a candidate
+  // if it is BOTH supported by the hardware AND actually implemented. WebGPU
+  // reports ok on any machine with an adapter, so without the hasSource() check
+  // a boot on this hardware selects a backend that has no code behind it yet
+  // and the app starts up with no data source at all -- a blank globe, and
+  // nothing in the UI explaining why. Falling through to the CPU baseline is
+  // both correct and the honest default.
+  const compute =
+    caps.cuda && caps.cuda.ok
+      ? COMPUTE.CUDA
+      : caps.webgpu && caps.webgpu.ok && hasSource(COMPUTE.WEBGPU)
+        ? COMPUTE.WEBGPU
+        : COMPUTE.CPU;
 
   const candidate: ModeState = { compute, raster: RASTER.THREE, present: PRESENT.COMPOSITE };
 
@@ -535,6 +565,11 @@ function applyMode(next: Partial<ModeState> | null | undefined): void {
     return;
   }
 
+  // Captured before the reassignment below: swapping the compute backend is
+  // the only part of a mode change that costs anything, so a raster/present
+  // change must not tear a working source down and build it again.
+  const computeChanged = (next.compute ?? mode.compute) !== mode.compute;
+
   // isLegalMode only returns ok for a fully-populated mode, so the three reads
   // below are guaranteed present by the check above.
   mode = {
@@ -556,6 +591,408 @@ function applyMode(next: Partial<ModeState> | null | undefined): void {
   }
 
   console.log(`[app] mode -> ${mode.compute} / ${mode.raster} / ${mode.present}`);
+
+  // Swap the visible surface. Cheap (a visibility toggle plus, on the first
+  // entry into mode 5, one context creation) and independent of the source.
+  updatePresentation();
+
+  // A compute change swaps the backend under the scene. The scene itself is
+  // untouched -- it consumes callbacks and does not know or care which backend
+  // is feeding it, which is exactly what the DataSource seam buys.
+  if (computeChanged) {
+    void ensureSource(activeEngineScene());
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ *  Data source routing
+ * ------------------------------------------------------------------ */
+
+/**
+ * Deliver one entity batch to the active scene and update the overlay.
+ *
+ * Registered once per source, not per frame. The EntityFrame's `records` view
+ * is borrowed for the duration of this call -- the scene uploads it to the GPU
+ * synchronously and does not retain it, which is what lets the source recycle
+ * the underlying buffer immediately afterwards.
+ */
+function onSourceEntities(f: EntityFrame): void {
+  if (!f || !(f.records instanceof Float32Array)) return;
+
+  if (activeScene && typeof activeScene.setEntities === 'function') {
+    try {
+      activeScene.setEntities(f);
+    } catch (err) {
+      console.warn('[app] scene setEntities threw: %s', errText(err));
+    }
+  }
+
+  if (ui.overlay) {
+    ui.overlay.setCount(f.count);
+    if (f.timings) ui.overlay.setTimings(f.timings);
+  }
+
+  // The CUDA link verdict is driven by real records arriving on the CUDA path.
+  // Non-latching: this promotes the chip whether the last verdict was "nothing
+  // yet" or "failed".
+  if (
+    mode.compute === COMPUTE.CUDA &&
+    f.count > 0 &&
+    (!cudaLinkVerified || cudaLinkFailed)
+  ) {
+    markLinkVerified(f.count);
+  }
+}
+
+/** Deliver one weather field to the active scene. */
+function onSourceField(f: FieldFrame): void {
+  if (!f || !(f.data instanceof Uint8Array)) return;
+  if (!activeScene || typeof activeScene.setField !== 'function') return;
+
+  try {
+    activeScene.setField(f);
+  } catch (err) {
+    console.warn('[app] scene setField threw: %s', errText(err));
+  }
+}
+
+/**
+ * Deliver one CUDA-rastered frame to the blit surface.
+ *
+ * This is the mode-5 counterpart of onSourceEntities: the engine did the sim AND
+ * the rasterization, so there are no records to hand a scene -- the pixels are
+ * the output. The overlay still gets real numbers, and renderMs is the one that
+ * matters here (it is the ray-march, which is the thing being measured).
+ */
+function onSourceRgba(f: RgbaFrame): void {
+  if (!f || !(f.data instanceof Uint8Array)) return;
+  if (!blit || !blit.ok) return;
+
+  const uploadMs = blit.present(f.data, f.w, f.h);
+
+  if (ui.overlay) {
+    // simMs/copyMs come from the engine; the draw figure is renderMs (the CUDA
+    // ray-march) plus what the texture upload and blit cost on this side. Both
+    // halves are real per-frame costs of this mode, so reporting their sum is
+    // the honest "what did it take to put this on screen" number.
+    ui.overlay.setTimings({ simMs: f.simMs, copyMs: f.copyMs });
+    ui.overlay.setDrawMs(f.renderMs + uploadMs);
+  }
+
+  // A rastered frame is proof of a live link exactly as an entity batch is --
+  // the whole round trip completed. Non-latching, same as the entity path.
+  if (mode.compute === COMPUTE.CUDA && (!cudaLinkVerified || cudaLinkFailed)) {
+    markLinkVerified(f.w * f.h);
+  }
+}
+
+/**
+ * Surface an engine ERROR.
+ *
+ * Errors back the drive off (a hard-down engine should not be hammered at
+ * 60 Hz) but never stop it, and the most recent text is kept as the failure
+ * reason so an expired deadline can say what actually went wrong instead of
+ * "timed out".
+ */
+function onSourceError(reason: string): void {
+  engineErrorStreak++;
+
+  if (typeof reason === 'string' && reason.length > 0) {
+    linkFailureReason = `engine error: ${reason}`;
+  }
+
+  // Log the first few then go quiet -- a persistent failure at 60 Hz would
+  // otherwise flood the console and bury the first, most useful error.
+  //
+  // Template literal rather than a "%s" placeholder: main's console tap captures
+  // the raw format string, so a placeholder shows up verbatim in the captured
+  // output with the substitution dangling after it.
+  if (engineErrorStreak <= 3) {
+    console.warn(`[app] engine error: ${reason}`);
+  }
+
+  const backoff = Math.min(
+    RETRY_BACKOFF_MAX_MS,
+    RETRY_BACKOFF_MIN_MS * 2 ** Math.min(engineErrorStreak - 1, 8),
+  );
+  nextRequestAllowedMs = performance.now() + backoff;
+}
+
+/**
+ * Narrow a DataSource to the CUDA surface, or null when it is a different
+ * backend. A structural test rather than an id check: the id says which backend
+ * it claims to be, this says which methods actually exist to call.
+ */
+function asCudaSource(source: DataSource | null): CudaSourceApi | null {
+  if (!source || source.id !== COMPUTE.CUDA) return null;
+
+  const probe = source as Partial<CudaSourceApi>;
+  if (typeof probe.requestRgba !== 'function') return null;
+  if (typeof probe.onRgba !== 'function') return null;
+  if (typeof probe.onError !== 'function') return null;
+
+  // Every method the extended surface declares is present, which is exactly what
+  // the interface asserts -- the cast carries no claim the checks above did not.
+  return source as CudaSourceApi;
+}
+
+/** Tear down the live source. Safe when there is none. */
+function disposeActiveSource(): void {
+  if (!activeSource) return;
+  try {
+    activeSource.dispose();
+  } catch (err) {
+    console.warn('[app] source dispose threw: %s', errText(err));
+  }
+  activeSource = null;
+  activeSourceId = null;
+  cudaSource = null;
+  sourceConfigured = false;
+}
+
+/**
+ * Make `mode.compute` the live source, building it if necessary, and configure
+ * it for the current scene.
+ *
+ * Every reconfiguration path funnels through here -- mode change, scene change
+ * and preset change all just call it. That is deliberate: the three used to be
+ * three slightly different sequences, and the differences were where the bugs
+ * lived (a preset change that reconfigured the engine but not the scene, a
+ * scene change that left the old source running).
+ */
+async function ensureSource(engineScene: SceneId): Promise<void> {
+  const wanted = mode.compute;
+  const token = ++sourceToken;
+
+  const registration = findSource(wanted);
+  if (!registration) {
+    // A backend with no implementation yet is not an error -- it is a cell in
+    // the matrix the UI greys out. Say so once and run without a source.
+    disposeActiveSource();
+    setChip('source', `${wanted} backend not implemented yet`, 'warn');
+    return;
+  }
+
+  // Same backend already live: just reconfigure it for the new scene/preset.
+  if (activeSource && activeSourceId === wanted) {
+    await configureSource(activeSource, engineScene, token);
+    return;
+  }
+
+  disposeActiveSource();
+
+  let source: DataSource;
+  try {
+    source = await registration.create();
+  } catch (err) {
+    const why = errText(err);
+    console.warn('[app] could not create %s source: %s', wanted, why);
+    setChip('source', `${registration.label} unavailable`, 'warn', why);
+    return;
+  }
+
+  // The user changed mode/scene while the factory was resolving.
+  if (token !== sourceToken) {
+    try {
+      source.dispose();
+    } catch {
+      /* nothing to recover; the source never became active */
+    }
+    return;
+  }
+
+  source.onEntities(onSourceEntities);
+  source.onField(onSourceField);
+
+  activeSource = source;
+  activeSourceId = wanted;
+
+  // CUDA carries two extra sinks: rastered frames for the blit presenter, and
+  // engine errors for the link verdict. Both are no-ops on the other backends,
+  // which is why they are not part of DataSource.
+  cudaSource = asCudaSource(source);
+  if (cudaSource) {
+    cudaSource.onRgba(onSourceRgba);
+    cudaSource.onError(onSourceError);
+    if (!cudaSource.isLinked()) {
+      linkFailureReason = 'engine port not delivered -- REQs cannot be posted';
+    }
+  }
+
+  clearChip('source');
+  console.log(`[app] compute source -> ${registration.label}`);
+
+  await configureSource(source, engineScene, token);
+}
+
+/**
+ * Configure a source for a scene at the current preset, and surface the CPU
+ * cap if one was applied.
+ */
+async function configureSource(
+  source: DataSource,
+  engineScene: SceneId,
+  token: number,
+): Promise<void> {
+  sourceConfigured = false;
+
+  let result;
+  try {
+    result = await source.configure(engineScene, sceneParams);
+  } catch (err) {
+    console.warn('[app] source configure threw: %s', errText(err));
+    return;
+  }
+
+  // A newer configure superseded this one while it was in flight.
+  if (token !== sourceToken) return;
+
+  if (!result || result.ok !== true) {
+    const why = (result && result.reason) || 'unknown';
+    console.warn('[app] source configure failed: %s', why);
+    setChip('source', 'Compute source failed to configure', 'warn', why);
+
+    // A refused configure is one of the concrete link-failure causes, so record
+    // it: if the deadline later expires the chip tooltip says "configureScene
+    // refused: ..." rather than a generic timeout.
+    if (source.id === COMPUTE.CUDA) {
+      linkFailureReason = `configureScene refused: ${why}`;
+    }
+    return;
+  }
+
+  sourceConfigured = true;
+  clearChip('source');
+  updateCapChip(source);
+
+  // The engine reports how much device memory the new allocation took.
+  if (isFiniteNumber(result.vramUsedMB)) {
+    setChip('vram', `${Math.round(result.vramUsedMB)} MB VRAM`, 'cuda');
+  }
+
+  // A successful (re)configure is a fresh warmup: device memory may have just
+  // been freed and reallocated, and the next kernel launch pays for it. Restart
+  // the deadline so that cost is never counted as a link failure.
+  if (source.id === COMPUTE.CUDA && !cudaLinkVerified) {
+    resetLinkAttempt('waiting for the first frame after configureScene');
+  }
+}
+
+/**
+ * Show or clear the "CPU capped" chip.
+ *
+ * CONTRACTS is explicit that the CPU baseline auto-caps at the Low preset and
+ * SAYS SO. A frozen app is not a baseline; a silently capped one is a lie. The
+ * chip carries the real numbers in its tooltip so the measurement stays
+ * interpretable.
+ */
+function updateCapChip(source: DataSource): void {
+  // The cap reporting is CPU-specific, so feature-test rather than widening
+  // DataSource with three methods only one backend can answer.
+  const capped = source as Partial<{
+    wasCapped(): boolean;
+    activeCount(): number;
+    requestedCount(): number;
+  }>;
+
+  if (typeof capped.wasCapped !== 'function' || !capped.wasCapped()) {
+    clearChip('cpu-cap');
+    return;
+  }
+
+  const active = typeof capped.activeCount === 'function' ? capped.activeCount() : 0;
+  const asked = typeof capped.requestedCount === 'function' ? capped.requestedCount() : 0;
+
+  setChip(
+    'cpu-cap',
+    `CPU capped at ${fmtCount(active)}`,
+    'warn',
+    `The CPU baseline runs at the Low preset (${fmtCount(active)}) instead of the ` +
+      `requested ${fmtCount(asked)}. A single thread cannot step the higher presets ` +
+      `at an interactive rate, and a frozen app measures nothing -- switch to a GPU ` +
+      `backend for the full count.`,
+  );
+}
+
+/** Compact count formatting shared by the chip and the overlay. */
+function fmtCount(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return '0';
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
+  if (n >= 1000) return `${(n / 1000).toFixed(0)}k`;
+  return String(Math.round(n));
+}
+
+/* ------------------------------------------------------------------ *
+ *  Presentation routing (which surface the user is actually looking at)
+ * ------------------------------------------------------------------ */
+
+/**
+ * Build the blit surface if it does not exist yet.
+ *
+ * Lazy because most sessions never enter mode 5, and a WebGL context that is
+ * never drawn into is still a driver-side allocation. Once built it is kept for
+ * the rest of the session -- see the state block above for why.
+ *
+ * @returns true when a usable presenter is available
+ */
+function ensureBlit(): boolean {
+  if (blit && blit.ok) return true;
+  if (blitFailed) return false;
+
+  const host = document.getElementById('stage-surface');
+  if (!host) {
+    blitFailed = true;
+    console.warn('[app] #stage-surface missing; CUDA blit presenter unavailable');
+    return false;
+  }
+
+  blit = createCudaBlit(host);
+  if (!blit.ok) {
+    blitFailed = true;
+    setChip('blit', 'CUDA blit surface unavailable', 'warn', blit.reason);
+    return false;
+  }
+
+  // Size it from the stage immediately: the first RGBA REQ needs a target size,
+  // and a presenter sized 1x1 would ask the engine to ray-march one pixel.
+  const rect = host.getBoundingClientRect();
+  if (rect.width > 0 && rect.height > 0) blit.resize(rect.width, rect.height);
+
+  console.log('[app] CUDA blit presenter created');
+  return true;
+}
+
+/**
+ * Point the display at whichever surface the current mode produces.
+ *
+ * Mode 5 hides the three.js scene and shows the blit canvas; every other mode
+ * does the reverse. The scene is only HIDDEN, never unmounted -- it keeps its
+ * camera rig, and that rig is what feeds InputState.camera to the ray-marcher,
+ * so unmounting it would leave the CUDA view with no camera to follow
+ * (CONTRACTS section 8: the two paths must show the identical view).
+ */
+function updatePresentation(): void {
+  const host = document.getElementById('stage-surface');
+  const sceneRoot = host?.querySelector<HTMLElement>('.scene-root') ?? null;
+
+  if (isCudaRasterMode()) {
+    if (!ensureBlit()) {
+      // No presenter: fall back to showing the three.js scene rather than a
+      // blank stage, so the mode change degrades instead of blanking out.
+      if (sceneRoot) sceneRoot.style.display = '';
+      return;
+    }
+
+    if (blit) blit.setVisible(true);
+    // visibility rather than display:none -- the rig's pointer handlers stay
+    // live so orbit/pan/zoom keep driving the camera the ray-marcher reads,
+    // while the three.js pixels stop being composited.
+    if (sceneRoot) sceneRoot.style.visibility = 'hidden';
+    return;
+  }
+
+  if (blit) blit.setVisible(false);
+  if (sceneRoot) sceneRoot.style.visibility = '';
 }
 
 /* ------------------------------------------------------------------ *
@@ -581,6 +1018,18 @@ async function mountScene(id: string): Promise<void> {
     console.warn('[app] #stage-surface missing; cannot mount scene');
     return;
   }
+
+  // Stop the drive BEFORE activeSceneId moves.
+  //
+  // activeEngineScene() reads activeSceneId, so the moment that assignment
+  // happens the drive starts requesting the NEW scene from a backend that is
+  // still allocated for the old one. The source's own in-flight guard does not
+  // help: it only covers the window in which a configure() promise is pending,
+  // and configure is not called until the dynamic import has resolved -- tens of
+  // frames later. On the CUDA path that window produced one
+  // "Scene 'weather' is not configured" error per frame, complete with the
+  // error-streak backoff that came with it.
+  sourceConfigured = false;
 
   // Tear down the outgoing scene first.
   if (activeScene) {
@@ -625,11 +1074,21 @@ async function mountScene(id: string): Promise<void> {
   activeScene = instance;
   resizeActiveScene();
 
-  // Point the engine at whatever this scene needs. Failure is non-fatal: the
-  // scene still runs its own placeholder.
-  if (caps.cuda && caps.cuda.ok) {
-    void configureEngineScene(entry.engineScene);
-  }
+  // The new scene appended its own .scene-root, so re-apply the visibility rule
+  // for the active mode -- otherwise a scene mounted while mode 5 is live would
+  // paint over the blit canvas.
+  updatePresentation();
+
+  // Point the compute backend at whatever this scene needs. Non-fatal either
+  // way: a scene renders its own geometry regardless of whether any records
+  // ever arrive.
+  await ensureSource(entry.engineScene);
+}
+
+/** The engine scene id the active nav scene drives. */
+function activeEngineScene(): SceneId {
+  const entry = SCENE_REGISTRY[activeSceneId];
+  return entry?.engineScene ?? SCENES.SWARM;
 }
 
 /** Update the stage heading. */
@@ -640,14 +1099,30 @@ function setStageText(title: string, subtitle: string): void {
   if (s && s.textContent !== subtitle) s.textContent = subtitle;
 }
 
-/** Push the stage surface's CSS size into the active scene. */
+/**
+ * Push the stage surface's CSS size into every surface that draws into it.
+ *
+ * The blit presenter is resized alongside the scene rather than only when it is
+ * visible: its device dimensions are what the next RGBA REQ asks the engine to
+ * ray-march, so a stale size would have the engine render one frame at the old
+ * resolution after every window change.
+ */
 function resizeActiveScene(): void {
-  if (!activeScene || typeof activeScene.resize !== 'function') return;
   const host = document.getElementById('stage-surface');
   if (!host) return;
 
   const rect = host.getBoundingClientRect();
   if (rect.width <= 0 || rect.height <= 0) return;
+
+  if (blit && blit.ok) {
+    try {
+      blit.resize(rect.width, rect.height);
+    } catch (err) {
+      console.warn('[app] blit resize threw: %s', errText(err));
+    }
+  }
+
+  if (!activeScene || typeof activeScene.resize !== 'function') return;
 
   try {
     activeScene.resize(rect.width, rect.height);
@@ -656,198 +1131,108 @@ function resizeActiveScene(): void {
   }
 }
 
-/**
- * Ask main to (re)allocate device buffers for a scene at the current params.
- *
- * A rejection here is one of the three concrete link-failure causes, so it is
- * recorded as the failure reason rather than just logged -- if the deadline
- * later expires, the chip tooltip says "configureScene refused: ..." instead of
- * a generic timeout.
- */
-async function configureEngineScene(engineScene: SceneId): Promise<void> {
-  const bridge = window.geoswarm;
-  if (!bridge || typeof bridge.configureScene !== 'function') return;
-
-  try {
-    const res = await bridge.configureScene(engineScene, sceneParams);
-    if (!res || res.ok !== true) {
-      const why = (res && res.reason) || 'unknown';
-      console.warn('[app] configureScene failed: %s', why);
-      setChip('engine', `Engine: ${why}`, 'warn');
-      linkFailureReason = `configureScene refused: ${why}`;
-      return;
-    }
-    clearChip('engine');
-    if (isFiniteNumber(res.vramUsedMB)) {
-      setChip('vram', `${Math.round(res.vramUsedMB)} MB VRAM`, 'cuda');
-    }
-    // A reallocation changes the payload size, so any request still in flight
-    // is answering for the old geometry. Clear the guard and start fresh.
-    requestInFlight = false;
-
-    // A successful (re)configure is a fresh warmup: the engine may have just
-    // freed and reallocated device memory, and the next kernel launch pays for
-    // it. Restart the deadline so that cost is never counted as a failure.
-    if (!cudaLinkVerified) {
-      resetLinkAttempt('waiting for the first frame after configureScene');
-    }
-  } catch (err) {
-    const why = errText(err);
-    console.warn('[app] configureScene threw: %s', why);
-    linkFailureReason = `configureScene threw: ${why}`;
-  }
-}
-
 /* ------------------------------------------------------------------ *
  *  Engine frame cycle
  * ------------------------------------------------------------------ */
 
 /**
- * Floats per record for a given engine scene. Swarm and weather share the
- * 8-float agent record; storm uses the 4-float particle record.
- */
-function strideFor(engineScene: SceneId): number {
-  return engineScene === SCENES.STORM ? STORM_FLOATS : SWARM_FLOATS;
-}
-
-/**
- * Handle an inbound port message (FRAME or ERROR).
- */
-function onEngineMessage(msg: PumpToRendererMsg): void {
-  if (!msg || typeof msg !== 'object') return;
-
-  if (msg.t === MSG.ERROR) {
-    requestInFlight = false;
-    engineErrorStreak++;
-
-    // Keep the most recent engine text as the failure reason: if the deadline
-    // does expire, this is what the chip tooltip shows.
-    if (typeof msg.reason === 'string' && msg.reason.length > 0) {
-      linkFailureReason = `engine error: ${msg.reason}`;
-    }
-
-    // Log the first few then go quiet -- a persistent failure at 60 Hz would
-    // otherwise flood the console and make the real first error unfindable.
-    if (engineErrorStreak <= 3) {
-      console.warn('[app] engine error: %s', msg.reason);
-    }
-
-    // Exponential backoff, capped. Errors slow the drive down; they no longer
-    // stop it, so a late-arriving engine still gets picked up.
-    const backoff = Math.min(
-      RETRY_BACKOFF_MAX_MS,
-      RETRY_BACKOFF_MIN_MS * 2 ** Math.min(engineErrorStreak - 1, 8),
-    );
-    nextRequestAllowedMs = performance.now() + backoff;
-    return;
-  }
-
-  if (msg.t !== MSG.FRAME) return;
-
-  requestInFlight = false;
-  engineErrorStreak = 0;
-  nextRequestAllowedMs = 0;
-
-  if (msg.timings && ui.overlay) ui.overlay.setTimings(msg.timings);
-
-  // Entity payloads go straight to the globe scene's scatter proof.
-  if (msg.kind === KIND.ENTITIES && msg.buf instanceof ArrayBuffer) {
-    const stride = strideFor(msg.scene);
-    const count = isFiniteNumber(msg.count) ? msg.count : 0;
-
-    // A view over the received buffer -- no copy. The buffer is ours outright
-    // (it arrived as a structured clone and is never handed back), so the view
-    // stays valid for as long as anything holds a reference to it.
-    let view: Float32Array | null = null;
-    try {
-      view = new Float32Array(msg.buf);
-    } catch (err) {
-      console.warn('[app] could not view frame buffer: %s', errText(err));
-    }
-
-    if (view && activeScene && typeof activeScene.setEntities === 'function') {
-      activeScene.setEntities(view, count, stride);
-    }
-
-    if (ui.overlay) ui.overlay.setCount(count);
-
-    // Non-latching: this promotes the chip whether the last verdict was
-    // "nothing yet" or "failed".
-    if (count > 0 && (!cudaLinkVerified || cudaLinkFailed)) {
-      markLinkVerified(count);
-    }
-  }
-
-  // Nothing to return: the buffer is a fresh IPC-layer allocation, and shipping
-  // it back would cost a second full copy just to be discarded on arrival
-  // (CONTRACTS section 7). Dropping the reference here hands it to the GC.
-}
-
-/**
- * Issue one REQ if the engine path is active and nothing is in flight.
+ * Refresh the shared InputState from the pointer and the clock.
  *
- * Also owns the deadline check: it is evaluated here rather than on a timer so
- * the verdict is only ever produced while the drive is genuinely running.
+ * Called from tick() before either backend path runs, so both see the same
+ * input for the same frame. It deliberately does NOT touch `camera` or
+ * `pointerWorld`: the active scene owns those (it has the camera rig and the
+ * raycast) and writes them during frame(). Overwriting them here would fight
+ * the scene and leave the CUDA ray-marcher a frame behind the picture.
  */
-function pumpEngineFrame(dtMs: number): void {
-  if (mode.compute !== COMPUTE.CUDA) return;
-  if (!caps.cuda || caps.cuda.ok !== true) return;
-
-  const now = performance.now();
-
-  // Deadline check. Runs before the in-flight guard so a request that never
-  // gets answered still produces a verdict rather than hanging silently.
-  if (!cudaLinkVerified && linkAttemptStartMs > 0 && now - linkAttemptStartMs > LINK_DEADLINE_MS) {
-    const secs = Math.round(LINK_DEADLINE_MS / 1000);
-    markLinkFailed(linkFailureReason || `no frame received within ${secs} s`);
-  }
-
-  if (requestInFlight) return;
-  // Backoff window after an error -- not a stop, just a slower retry.
-  if (now < nextRequestAllowedMs) return;
-
-  const bridge = window.geoswarm;
-  if (!bridge || typeof bridge.sendReq !== 'function') return;
-
-  const entry = SCENE_REGISTRY[activeSceneId];
-  const engineScene: SceneId = entry?.engineScene ?? SCENES.SWARM;
-
-  // Refresh the input struct in place.
+function refreshInputState(dt: number): void {
   inputState.mouse.x = frameState.pointer.x;
   inputState.mouse.y = frameState.pointer.y;
   inputState.mouse.down = frameState.pointer.down;
   // MouseForceMode is 1|2|3; the pointer's 0 (button up) maps to attract, which
-  // is what the kernels treat as the neutral mode when down is false.
+  // is what the kernels treat as the neutral mode when down is false. The storm
+  // scene overrides this from its 1/2/3 keys during frame().
   inputState.mouse.mode =
     frameState.pointer.mode === 2 ? 2 : frameState.pointer.mode === 3 ? 3 : 1;
   inputState.timeSec = frameState.timeSec;
 
-  // Targets are capped by protocol; keep the array from ever exceeding it.
+  // Age targets and shockwaves, dropping the expired ones.
+  ageInteractions(inputState, dt);
+
+  // Both arrays are capped by protocol; keep them from ever exceeding it.
   if (inputState.targets.length > MAX_TARGETS) inputState.targets.length = MAX_TARGETS;
+  if (inputState.shockwaves.length > MAX_SHOCKWAVES) {
+    inputState.shockwaves.length = MAX_SHOCKWAVES;
+  }
+}
 
-  // Scalars plus the shared input struct, and nothing else. The REQ carries no
-  // buffers and rides as a structured clone -- see CONTRACTS section 7.
-  const req: ReqMsg = {
-    t: MSG.REQ,
-    frameId: nextFrameId++,
-    scene: engineScene,
-    compute: mode.compute,
-    raster: mode.raster,
-    dtMs,
-    wantField: false,
-    input: inputState,
-  };
+/**
+ * True when the current mode is the CUDA blit path: CUDA computes the sim AND
+ * rasterizes the whole frame, and this side does nothing but present it.
+ *
+ * isLegalMode already guarantees compute===CUDA whenever raster===CUDA, so the
+ * raster axis alone is the discriminant -- but both are checked because this
+ * function gates a code path that would post nonsense REQs if the invariant ever
+ * broke.
+ */
+function isCudaRasterMode(): boolean {
+  return mode.compute === COMPUTE.CUDA && mode.raster === RASTER.CUDA;
+}
 
-  requestInFlight = true;
-  const sent = bridge.sendReq(req);
+/**
+ * Drive one frame of whichever compute backend is active.
+ *
+ * Every backend goes through the same DataSource call; the only branch is which
+ * KIND of payload is being asked for, which is a property of the RASTER axis
+ * rather than the compute one. This function also owns the CUDA deadline check,
+ * evaluated here rather than on a timer so the verdict is only ever produced
+ * while the drive is genuinely running.
+ */
+function driveSource(dtMs: number): void {
+  if (!activeSource || !sourceConfigured) return;
 
-  if (!sent) {
-    // The port has not arrived yet (or the post failed). Clear the flag so the
-    // next tick retries instead of deadlocking on a request that never went out.
-    requestInFlight = false;
-    if (!linkFailureReason) {
-      linkFailureReason = 'engine port not delivered -- REQ could not be posted';
+  const engineScene = activeEngineScene();
+
+  // ---- CUDA link deadline -------------------------------------------
+  // Runs before any early return below so a drive that is being throttled by
+  // backoff still produces a verdict rather than hanging silently.
+  if (mode.compute === COMPUTE.CUDA) {
+    const now = performance.now();
+    if (
+      !cudaLinkVerified &&
+      linkAttemptStartMs > 0 &&
+      now - linkAttemptStartMs > LINK_DEADLINE_MS
+    ) {
+      const secs = Math.round(LINK_DEADLINE_MS / 1000);
+      markLinkFailed(linkFailureReason || `no frame received within ${secs} s`);
     }
+
+    // Backoff window after an engine error -- a slower retry, never a stop.
+    if (now < nextRequestAllowedMs) return;
+  }
+
+  // ---- mode 5: ask for pixels ---------------------------------------
+  if (isCudaRasterMode()) {
+    // No presenter means no target size to request, and an RGBA REQ without one
+    // earns an engine error per frame. ensureBlit() reports its own failure.
+    if (!cudaSource || !blit || !blit.ok) return;
+
+    const w = blit.deviceWidth();
+    const h = blit.deviceHeight();
+    if (w <= 0 || h <= 0) return;
+
+    try {
+      cudaSource.requestRgba(engineScene, dtMs, inputState, w, h);
+    } catch (err) {
+      console.warn('[app] requestRgba threw: %s', errText(err));
+    }
+    return;
+  }
+
+  // ---- modes 1-4: ask for entity records ----------------------------
+  try {
+    activeSource.frame(engineScene, dtMs, inputState);
+  } catch (err) {
+    console.warn('[app] source frame threw: %s', errText(err));
   }
 }
 
@@ -930,11 +1315,28 @@ function tick(now: number): void {
 
   if (ui.overlay) ui.overlay.pushFrame(frameMs);
 
-  // Ask the engine for the next payload before drawing, so the reply has the
+  // Refresh the shared input BEFORE kicking the backend, so this frame's
+  // pointer state and this frame's target ages are what the sim integrates.
+  refreshInputState(dt);
+
+  // Ask the backend for the next payload before drawing, so the reply has the
   // whole draw + idle window to land before the next tick needs it.
-  pumpEngineFrame(dtMs);
+  driveSource(dtMs);
 
   // Draw. Timed separately from the engine's own numbers.
+  //
+  // The scene's frame() runs in EVERY mode, including the CUDA blit mode where
+  // its pixels are not composited. That is deliberate and it is not laziness:
+  // the scene owns the camera rig, and rig.update() + writeCamera() happen
+  // inside frame(). Skipping it in mode 5 would freeze InputState.camera, and
+  // the ray-marcher would render a view that no longer matches where the user
+  // dragged to -- which CONTRACTS section 8 forbids in exactly those words.
+  //
+  // The cost of the hidden three.js render is therefore inside this measurement
+  // but NOT inside the number the overlay shows for mode 5: onSourceRgba
+  // overwrites drawMs with the engine's renderMs plus the blit upload, which is
+  // what this mode actually costs to produce a pixel. Wall-clock FPS still
+  // includes everything, as it must.
   const drawStart = performance.now();
   if (activeScene && typeof activeScene.frame === 'function') {
     try {
@@ -948,7 +1350,10 @@ function tick(now: number): void {
   const drawMs = performance.now() - drawStart;
 
   if (ui.overlay) {
-    ui.overlay.setDrawMs(drawMs);
+    // In the blit mode the RGBA callback is the authority on draw cost; leave
+    // whatever it last reported in place rather than clobbering it with the
+    // cost of a render nobody is looking at.
+    if (!isCudaRasterMode()) ui.overlay.setDrawMs(drawMs);
     ui.overlay.tick(now);
   }
 }
@@ -1000,64 +1405,34 @@ function startFrameLoop(): void {
  * ------------------------------------------------------------------ */
 
 /**
- * Install the port listener as early as possible. The preload already queues
- * anything sent before the port lands, but frames can start arriving the moment
- * the handshake completes.
+ * Decode and upload the bundled earth texture to the CUDA engine.
+ *
+ * Main owns the decode (Electron's nativeImage), so the native side ships with
+ * no image libraries at all. The texture is what the volumetric ray-marcher
+ * shades the globe with, so without it mode 5 draws an untextured sphere --
+ * degraded, never broken, which is why a failure here is a log line rather than
+ * anything louder.
  */
-function installEngineListener(): void {
+async function uploadEarthTexture(): Promise<void> {
   const bridge = window.geoswarm;
-  if (!bridge || typeof bridge.onFrame !== 'function') {
-    console.warn('[app] preload bridge missing onFrame; engine transport unavailable');
+  if (!bridge || typeof bridge.uploadEarth !== 'function') {
+    console.log('[app] earth texture skipped: bridge does not expose uploadEarth');
     return;
   }
-  bridge.onFrame(onEngineMessage);
-}
-
-/** How long boot waits for IPC.ENGINE_PORT before starting the drive anyway. */
-const PORT_WAIT_MS = 10_000;
-
-/**
- * Block until the engine port has actually been delivered.
- *
- * This is the first half of the "CUDA link failed" fix. The old boot started
- * the drive the moment the scene mounted, which is strictly before
- * IPC.ENGINE_PORT can arrive: main only posts the port after it sees
- * IPC.RENDERER_READY, and that round trip is not instant. Every REQ issued in
- * that window went into the preload's bounded queue (cap 8) and the rest were
- * dropped on the floor -- a send-before-listen race whose only symptom was a
- * chip that eventually said the link had failed.
- *
- * whenPortReady() is a required member of the bridge (CONTRACTS section 7), so
- * there is exactly one path here. It resolves with no value, so readiness is
- * signalled by which side of the race settles first -- hence the boolean-tagged
- * wrappers rather than racing the hook's own resolution value.
- *
- * @returns true when the port is known to be attached
- */
-async function waitForEnginePort(bridge: GeoswarmBridge | undefined): Promise<boolean> {
-  if (!bridge || typeof bridge.whenPortReady !== 'function') return false;
 
   try {
-    // The timeout is a ceiling on boot, not a failure in itself: the preload
-    // still queues the first few REQs, so a late port is recoverable.
-    const ready = await Promise.race([
-      bridge.whenPortReady().then(() => true),
-      new Promise<boolean>((resolve) => window.setTimeout(() => resolve(false), PORT_WAIT_MS)),
-    ]);
-    if (ready) return true;
-
-    console.warn(`[app] engine port not delivered within ${PORT_WAIT_MS} ms`);
-    linkFailureReason = `engine port not delivered within ${Math.round(PORT_WAIT_MS / 1000)} s`;
-    return false;
+    const res = await bridge.uploadEarth();
+    if (res && res.ok === true) {
+      console.log('[app] earth texture uploaded to the CUDA engine');
+      return;
+    }
+    console.log(`[app] earth texture not uploaded: ${(res && res.reason) || 'unknown'}`);
   } catch (err) {
-    console.warn(`[app] whenPortReady threw: ${errText(err)}`);
-    return false;
+    console.log(`[app] earth texture upload threw: ${errText(err)}`);
   }
 }
 
 async function boot(): Promise<void> {
-  installEngineListener();
-
   // Reduced motion is a live query -- respond if the user flips it mid-session.
   const motionQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
   frameState.reducedMotion = motionQuery.matches;
@@ -1104,8 +1479,11 @@ async function boot(): Promise<void> {
     initial: caps.cuda.ok ? 'low' : DEFAULT_PRESET,
     onChange: (params) => {
       sceneParams = params;
-      const entry = SCENE_REGISTRY[activeSceneId];
-      if (caps.cuda.ok && entry) void configureEngineScene(entry.engineScene);
+
+      // Reconfigure whichever backend is live. It reallocates for the new counts
+      // and does not remount the scene, because geometry sizes are a backend
+      // concern and the scene draws whatever batch it is handed.
+      void ensureSource(activeEngineScene());
     },
   });
   sceneParams = ui.presets.getParams();
@@ -1126,27 +1504,13 @@ async function boot(): Promise<void> {
   }
 
   // ---- engine warmup ---------------------------------------------------
+  // The earth texture is what the CUDA volumetric ray-marcher shades the globe
+  // with, so it goes up before the first frame is ever requested. It does not
+  // depend on the port -- it rides a plain IPC invoke -- so it does not wait on
+  // one. Scene configuration is handled by the source's configure() during
+  // mountScene, which is also where the port handshake is awaited.
   if (caps.cuda.ok) {
-    // Wait for the transport before doing anything that depends on it. The
-    // capability query and the port handshake are separate round trips, and
-    // starting the drive on the strength of the former is the race this fixes.
-    const bridge = window.geoswarm;
-    const portReady = await waitForEnginePort(bridge);
-    if (portReady) {
-      console.log('[app] engine port delivered');
-    }
-
-    // Configure before the first scene mounts so the pool sizes are right for
-    // the very first request.
-    await configureEngineScene(SCENES.SWARM);
-
-    // The earth texture is optional in phase 1; log the reason and move on.
-    if (bridge && typeof bridge.uploadEarth === 'function') {
-      const res = await bridge.uploadEarth();
-      if (!res || res.ok !== true) {
-        console.log(`[app] earth texture not uploaded: ${(res && res.reason) || 'unknown'}`);
-      }
-    }
+    await uploadEarthTexture();
   }
 
   installPointerHandlers();

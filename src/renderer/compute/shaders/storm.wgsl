@@ -290,8 +290,8 @@ fn step(@builtin(global_invocation_id) gid : vec3<u32>) {
 
   /* --- pointer interaction ------------------------------------------------ */
   if (U.counts.z != 0u && U.timing.z != 0.0) {
-    let target = U.pointerWorld.xyz;
-    let toward = target - p;
+    let attractor = U.pointerWorld.xyz;
+    let toward = attractor - p;
     let dist = length(toward);
 
     if (dist > 1e-4 && dist < kPointerRadius) {
@@ -314,7 +314,7 @@ fn step(@builtin(global_invocation_id) gid : vec3<u32>) {
         // vortex -- rotate about the axis from the camera through the pointer,
         // so the swirl always presents face-on to the viewer. Falling back to
         // world up keeps it sane when the camera sits exactly on the pointer.
-        var axis = target - U.camPos.xyz;
+        var axis = attractor - U.camPos.xyz;
         let alen2 = dot(axis, axis);
         axis = select(vec3<f32>(0.0, 1.0, 0.0), axis * inverseSqrt(alen2), alen2 > 1e-8);
 

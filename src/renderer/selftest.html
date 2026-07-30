@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <!--
+      Machine-verification entry point for the WebGPU compute + raster lane.
+
+      This is a SEPARATE html entry rather than a flag on index.html for one
+      reason: index.html and app.ts belong to the scene/app workstream, and a
+      verification hook wired into them would be an edit outside this lane. A
+      second entry costs nothing (vite tree-shakes it into its own chunk, and
+      the app never loads it) and keeps the two workstreams from touching the
+      same file.
+
+      Run it with:  electron . --selftest=webgpu
+
+      The same strict CSP as index.html -- everything is bundled and served from
+      the file:// origin, so 'self' covers it.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="
+        default-src 'self';
+        script-src 'self';
+        style-src 'self' 'unsafe-inline';
+        img-src 'self' data: blob:;
+        connect-src 'self';
+        object-src 'none';
+        base-uri 'none';
+        form-action 'none';
+        frame-ancestors 'none';
+      "
+    />
+    <title>GeoSwarm - WebGPU self-test</title>
+    <style>
+      body {
+        margin: 0;
+        background: #06080e;
+        color: #cfe6f5;
+        font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        padding: 24px;
+      }
+      h1 {
+        font-size: 15px;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+        margin: 0 0 16px;
+        color: #7fd4ff;
+      }
+      #log {
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+    </style>
+  </head>
+
+  <body>
+    <h1>GeoSwarm WebGPU self-test</h1>
+    <div id="log">running...</div>
+    <script type="module" src="./selftest-main.ts"></script>
+  </body>
+</html>
