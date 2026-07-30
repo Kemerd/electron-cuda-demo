@@ -1,0 +1,927 @@
+/* =====================================================================
+   GeoSwarm design system
+   ---------------------------------------------------------------------
+   Dark, translucent, restrained. One accent (#4FD1FF) carries interaction
+   state; NVIDIA green is reserved exclusively for CUDA-specific signal so
+   it keeps its meaning; amber is warning-only.
+
+   Type scale is fixed at 11 / 12.5 / 14 / 17 / 22 px -- five steps, no
+   improvisation. Every numeric readout uses tabular figures so digits do
+   not jitter as values change.
+
+   Motion: one spring-ish curve, cubic-bezier(0.32, 0.72, 0, 1), around
+   320ms for anything structural. Everything collapses to 0.01ms under
+   prefers-reduced-motion.
+   ===================================================================== */
+
+:root {
+  /* ---- surfaces --------------------------------------------------- */
+  --bg: #0b0c10;
+  --bg-elevated: #101218;
+  --panel: rgba(22, 24, 30, 0.72);
+  --panel-solid: rgb(22, 24, 30);
+  --panel-hover: rgba(30, 33, 41, 0.82);
+  --hairline: rgba(255, 255, 255, 0.08);
+  --hairline-strong: rgba(255, 255, 255, 0.14);
+
+  /* ---- text ------------------------------------------------------- */
+  --text: rgba(255, 255, 255, 0.94);
+  --text-secondary: rgba(255, 255, 255, 0.62);
+  --text-tertiary: rgba(255, 255, 255, 0.38);
+  --text-disabled: rgba(255, 255, 255, 0.24);
+
+  /* ---- signal colors ---------------------------------------------- */
+  --accent: #4fd1ff;
+  --accent-dim: rgba(79, 209, 255, 0.18);
+  --accent-glow: rgba(79, 209, 255, 0.34);
+  --cuda: #76b900; /* CUDA badges only */
+  --cuda-dim: rgba(118, 185, 0, 0.16);
+  --warn: #ffb340;
+  --warn-dim: rgba(255, 179, 64, 0.16);
+  --danger: #ff5c5c;
+
+  /* ---- geometry --------------------------------------------------- */
+  --r-sm: 10px;
+  --r-lg: 14px;
+  --sidebar-w: 264px;
+  --sidebar-w-rail: 68px;
+
+  /* ---- type ------------------------------------------------------- */
+  --fs-micro: 11px;
+  --fs-small: 12.5px;
+  --fs-body: 14px;
+  --fs-lead: 17px;
+  --fs-title: 22px;
+
+  /* ---- motion ----------------------------------------------------- */
+  --spring: cubic-bezier(0.32, 0.72, 0, 1);
+  --dur: 320ms;
+  --dur-fast: 180ms;
+
+  --blur: blur(18px);
+}
+
+/* ---------------------------------------------------------------------
+   Reset -- narrow on purpose. Only what this app actually needs.
+   ------------------------------------------------------------------- */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+  overflow: hidden; /* the shell owns all scrolling */
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, 'Segoe UI Variable Display', 'Segoe UI', system-ui, sans-serif;
+  font-size: var(--fs-body);
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  /* Chromium's default drag-select on a control-dense app feels broken. */
+  user-select: none;
+  cursor: default;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+}
+
+/* Focus ring: visible for keyboards, invisible for mouse. */
+:focus { outline: none; }
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+/* Every number in this UI is tabular; digit width shifting under a live
+   counter reads as a rendering bug. */
+.stat,
+.stat-value,
+.fps-value,
+.slider-value,
+.badge-detail,
+.mono {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1;
+}
+
+/* ---------------------------------------------------------------------
+   Shell layout
+   ------------------------------------------------------------------- */
+
+#app-shell {
+  display: grid;
+  grid-template-columns: var(--sidebar-w) 1fr;
+  height: 100%;
+  width: 100%;
+  transition: grid-template-columns var(--dur) var(--spring);
+}
+
+#app-shell.rail {
+  grid-template-columns: var(--sidebar-w-rail) 1fr;
+}
+
+/* ---------------------------------------------------------------------
+   Sidebar
+   ------------------------------------------------------------------- */
+
+.sidebar {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  background: var(--panel);
+  backdrop-filter: var(--blur);
+  -webkit-backdrop-filter: var(--blur);
+  border-right: 1px solid var(--hairline);
+  overflow: hidden;
+}
+
+.sidebar-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 18px 16px 14px;
+  min-height: 64px;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  flex: 1;
+}
+
+/* Concentric-ring mark: two radial gradients, no asset needed. */
+.brand-mark {
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background:
+    radial-gradient(circle at 32% 30%, rgba(255, 255, 255, 0.5), transparent 42%),
+    conic-gradient(from 200deg, var(--accent), #2b7fa8 55%, var(--accent));
+  box-shadow: 0 0 0 1px var(--hairline-strong), 0 0 16px var(--accent-dim);
+}
+
+.brand-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  transition: opacity var(--dur-fast) var(--spring);
+}
+
+.brand-name {
+  font-size: var(--fs-body);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+}
+
+.brand-sub {
+  font-size: var(--fs-micro);
+  color: var(--text-tertiary);
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+
+.icon-button {
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+  color: var(--text-secondary);
+  transition: background var(--dur-fast) var(--spring), color var(--dur-fast) var(--spring);
+}
+
+.icon-button:hover {
+  background: rgba(255, 255, 255, 0.07);
+  color: var(--text);
+}
+
+/* Chevron drawn from two borders so there is no icon dependency. */
+.chevron {
+  width: 7px;
+  height: 7px;
+  border-left: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(45deg) translate(1px, -1px);
+  transition: transform var(--dur) var(--spring);
+}
+
+#app-shell.rail .chevron {
+  transform: rotate(-135deg) translate(0, 0);
+}
+
+#app-shell.rail .brand-text,
+#app-shell.rail .sidebar-scroll {
+  opacity: 0;
+  pointer-events: none;
+}
+
+#app-shell.rail .nav-label {
+  opacity: 0;
+  transform: translateX(-6px);
+}
+
+/* ---- nav ------------------------------------------------------------ */
+
+.sidebar-nav {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 10px 14px;
+}
+
+/* The indicator is a single absolutely-positioned pill that springs between
+   items -- one animated element instead of N cross-fading backgrounds. */
+.nav-indicator {
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  height: 0;
+  border-radius: var(--r-sm);
+  background: var(--accent-dim);
+  box-shadow: inset 0 0 0 1px rgba(79, 209, 255, 0.28);
+  transform: translateY(0);
+  transition:
+    transform var(--dur) var(--spring),
+    height var(--dur) var(--spring),
+    opacity var(--dur-fast) linear;
+  opacity: 0;
+  pointer-events: none;
+  will-change: transform;
+}
+
+.nav-indicator.visible { opacity: 1; }
+
+.nav-item {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 12px;
+  border-radius: var(--r-sm);
+  color: var(--text-secondary);
+  font-size: var(--fs-body);
+  text-align: left;
+  white-space: nowrap;
+  transition: color var(--dur-fast) var(--spring), background var(--dur-fast) var(--spring);
+}
+
+.nav-item:hover { color: var(--text); background: rgba(255, 255, 255, 0.045); }
+.nav-item.active { color: var(--accent); background: transparent; }
+.nav-item.active .nav-glyph { color: var(--accent); }
+
+.nav-glyph {
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  color: var(--text-tertiary);
+  transition: color var(--dur-fast) var(--spring);
+}
+
+.nav-glyph svg { width: 18px; height: 18px; display: block; }
+
+.nav-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: opacity var(--dur-fast) var(--spring), transform var(--dur) var(--spring);
+}
+
+/* ---- scrolling panel column ----------------------------------------- */
+
+.sidebar-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 0 10px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  transition: opacity var(--dur-fast) var(--spring);
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.16) transparent;
+}
+
+.sidebar-scroll::-webkit-scrollbar { width: 8px; }
+.sidebar-scroll::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.14);
+  border-radius: 4px;
+}
+.sidebar-scroll::-webkit-scrollbar-track { background: transparent; }
+
+/* ---------------------------------------------------------------------
+   Panels
+   ------------------------------------------------------------------- */
+
+.panel {
+  background: rgba(255, 255, 255, 0.026);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-lg);
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.panel-title {
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+  margin: 0;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.field-label {
+  font-size: var(--fs-micro);
+  color: var(--text-tertiary);
+  letter-spacing: 0.04em;
+}
+
+/* ---------------------------------------------------------------------
+   Segmented control (backend matrix)
+   ------------------------------------------------------------------- */
+
+.segmented {
+  position: relative;
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
+  gap: 2px;
+  padding: 2px;
+  background: rgba(0, 0, 0, 0.34);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+}
+
+.segment {
+  position: relative;
+  z-index: 1;
+  padding: 6px 4px;
+  border-radius: 8px;
+  font-size: var(--fs-small);
+  color: var(--text-secondary);
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition:
+    color var(--dur-fast) var(--spring),
+    background var(--dur-fast) var(--spring),
+    opacity var(--dur-fast) var(--spring);
+}
+
+.segment:hover:not(.disabled) { color: var(--text); background: rgba(255, 255, 255, 0.05); }
+
+.segment.selected {
+  color: #06212b;
+  background: var(--accent);
+  font-weight: 600;
+  box-shadow: 0 1px 8px var(--accent-dim);
+}
+
+/* CUDA segments keep the green identity when selected. */
+.segment.selected.cuda {
+  color: #0e1a00;
+  background: var(--cuda);
+  box-shadow: 0 1px 8px var(--cuda-dim);
+}
+
+.segment.disabled {
+  color: var(--text-disabled);
+  cursor: not-allowed;
+  background: repeating-linear-gradient(
+    -45deg,
+    transparent,
+    transparent 4px,
+    rgba(255, 255, 255, 0.028) 4px,
+    rgba(255, 255, 255, 0.028) 8px
+  );
+}
+
+/* ---------------------------------------------------------------------
+   Presets + sliders
+   ------------------------------------------------------------------- */
+
+.preset-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 6px;
+}
+
+.preset-chip {
+  padding: 8px 6px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--hairline);
+  background: rgba(255, 255, 255, 0.03);
+  font-size: var(--fs-small);
+  color: var(--text-secondary);
+  transition:
+    border-color var(--dur-fast) var(--spring),
+    background var(--dur-fast) var(--spring),
+    color var(--dur-fast) var(--spring),
+    transform var(--dur-fast) var(--spring);
+}
+
+.preset-chip:hover { background: rgba(255, 255, 255, 0.06); color: var(--text); }
+.preset-chip:active { transform: scale(0.97); }
+
+.preset-chip.selected {
+  border-color: rgba(79, 209, 255, 0.5);
+  background: var(--accent-dim);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.disclosure {
+  border-top: 1px solid var(--hairline);
+  padding-top: 10px;
+  margin-top: 2px;
+}
+
+.disclosure-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  font-size: var(--fs-small);
+  color: var(--text-secondary);
+}
+
+.disclosure-head:hover { color: var(--text); }
+
+.disclosure-caret {
+  width: 6px;
+  height: 6px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(-45deg);
+  transition: transform var(--dur-fast) var(--spring);
+}
+
+.disclosure.open .disclosure-caret { transform: rotate(45deg); }
+
+/* Height animation via grid-template-rows 0fr->1fr: animates cleanly without
+   needing a measured pixel height. */
+.disclosure-body {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows var(--dur) var(--spring);
+}
+
+.disclosure.open .disclosure-body { grid-template-rows: 1fr; }
+
+.disclosure-body > .disclosure-inner {
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+}
+
+.disclosure.open .disclosure-body > .disclosure-inner { padding-top: 10px; }
+
+.slider-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: var(--fs-micro);
+}
+
+.slider-value { color: var(--accent); font-weight: 600; }
+
+input[type='range'] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 3px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.14);
+  cursor: pointer;
+}
+
+input[type='range']::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+  transition: transform var(--dur-fast) var(--spring);
+}
+
+input[type='range']:hover::-webkit-slider-thumb { transform: scale(1.18); }
+input[type='range']:active::-webkit-slider-thumb { transform: scale(1.06); }
+
+/* ---------------------------------------------------------------------
+   Capability badges
+   ------------------------------------------------------------------- */
+
+.badge {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 9px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--hairline);
+  background: rgba(255, 255, 255, 0.022);
+}
+
+.badge-dot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  margin-top: 6px;
+  background: var(--text-disabled);
+}
+
+.badge.ok .badge-dot { background: var(--accent); box-shadow: 0 0 8px var(--accent-glow); }
+.badge.ok.cuda .badge-dot { background: var(--cuda); box-shadow: 0 0 8px rgba(118, 185, 0, 0.45); }
+.badge.warn .badge-dot { background: var(--warn); }
+.badge.bad .badge-dot { background: var(--text-disabled); }
+
+.badge-body { min-width: 0; flex: 1; }
+
+.badge-name {
+  font-size: var(--fs-small);
+  font-weight: 600;
+  color: var(--text);
+}
+
+.badge.bad .badge-name { color: var(--text-secondary); }
+.badge.ok.cuda .badge-name { color: var(--cuda); }
+
+.badge-detail {
+  font-size: var(--fs-micro);
+  color: var(--text-tertiary);
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+/* ---------------------------------------------------------------------
+   Stage
+   ------------------------------------------------------------------- */
+
+.stage {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  /* A faint off-center wash keeps the large dark field from looking flat. */
+  background:
+    radial-gradient(1100px 720px at 62% 8%, rgba(79, 209, 255, 0.055), transparent 62%),
+    radial-gradient(900px 600px at 15% 100%, rgba(118, 185, 0, 0.032), transparent 60%),
+    var(--bg);
+}
+
+.stage-topbar {
+  position: relative;
+  z-index: 2;
+  padding: 20px 24px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  pointer-events: none;
+}
+
+.stage-title {
+  margin: 0;
+  font-size: var(--fs-title);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+.stage-subtitle {
+  margin: 0;
+  font-size: var(--fs-small);
+  color: var(--text-secondary);
+  max-width: 62ch;
+}
+
+.status-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+  min-height: 22px;
+}
+
+.status-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  border: 1px solid var(--hairline);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-secondary);
+  /* Chips appear mid-session; a small spring-in keeps that from being jarring. */
+  animation: chip-in var(--dur) var(--spring) both;
+}
+
+.status-chip::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.status-chip.cuda {
+  color: var(--cuda);
+  border-color: rgba(118, 185, 0, 0.34);
+  background: var(--cuda-dim);
+}
+
+.status-chip.accent {
+  color: var(--accent);
+  border-color: rgba(79, 209, 255, 0.34);
+  background: var(--accent-dim);
+}
+
+.status-chip.warn {
+  color: var(--warn);
+  border-color: rgba(255, 179, 64, 0.32);
+  background: var(--warn-dim);
+}
+
+@keyframes chip-in {
+  from { opacity: 0; transform: translateY(-5px) scale(0.94); }
+  to   { opacity: 1; transform: none; }
+}
+
+.stage-surface {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  margin: 0 20px 20px;
+  border-radius: var(--r-lg);
+  border: 1px solid var(--hairline);
+  overflow: hidden;
+  background: rgba(0, 0, 0, 0.24);
+}
+
+/* Scene canvases fill their host; sizing is done in device pixels by JS. */
+.stage-surface canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+/* ---------------------------------------------------------------------
+   Overlay layer
+   ------------------------------------------------------------------- */
+
+.overlay-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 10;
+  padding: 18px;
+  display: flex;
+  justify-content: flex-end;
+  align-items: flex-start;
+}
+
+.glass-card {
+  pointer-events: auto;
+  background: var(--panel);
+  backdrop-filter: var(--blur);
+  -webkit-backdrop-filter: var(--blur);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-lg);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+}
+
+.fps-card {
+  width: 216px;
+  padding: 12px 13px 11px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.fps-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.fps-value {
+  font-size: 34px;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: -0.03em;
+}
+
+.fps-unit {
+  font-size: var(--fs-micro);
+  color: var(--text-tertiary);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.spark {
+  display: block;
+  width: 100%;
+  height: 34px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.3);
+}
+
+.stat-row {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 4px 10px;
+}
+
+.stat {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 6px;
+  font-size: var(--fs-micro);
+  color: var(--text-tertiary);
+}
+
+.stat-value { color: var(--text-secondary); font-weight: 600; }
+.stat-value.accent { color: var(--accent); }
+.stat-value.cuda { color: var(--cuda); }
+
+.stat-divider {
+  grid-column: 1 / -1;
+  height: 1px;
+  background: var(--hairline);
+  margin: 3px 0 1px;
+}
+
+/* ---------------------------------------------------------------------
+   Tooltip
+   ------------------------------------------------------------------- */
+
+.tooltip {
+  position: fixed;
+  z-index: 1000;
+  max-width: 268px;
+  padding: 8px 10px;
+  border-radius: var(--r-sm);
+  background: rgba(16, 18, 24, 0.96);
+  backdrop-filter: var(--blur);
+  -webkit-backdrop-filter: var(--blur);
+  border: 1px solid var(--hairline-strong);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  font-size: var(--fs-micro);
+  line-height: 1.45;
+  color: var(--text-secondary);
+  opacity: 0;
+  transform: translateY(4px) scale(0.97);
+  transition:
+    opacity var(--dur-fast) var(--spring),
+    transform var(--dur-fast) var(--spring);
+  pointer-events: none;
+}
+
+.tooltip.visible { opacity: 1; transform: none; }
+
+/* ---------------------------------------------------------------------
+   Scene placeholders
+   ------------------------------------------------------------------- */
+
+.scene-root {
+  position: absolute;
+  inset: 0;
+}
+
+.scene-caption {
+  position: absolute;
+  left: 20px;
+  bottom: 18px;
+  max-width: 44ch;
+  pointer-events: none;
+}
+
+.scene-caption h2 {
+  margin: 0 0 4px;
+  font-size: var(--fs-lead);
+  font-weight: 600;
+  letter-spacing: -0.015em;
+}
+
+.scene-caption p {
+  margin: 0;
+  font-size: var(--fs-small);
+  color: var(--text-secondary);
+}
+
+.scene-tag {
+  display: inline-block;
+  margin-bottom: 8px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+  border: 1px solid var(--hairline);
+  background: rgba(0, 0, 0, 0.3);
+}
+
+/* ---------------------------------------------------------------------
+   Responsive
+   ------------------------------------------------------------------- */
+
+/* Under 1280px the sidebar auto-collapses to the icon rail. The .rail class
+   is still applied by JS for the manual toggle; this makes narrow windows
+   default to the rail without JS having to watch resize. */
+@media (max-width: 1279px) {
+  #app-shell { grid-template-columns: var(--sidebar-w-rail) 1fr; }
+  #app-shell .brand-text,
+  #app-shell .sidebar-scroll { opacity: 0; pointer-events: none; }
+  #app-shell .nav-label { opacity: 0; transform: translateX(-6px); }
+
+  /* An explicit expand still wins -- overlay the rail rather than reflow. */
+  #app-shell.expanded {
+    grid-template-columns: var(--sidebar-w-rail) 1fr;
+  }
+  #app-shell.expanded .sidebar {
+    position: absolute;
+    z-index: 40;
+    width: var(--sidebar-w);
+    height: 100%;
+    box-shadow: 0 0 60px rgba(0, 0, 0, 0.6);
+  }
+  #app-shell.expanded .brand-text,
+  #app-shell.expanded .sidebar-scroll { opacity: 1; pointer-events: auto; }
+  #app-shell.expanded .nav-label { opacity: 1; transform: none; }
+}
+
+/* Tight heights: shrink the overlay so it never covers the stage caption. */
+@media (max-height: 760px) {
+  .fps-card { width: 190px; }
+  .fps-value { font-size: 28px; }
+  .spark { height: 26px; }
+}
+
+@media (max-width: 900px) {
+  .stage-topbar { padding: 14px 16px 10px; }
+  .stage-surface { margin: 0 12px 12px; }
+  .overlay-layer { padding: 12px; }
+  .fps-card { width: 176px; }
+}
+
+/* ---------------------------------------------------------------------
+   Reduced motion -- honor it everywhere, including the scene canvases
+   (scenes read this via matchMedia and slow their animation instead of
+   stopping, so the stage never looks broken).
+   ------------------------------------------------------------------- */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

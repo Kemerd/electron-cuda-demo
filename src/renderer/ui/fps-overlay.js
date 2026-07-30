@@ -1,0 +1,350 @@
+/**
+ * fps-overlay.js -- the performance HUD.
+ *
+ * Hard requirement: ZERO allocation per frame. An overlay that measures frame
+ * time while generating garbage every frame measures its own GC pauses. So:
+ *
+ *  - Frame times live in a preallocated Float32Array ring (240 samples).
+ *  - The p50/p99 sort works in a second preallocated Float32Array that is
+ *    refilled in place -- no slice(), no sort() on a fresh array.
+ *  - Text updates go through a small string cache: assigning the same string to
+ *    textContent still touches the DOM, so we compare first and skip.
+ *  - The sparkline draws with a path built from primitives; no per-frame arrays.
+ *
+ * The percentile pass is the only non-trivial cost, so it runs on the same
+ * cadence as the text refresh (~6 Hz) rather than every frame. The sparkline
+ * itself redraws every frame -- it is 240 lineTo calls into a 34px-tall canvas.
+ */
+
+/** Ring capacity. 240 samples is ~4 s at 60 Hz, ~1 s at 240 Hz. */
+const SAMPLES = 240;
+
+/** Text/percentile refresh interval in ms. Faster than this and the numbers
+ *  are unreadable; slower and it feels laggy. */
+const READOUT_INTERVAL_MS = 160;
+
+/** Sparkline vertical range in ms. Clamped so one 400ms hitch does not flatten
+ *  the entire trace for the next four seconds. */
+const SPARK_MIN_MS = 8;
+const SPARK_MAX_MS = 50;
+
+/**
+ * Mount the overlay.
+ *
+ * @param {HTMLElement|null} host container (#fps-overlay)
+ * @returns {{
+ *   pushFrame:(frameMs:number)=>void,
+ *   setTimings:(t:object)=>void,
+ *   setDrawMs:(ms:number)=>void,
+ *   setCount:(n:number)=>void,
+ *   tick:(nowMs:number)=>void
+ * }}
+ */
+export function createFpsOverlay(host) {
+  if (!host) {
+    console.warn('[fps-overlay] host element missing; performance HUD disabled');
+    // A complete no-op stub so callers never have to null-check the returned API.
+    return {
+      pushFrame() {},
+      setTimings() {},
+      setDrawMs() {},
+      setCount() {},
+      tick() {},
+    };
+  }
+
+  /* ---- preallocated storage --------------------------------------- */
+
+  const ring = new Float32Array(SAMPLES);
+  const scratch = new Float32Array(SAMPLES);
+  let ringHead = 0;   // next write index
+  let ringCount = 0;  // valid samples, saturating at SAMPLES
+
+  // Rolling FPS is computed from a windowed mean rather than 1000/lastFrame:
+  // instantaneous FPS from a single frame flickers by tens of Hz.
+  let fpsAccumMs = 0;
+  let fpsAccumFrames = 0;
+  let displayFps = 0;
+
+  // Latest engine timings. Held as plain numbers, never an object we replace.
+  let simMs = 0;
+  let copyMs = 0;
+  let drawMs = 0;
+  let entityCount = 0;
+
+  let lastReadoutMs = 0;
+
+  /* ---- DOM -------------------------------------------------------- */
+
+  host.replaceChildren();
+
+  const head = document.createElement('div');
+  head.className = 'fps-head';
+
+  const fpsValue = document.createElement('span');
+  fpsValue.className = 'fps-value';
+  fpsValue.textContent = '--';
+
+  const fpsUnit = document.createElement('span');
+  fpsUnit.className = 'fps-unit';
+  fpsUnit.textContent = 'fps';
+
+  head.append(fpsValue, fpsUnit);
+
+  const spark = document.createElement('canvas');
+  spark.className = 'spark';
+  // Backing-store size is set in resizeSpark() from the real layout box.
+  spark.width = 190;
+  spark.height = 34;
+
+  const stats = document.createElement('div');
+  stats.className = 'stat-row';
+
+  /**
+   * Create one label/value stat cell.
+   * @param {string} label
+   * @param {string} [valueClass]
+   * @returns {HTMLElement} the value span (what we update)
+   */
+  function makeStat(label, valueClass) {
+    const row = document.createElement('div');
+    row.className = 'stat';
+
+    const l = document.createElement('span');
+    l.textContent = label;
+
+    const v = document.createElement('span');
+    v.className = `stat-value${valueClass ? ` ${valueClass}` : ''}`;
+    v.textContent = '--';
+
+    row.append(l, v);
+    stats.appendChild(row);
+    return v;
+  }
+
+  const p50El = makeStat('p50');
+  const p99El = makeStat('p99');
+
+  const divider = document.createElement('div');
+  divider.className = 'stat-divider';
+  stats.appendChild(divider);
+
+  const simEl = makeStat('sim', 'cuda');
+  const copyEl = makeStat('copy', 'cuda');
+  const drawEl = makeStat('draw', 'accent');
+  const countEl = makeStat('records');
+
+  host.append(head, spark, stats);
+
+  /* ---- canvas sizing ---------------------------------------------- */
+
+  const ctx = spark.getContext('2d', { alpha: true, desynchronized: true });
+  if (!ctx) console.warn('[fps-overlay] 2D context unavailable; sparkline disabled');
+
+  let sparkW = spark.width;
+  let sparkH = spark.height;
+
+  /**
+   * Match the canvas backing store to its CSS box at the current DPR. Only
+   * touches canvas.width/height when they actually change -- assigning either
+   * clears the canvas and reallocates the backing store.
+   */
+  function resizeSpark() {
+    const rect = spark.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const w = Math.max(1, Math.round(rect.width * dpr));
+    const h = Math.max(1, Math.round(rect.height * dpr));
+
+    if (spark.width !== w || spark.height !== h) {
+      spark.width = w;
+      spark.height = h;
+      sparkW = w;
+      sparkH = h;
+    }
+  }
+
+  resizeSpark();
+  window.addEventListener('resize', resizeSpark);
+
+  /* ---- statistics -------------------------------------------------- */
+
+  /**
+   * Compute a percentile over the live samples. Copies into the preallocated
+   * scratch array and sorts a subarray view -- TypedArray.prototype.sort is
+   * in-place and numeric by default, so this allocates nothing.
+   *
+   * @param {number} q 0..1
+   * @returns {number} milliseconds
+   */
+  function percentile(q) {
+    if (ringCount === 0) return 0;
+
+    scratch.set(ring.subarray(0, ringCount));
+    const view = scratch.subarray(0, ringCount);
+    view.sort();
+
+    const idx = Math.min(ringCount - 1, Math.max(0, Math.round(q * (ringCount - 1))));
+    return view[idx];
+  }
+
+  /**
+   * Assign textContent only when the value actually differs. Saves a DOM write
+   * and a style invalidation on every unchanged cell.
+   * @param {HTMLElement} el
+   * @param {string} text
+   */
+  function setText(el, text) {
+    if (el.textContent !== text) el.textContent = text;
+  }
+
+  /** Fixed-width ms formatting so the columns do not jitter. */
+  function ms(v) {
+    if (!Number.isFinite(v) || v <= 0) return '--';
+    return v < 10 ? `${v.toFixed(2)}` : `${v.toFixed(1)}`;
+  }
+
+  /* ---- sparkline --------------------------------------------------- */
+
+  /**
+   * Redraw the frame-time trace. Oldest sample on the left, newest on the right.
+   * The fill under the line uses the accent at low alpha so the shape reads even
+   * where the stroke is thin.
+   */
+  function drawSpark() {
+    if (!ctx) return;
+
+    ctx.clearRect(0, 0, sparkW, sparkH);
+    if (ringCount < 2) return;
+
+    // Autoscale to the window's own peak, clamped to a sane band.
+    let peak = SPARK_MIN_MS;
+    for (let i = 0; i < ringCount; i++) {
+      const v = ring[i];
+      if (v > peak) peak = v;
+    }
+    if (peak > SPARK_MAX_MS) peak = SPARK_MAX_MS;
+
+    const stepX = sparkW / (ringCount - 1);
+    const scaleY = sparkH / peak;
+
+    // 16.67ms reference line -- the 60Hz budget.
+    const budgetY = sparkH - Math.min(sparkH, 16.67 * scaleY);
+    ctx.strokeStyle = 'rgba(255,255,255,0.14)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, budgetY);
+    ctx.lineTo(sparkW, budgetY);
+    ctx.stroke();
+
+    // Walk the ring from oldest to newest. The tail (ringHead) is the oldest
+    // sample once the ring has wrapped.
+    const start = ringCount === SAMPLES ? ringHead : 0;
+
+    ctx.beginPath();
+    for (let i = 0; i < ringCount; i++) {
+      const v = ring[(start + i) % SAMPLES];
+      const x = i * stepX;
+      const y = sparkH - Math.min(sparkH, v * scaleY);
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+
+    ctx.strokeStyle = '#4FD1FF';
+    ctx.lineWidth = Math.max(1, sparkH / 30);
+    ctx.lineJoin = 'round';
+    ctx.stroke();
+
+    // Close the path down to the baseline for the fill.
+    ctx.lineTo(sparkW, sparkH);
+    ctx.lineTo(0, sparkH);
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(79,209,255,0.14)';
+    ctx.fill();
+  }
+
+  /* ---- public API --------------------------------------------------- */
+
+  return {
+    /**
+     * Record one frame's wall-clock duration.
+     * @param {number} frameMs
+     */
+    pushFrame(frameMs) {
+      if (!Number.isFinite(frameMs) || frameMs <= 0) return;
+      // Cap absurd deltas (tab restore, debugger pause) so one outlier does not
+      // poison the percentiles for four seconds.
+      const v = Math.min(frameMs, 1000);
+
+      ring[ringHead] = v;
+      ringHead = (ringHead + 1) % SAMPLES;
+      if (ringCount < SAMPLES) ringCount++;
+
+      fpsAccumMs += v;
+      fpsAccumFrames++;
+    },
+
+    /**
+     * Feed engine-reported timings from a FRAME message.
+     * @param {{simMs?:number, copyMs?:number, renderMs?:number}} t
+     */
+    setTimings(t) {
+      if (!t || typeof t !== 'object') return;
+      if (Number.isFinite(t.simMs)) simMs = t.simMs;
+      if (Number.isFinite(t.copyMs)) copyMs = t.copyMs;
+      // A CUDA-rastered frame reports renderMs; treat it as the draw cost.
+      if (Number.isFinite(t.renderMs)) drawMs = t.renderMs;
+    },
+
+    /**
+     * Renderer-side draw cost, measured around the scene's frame() call.
+     * @param {number} value
+     */
+    setDrawMs(value) {
+      if (Number.isFinite(value) && value >= 0) drawMs = value;
+    },
+
+    /**
+     * Record count from the last entity frame.
+     * @param {number} n
+     */
+    setCount(n) {
+      if (Number.isFinite(n) && n >= 0) entityCount = n;
+    },
+
+    /**
+     * Per-frame update. Draws the sparkline every call; refreshes the text and
+     * percentiles on the slower cadence.
+     * @param {number} nowMs performance.now() from the rAF loop
+     */
+    tick(nowMs) {
+      drawSpark();
+
+      if (!Number.isFinite(nowMs)) return;
+      if (nowMs - lastReadoutMs < READOUT_INTERVAL_MS) return;
+      lastReadoutMs = nowMs;
+
+      if (fpsAccumFrames > 0 && fpsAccumMs > 0) {
+        displayFps = (fpsAccumFrames * 1000) / fpsAccumMs;
+        fpsAccumMs = 0;
+        fpsAccumFrames = 0;
+      }
+
+      setText(fpsValue, displayFps > 0 ? String(Math.round(displayFps)) : '--');
+      setText(p50El, `${ms(percentile(0.5))} ms`);
+      setText(p99El, `${ms(percentile(0.99))} ms`);
+      setText(simEl, `${ms(simMs)} ms`);
+      setText(copyEl, `${ms(copyMs)} ms`);
+      setText(drawEl, `${ms(drawMs)} ms`);
+      setText(
+        countEl,
+        entityCount >= 1_000_000
+          ? `${(entityCount / 1_000_000).toFixed(2)}M`
+          : entityCount >= 1000
+            ? `${(entityCount / 1000).toFixed(1)}k`
+            : String(entityCount),
+      );
+    },
+  };
+}

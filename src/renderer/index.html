@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <!--
+      Strict CSP. Everything the renderer runs is bundled by vite and served from
+      the same file:// origin, so 'self' covers scripts and modules outright.
+      'unsafe-inline' is granted to style-src only: the UI writes inline style
+      properties (transform on the sidebar indicator, width on meters) every
+      frame, and CSP treats those as inline styles. No inline <script> exists.
+      blob: and data: on img-src cover canvas.toDataURL and generated textures.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="
+        default-src 'self';
+        script-src 'self';
+        style-src 'self' 'unsafe-inline';
+        img-src 'self' data: blob:;
+        font-src 'self';
+        connect-src 'self';
+        worker-src 'self' blob:;
+        object-src 'none';
+        base-uri 'none';
+        form-action 'none';
+        frame-ancestors 'none';
+      "
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>GeoSwarm</title>
+    <link rel="stylesheet" href="./styles/main.css" />
+  </head>
+
+  <body>
+    <!--
+      Three-part shell:
+        aside  - persistent navigation rail (collapses to icons under 1280px)
+        main   - the stage; scene modules own the canvas inside #stage-surface
+        div    - pointer-events:none overlay layer for floating chrome
+    -->
+    <div id="app-shell">
+      <aside id="sidebar" class="sidebar" aria-label="Scene navigation">
+        <header class="sidebar-head">
+          <div class="brand">
+            <span class="brand-mark" aria-hidden="true"></span>
+            <span class="brand-text">
+              <span class="brand-name">GeoSwarm</span>
+              <span class="brand-sub">CUDA / WebGPU / CPU</span>
+            </span>
+          </div>
+          <button
+            id="sidebar-toggle"
+            class="icon-button"
+            type="button"
+            aria-label="Collapse sidebar"
+            aria-expanded="true"
+          >
+            <span class="chevron" aria-hidden="true"></span>
+          </button>
+        </header>
+
+        <!-- Nav items and the sliding active indicator are built by ui/sidebar.js -->
+        <nav id="sidebar-nav" class="sidebar-nav" aria-label="Scenes"></nav>
+
+        <div class="sidebar-scroll">
+          <!-- Backend matrix: three segmented controls (ui/matrix.js) -->
+          <section id="matrix-panel" class="panel" aria-label="Backend matrix"></section>
+
+          <!-- Fidelity presets + advanced sliders (ui/presets.js) -->
+          <section id="presets-panel" class="panel" aria-label="Fidelity"></section>
+
+          <!-- Capability chips (ui/badges.js) -->
+          <section id="badges-panel" class="panel" aria-label="Capabilities"></section>
+        </div>
+      </aside>
+
+      <main id="stage" class="stage">
+        <div class="stage-topbar">
+          <h1 id="stage-title" class="stage-title">Globe + Swarm</h1>
+          <p id="stage-subtitle" class="stage-subtitle">Initializing.</p>
+          <div id="status-chips" class="status-chips" aria-live="polite"></div>
+        </div>
+
+        <!-- Scene modules mount their canvas/DOM into this element. -->
+        <div id="stage-surface" class="stage-surface"></div>
+      </main>
+
+      <div id="overlay-layer" class="overlay-layer" aria-live="off">
+        <!-- FPS + frame-time card (ui/fps-overlay.js) -->
+        <section id="fps-overlay" class="glass-card fps-card" aria-label="Performance"></section>
+      </div>
+    </div>
+
+    <!-- Shared tooltip element; matrix.js positions it over disabled cells. -->
+    <div id="tooltip" class="tooltip" role="tooltip" aria-hidden="true"></div>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
