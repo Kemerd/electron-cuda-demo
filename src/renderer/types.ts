@@ -231,6 +231,17 @@ export interface Scene {
   /** Hand the scene one weather field. Same borrow rule as setEntities. */
   setField?(f: FieldFrame): void;
 
+  /**
+   * Set an appearance multiplier for the scene's point glyphs.
+   *
+   * Optional because only the particle scene has points to size. It is a
+   * uniform write with no reallocation behind it, which is what lets its slider
+   * commit on every input event rather than on pointer release.
+   *
+   * @param v multiplier; implementations clamp to their own sane range
+   */
+  setPointScale?(v: number): void;
+
   /** True once real backend data has been drawn. */
   hasEngineData?(): boolean;
 }

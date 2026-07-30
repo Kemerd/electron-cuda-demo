@@ -23,6 +23,19 @@
  * (linear memory vs. surf2Dwrite), which is handled by a template parameter on
  * the composite kernel so there is exactly one copy of the shading code.
  *
+ * Scene composition
+ * -----------------
+ * Which of those passes actually run is decided by the scene the engine last
+ * published into the registry (SceneState::scene) - NOT by whatever pointers
+ * happen to be non-null. The distinction matters: buffers from a previous scene
+ * can still be published when a switch is in flight, and drawing "everything
+ * that is resident" is how a weather volume ends up hanging over the swarm
+ * scene. The per-scene recipe, from ScenePasses():
+ *
+ *   swarm    sky + globe + swarm splats                    (no volume)
+ *   weather  sky + globe + volumetric columns + swarm splats
+ *   storm    dark space + storm splats                     (no globe, no volume)
+ *
  * Output is tightly packed RGBA8 (protocol.js, RGBA_CHANNELS = 4).
  */
 
@@ -38,12 +51,81 @@ namespace geoswarm {
 namespace {
 
 /* ===================================================================== *
+ *  Scene composition
+ * ===================================================================== */
+
+/**
+ * @brief Which passes a given scene is made of.
+ *
+ * Resolved once per frame on the host from the published scene id, then handed
+ * to the splat launcher and baked into CompositeArgs. Every consumer downstream
+ * treats these as authoritative and does not second-guess them by testing
+ * pointers - a live pointer from the scene we just switched away from is
+ * exactly the case this exists to reject.
+ */
+struct ScenePasses {
+  bool globe = false;   ///< analytic ray-sphere earth + limb glow
+  bool volume = false;  ///< volumetric ray-march through the density grid
+  bool swarm = false;   ///< swarm agent splats
+  bool storm = false;   ///< storm particle splats
+};
+
+/**
+ * @brief Map a published SceneId to its pass set.
+ *
+ * The int comes straight out of the registry, so it is validated here rather
+ * than trusted: an unconfigured engine publishes kNone (0) and anything else
+ * unexpected must degrade to "draw the background only" instead of falling
+ * through to a scene's worth of passes over buffers that may not exist.
+ *
+ * @param sceneId SceneId as an int (geoswarm::SceneId, mirrored in protocol.js)
+ * @return the pass set for that scene; all-false for kNone / unknown
+ */
+ScenePasses PassesForScene(int sceneId) {
+  ScenePasses p;
+  switch (static_cast<SceneId>(sceneId)) {
+    case SceneId::kSwarm:
+      // Globe with the formation over it. No weather has been simulated in this
+      // scene, so any volume still published belongs to a previous one.
+      p.globe = true;
+      p.swarm = true;
+      break;
+
+    case SceneId::kWeather:
+      // The full stack: the swarm flies through the storm columns it is being
+      // advected by, which is the whole point of the scene.
+      p.globe = true;
+      p.volume = true;
+      p.swarm = true;
+      break;
+
+    case SceneId::kStorm:
+      // Free-space particles against empty sky. No globe: the storm lives in a
+      // box around the origin and a planet behind it would occlude half of it.
+      p.storm = true;
+      break;
+
+    case SceneId::kNone:
+    default:
+      // Nothing configured (or a value we do not recognise). Sky only - the
+      // frame is still well-formed, just empty.
+      break;
+  }
+  return p;
+}
+
+/* ===================================================================== *
  *  Look
  * ===================================================================== */
 
 /** Sky gradient endpoints - near-black at the top, a faint cool wash below. */
 __device__ __forceinline__ float3 SkyTop() { return gsMake(0.006f, 0.008f, 0.020f); }
 __device__ __forceinline__ float3 SkyBottom() { return gsMake(0.020f, 0.030f, 0.055f); }
+
+/** Flat deep-space background for the storm scene, which has no globe and so no
+ *  atmosphere to justify a gradient. Darker than SkyTop so the particle splats
+ *  have the full dynamic range to themselves. */
+__device__ __forceinline__ float3 SpaceColor() { return gsMake(0.004f, 0.005f, 0.012f); }
 
 /** Procedural globe palette, used when no earth texture has been uploaded. */
 __device__ __forceinline__ float3 OceanColor() { return gsMake(0.035f, 0.098f, 0.196f); }
@@ -619,6 +701,7 @@ struct CompositeArgs {
   const unsigned char* volume;     ///< density volume, may be null
   cudaTextureObject_t earth;       ///< globe texture, 0 when not uploaded
   float timeSec;
+  int hasGlobe;                    ///< 1 when the globe + its limb glow are drawn
   int hasVolume;                   ///< 1 when the volumetric pass should run
 };
 
@@ -657,8 +740,12 @@ __device__ float3 ShadePixel(int px, int py, int w, int h, const InputUniforms& 
   const float3 rd = PrimaryRay(px + 0.5f, py + 0.5f, w, h, in);
 
   /* --- sky ------------------------------------------------------------- */
+  // The globe scenes get the atmosphere-tinted gradient (it reads as looking at
+  // a planet from orbit). The storm scene has no planet, so that cool wash along
+  // the bottom would just look like an unexplained light source - it gets flat
+  // deep space instead, which also gives the particle splats the most contrast.
   const float v = (py + 0.5f) / static_cast<float>(h);
-  float3 color = gsLerp3(SkyTop(), SkyBottom(), v);
+  float3 color = args.hasGlobe ? gsLerp3(SkyTop(), SkyBottom(), v) : SpaceColor();
 
   // Starfield. A hash on the quantised ray direction gives stars that are fixed
   // in world space (they rotate correctly with the camera) and cost one hash.
@@ -677,7 +764,10 @@ __device__ float3 ShadePixel(int px, int py, int w, int h, const InputUniforms& 
   float3 surface = gsSplat(0.0f);
   bool hitGlobe = false;
 
-  {
+  // Scene-gated: the storm scene skips the planet entirely. globeHit stays at
+  // its "miss" sentinel, so nothing downstream (the shell march, the halo)
+  // thinks there is geometry occluding the ray.
+  if (args.hasGlobe) {
     float tHit = 0.0f;
     if (gsRaySphere(ro, rd, GS_GLOBE_RADIUS, &tHit)) {
       hitGlobe = true;
@@ -734,8 +824,10 @@ __device__ float3 ShadePixel(int px, int py, int w, int h, const InputUniforms& 
   /* --- atmospheric limb glow -------------------------------------------- */
   // Analytic: the glow strength is a function of the ray's closest approach to
   // the globe centre, which is exact and costs one dot product. Applied whether
-  // or not the globe was hit so the glow wraps the silhouette.
-  {
+  // or not the globe was hit so the glow wraps the silhouette. Gated with the
+  // globe itself - an atmosphere without a planet under it is just a blue smear
+  // in the middle of the storm scene.
+  if (args.hasGlobe) {
     const float closest = gsLength(gsSub(ro, gsScale(rd, gsDot(ro, rd))));
     if (!hitGlobe) {
       const float halo = gsSmoothstep(kShellOuter + 0.30f, GS_GLOBE_RADIUS, closest);
@@ -822,7 +914,17 @@ __device__ float3 ShadePixel(int px, int py, int w, int h, const InputUniforms& 
     // would let a bright globe crush the entity layer into invisibility; doing
     // it separately keeps the entities readable over any background.
     const float3 splat = Tonemap(gsMake(s.x, s.y, s.z));
-    color = gsAdd(color, splat);
+
+    // Coverage-weighted composite instead of a straight add. The w channel is
+    // the accumulated gaussian weight, i.e. how much of this pixel the entities
+    // actually cover, and it is already being written by SplatGaussian - it was
+    // simply never read. Using it to attenuate the background means a dense
+    // patch of agents reads as opaque bodies sitting ON the globe rather than a
+    // bright haze glowing through it, while sparse coverage (the common case at
+    // these counts, where most agents are subpixel) still composites additively
+    // and keeps its soft antialiased edge.
+    const float coverage = 1.0f - __expf(-s.w * 1.35f);
+    color = gsAdd(gsScale(color, 1.0f - 0.55f * coverage), splat);
   }
 
   return color;
@@ -933,12 +1035,19 @@ cudaError_t EnsureRasterScratch(int w, int h) {
 }
 
 /**
- * @brief Run the splat passes for whichever entities are currently resident.
+ * @brief Run the splat passes this scene calls for.
  *
- * Shared by both entry points. Clears the accumulation buffer, then splats the
- * swarm and/or the storm depending on what the scene registry reports.
+ * Shared by both entry points. Clears the accumulation buffer, then splats only
+ * the entity classes @p passes selects. A pass that is switched off is skipped
+ * even when its records are still published, which is the guard against a scene
+ * switch drawing the previous scene's entities: the engine publishes the new
+ * scene id and unpublishes the old buffers, and either of those alone is enough
+ * to make the pass drop out.
+ *
+ * @param passes composition for the currently published scene
  */
-cudaError_t RunSplatPasses(int w, int h, const InputUniforms* input, cudaStream_t stream) {
+cudaError_t RunSplatPasses(int w, int h, const ScenePasses& passes, const InputUniforms* input,
+                           cudaStream_t stream) {
   const SceneState& st = GetSceneState();
 
   const int pixels = w * h;
@@ -946,36 +1055,56 @@ cudaError_t RunSplatPasses(int w, int h, const InputUniforms* input, cudaStream_
   ClearSplatKernel<<<clearBlocks, GS_BLOCK_1D, 0, stream>>>(g_raster.accum, pixels);
   CUDA_CHECK(cudaGetLastError());
 
-  const float* swarm = st.swarmRecords.load(std::memory_order_relaxed);
-  const uint32_t swarmCount = st.swarmCount.load(std::memory_order_relaxed);
-  if (swarm && swarmCount > 0) {
-    const int blocks = gsDivUp(static_cast<int>(swarmCount), GS_BLOCK_1D);
-    SplatSwarmKernel<<<blocks, GS_BLOCK_1D, 0, stream>>>(g_raster.accum, w, h, swarm, swarmCount,
-                                                         input);
-    CUDA_CHECK(cudaGetLastError());
+  /* --- swarm ---------------------------------------------------------- */
+  if (passes.swarm) {
+    // Load the pointer, then re-read the count. FreeSceneBuffers() zeroes the
+    // count before it retires the pointer and frees the memory, so a count that
+    // is still non-zero after we hold the pointer means the buffer was live for
+    // the whole window - the ordering the registry's contract is built on.
+    const float* swarm = st.swarmRecords.load(std::memory_order_relaxed);
+    const uint32_t swarmCount = st.swarmCount.load(std::memory_order_relaxed);
+    if (swarm && swarmCount > 0) {
+      const int blocks = gsDivUp(static_cast<int>(swarmCount), GS_BLOCK_1D);
+      SplatSwarmKernel<<<blocks, GS_BLOCK_1D, 0, stream>>>(g_raster.accum, w, h, swarm, swarmCount,
+                                                           input);
+      CUDA_CHECK(cudaGetLastError());
+    }
   }
 
-  const float* storm = st.stormRecords.load(std::memory_order_relaxed);
-  const uint32_t stormCount = st.stormCount.load(std::memory_order_relaxed);
-  if (storm && stormCount > 0) {
-    const int blocks = gsDivUp(static_cast<int>(stormCount), GS_BLOCK_1D);
-    SplatStormKernel<<<blocks, GS_BLOCK_1D, 0, stream>>>(
-        g_raster.accum, w, h, reinterpret_cast<const float4*>(storm), stormCount, input);
-    CUDA_CHECK(cudaGetLastError());
+  /* --- storm ---------------------------------------------------------- */
+  if (passes.storm) {
+    const float* storm = st.stormRecords.load(std::memory_order_relaxed);
+    const uint32_t stormCount = st.stormCount.load(std::memory_order_relaxed);
+    if (storm && stormCount > 0) {
+      const int blocks = gsDivUp(static_cast<int>(stormCount), GS_BLOCK_1D);
+      SplatStormKernel<<<blocks, GS_BLOCK_1D, 0, stream>>>(
+          g_raster.accum, w, h, reinterpret_cast<const float4*>(storm), stormCount, input);
+      CUDA_CHECK(cudaGetLastError());
+    }
   }
 
   return cudaSuccess;
 }
 
-/** @brief Assemble the composite arguments from the scene registry. */
-CompositeArgs BuildArgs(float timeSec) {
+/**
+ * @brief Assemble the composite arguments for the scene being drawn.
+ *
+ * @param passes  composition for the currently published scene
+ * @param timeSec scene clock
+ */
+CompositeArgs BuildArgs(const ScenePasses& passes, float timeSec) {
   const SceneState& st = GetSceneState();
 
   CompositeArgs args;
   args.accum = g_raster.accum;
-  args.volume = st.densityVolume.load(std::memory_order_relaxed);
   args.earth = static_cast<cudaTextureObject_t>(st.earthTex.load(std::memory_order_relaxed));
   args.timeSec = timeSec;
+  args.hasGlobe = passes.globe ? 1 : 0;
+
+  // Only the weather scene reads the density volume. Loading the pointer under
+  // the pass flag (rather than loading it always and gating the use) means a
+  // volume belonging to a scene we have left never even reaches the kernel.
+  args.volume = passes.volume ? st.densityVolume.load(std::memory_order_relaxed) : nullptr;
   args.hasVolume = (args.volume != nullptr) ? 1 : 0;
   return args;
 }
@@ -1016,10 +1145,17 @@ cudaError_t LaunchRasterFrame(uint8_t* frame, int w, int h, size_t pitch,
   }
   if (!(timeSec == timeSec)) timeSec = 0.0f;
 
-  CUDA_CHECK(EnsureRasterScratch(w, h));
-  CUDA_CHECK(RunSplatPasses(w, h, input, stream));
+  // Resolve the scene composition ONCE per frame and use that snapshot for both
+  // the splat passes and the composite. Re-reading the registry between the two
+  // would let a scene switch land in the middle of a frame and produce a hybrid
+  // - storm particles composited over a globe, or worse.
+  const ScenePasses passes =
+      PassesForScene(GetSceneState().scene.load(std::memory_order_relaxed));
 
-  const CompositeArgs args = BuildArgs(timeSec);
+  CUDA_CHECK(EnsureRasterScratch(w, h));
+  CUDA_CHECK(RunSplatPasses(w, h, passes, input, stream));
+
+  const CompositeArgs args = BuildArgs(passes, timeSec);
 
   const dim3 block(GS_TILE_X, GS_TILE_Y);
   const dim3 grid(gsDivUp(w, GS_TILE_X), gsDivUp(h, GS_TILE_Y));
@@ -1037,10 +1173,16 @@ cudaError_t LaunchRasterSurface(cudaSurfaceObject_t surf, int w, int h,
   if (!(timeSec == timeSec)) timeSec = 0.0f;
 
   // Exactly the same pipeline as the blit path - only the final store differs.
-  CUDA_CHECK(EnsureRasterScratch(w, h));
-  CUDA_CHECK(RunSplatPasses(w, h, input, stream));
+  // Same one-snapshot-per-frame rule for the scene, and it matters more here:
+  // this runs on the native view's render thread while the main thread is the
+  // one reconfiguring scenes underneath it.
+  const ScenePasses passes =
+      PassesForScene(GetSceneState().scene.load(std::memory_order_relaxed));
 
-  const CompositeArgs args = BuildArgs(timeSec);
+  CUDA_CHECK(EnsureRasterScratch(w, h));
+  CUDA_CHECK(RunSplatPasses(w, h, passes, input, stream));
+
+  const CompositeArgs args = BuildArgs(passes, timeSec);
 
   const dim3 block(GS_TILE_X, GS_TILE_Y);
   const dim3 grid(gsDivUp(w, GS_TILE_X), gsDivUp(h, GS_TILE_Y));

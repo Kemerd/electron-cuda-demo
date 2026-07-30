@@ -16,7 +16,7 @@
  * itself redraws every frame -- it is 240 lineTo calls into a 34px-tall canvas.
  */
 
-import type { FrameTimings } from '../../shared/protocol';
+import type { FrameTimings, GpuStats } from '../../shared/protocol';
 import { isFiniteNumber } from '../types';
 
 /** Ring capacity. 240 samples is ~4 s at 60 Hz, ~1 s at 240 Hz. */
@@ -50,6 +50,17 @@ export interface FpsOverlayApi {
    * steps that actually came back, so a slow backend is visibly slow.
    */
   pushSimStep(): void;
+  /**
+   * Feed the ~1 Hz GPU telemetry poll (IPC.GPU_STATS).
+   *
+   * The line is drawn only while this is handed a usable ok:true snapshot;
+   * anything else -- a null, an ok:false, or a payload with no numbers in it at
+   * all -- hides it outright rather than showing placeholder dashes for
+   * hardware that is not reporting. Writes the DOM immediately instead of
+   * waiting for the next tick(): at 1 Hz there is nothing to batch, and a
+   * deferred write would make the readout lag its own poll.
+   */
+  setGpuStats(stats: GpuStats | null | undefined): void;
   /** Per-frame update. @param nowMs performance.now() from the frame loop */
   tick(nowMs: number): void;
 }
@@ -69,6 +80,7 @@ export function createFpsOverlay(host: HTMLElement | null): FpsOverlayApi {
       setDrawMs() {},
       setCount() {},
       pushSimStep() {},
+      setGpuStats() {},
       tick() {},
     };
   }
@@ -134,6 +146,31 @@ export function createFpsOverlay(host: HTMLElement | null): FpsOverlayApi {
 
   head.append(fpsValue, fpsUnit);
 
+  /**
+   * GPU telemetry line -- sits directly under the FPS readout per CONTRACTS
+   * section 8, above the sparkline, so it reads as a property of the machine
+   * rather than another per-frame timing.
+   *
+   * Two spans instead of one string: VRAM and utilization come from independent
+   * sources (cudaMemGetInfo vs NVML) and either can be missing while the other
+   * reports, so each half hides on its own. Built once and toggled with a class
+   * -- the line is hidden by default and only ever appears once real numbers
+   * arrive.
+   */
+  const gpuLine = document.createElement('div');
+  gpuLine.className = 'gpu-line is-hidden';
+  gpuLine.title =
+    'Device VRAM in use across the whole GPU (cudaMemGetInfo) and GPU core ' +
+    'utilization (NVML). Polled once a second over IPC -- not a per-frame cost.';
+
+  const gpuVram = document.createElement('span');
+  gpuVram.className = 'gpu-metric';
+
+  const gpuUtil = document.createElement('span');
+  gpuUtil.className = 'gpu-metric gpu-util';
+
+  gpuLine.append(gpuVram, gpuUtil);
+
   const spark = document.createElement('canvas');
   spark.className = 'spark';
   // Backing-store size is set in resizeSpark() from the real layout box.
@@ -184,7 +221,7 @@ export function createFpsOverlay(host: HTMLElement | null): FpsOverlayApi {
   const drawEl = makeStat('draw', 'accent');
   const countEl = makeStat('records');
 
-  host.append(head, spark, stats);
+  host.append(head, gpuLine, spark, stats);
 
   /* ---- canvas sizing ---------------------------------------------- */
 
@@ -253,6 +290,29 @@ export function createFpsOverlay(host: HTMLElement | null): FpsOverlayApi {
   function ms(v: number): string {
     if (!Number.isFinite(v) || v <= 0) return '--';
     return v < 10 ? `${v.toFixed(2)}` : `${v.toFixed(1)}`;
+  }
+
+  /**
+   * MB -> GB with one decimal. GB rather than MB because the interesting number
+   * on a 32 GB card is "3.2 of 32.6", and five-digit megabyte counts in a 216px
+   * card wrap. One decimal is fixed-width against the tabular figures, so the
+   * line does not shuffle as the allocation moves.
+   *
+   * Both units here are binary: BytesToMB() in engine.cc divides bytes by
+   * 1024*1024, so the figure arriving is mebibytes, and dividing by another
+   * 1024 yields gibibytes. That is deliberately NOT a decimal-GB conversion.
+   * A card sold as "32 GB" is 32 GiB of silicon, and cudaMemGetInfo reports
+   * the nameplate minus the driver's own reserve -- 31.8 GiB here. Rescaling
+   * to decimal GB would print 34.2 for a 32 GB card, which reads as a bug to
+   * anyone who knows what is installed.
+   *
+   * @param mb mebibytes as the engine reports them
+   * @returns formatted GiB (labelled GB, as the vendor labels it), or null
+   *          when the value is unusable
+   */
+  function gb(mb: unknown): string | null {
+    if (typeof mb !== 'number' || !Number.isFinite(mb) || mb < 0) return null;
+    return (mb / 1024).toFixed(1);
   }
 
   /* ---- sparkline --------------------------------------------------- */
@@ -350,6 +410,57 @@ export function createFpsOverlay(host: HTMLElement | null): FpsOverlayApi {
 
     pushSimStep() {
       simSteps++;
+    },
+
+    /**
+     * Repaint the GPU line from one 1 Hz poll.
+     *
+     * Allocation-wise this is the only place in the overlay that builds strings,
+     * and it does so once a second rather than once a frame -- the per-frame
+     * path (tick/drawSpark) is untouched by any of it.
+     */
+    setGpuStats(stats) {
+      // Anything short of a usable ok:true snapshot means the addon is absent,
+      // has no getGpuStats export yet, or NVML/CUDA declined to answer. The
+      // contract is that the line vanishes rather than showing dashes.
+      if (!stats || typeof stats !== 'object' || stats.ok !== true) {
+        if (!gpuLine.classList.contains('is-hidden')) gpuLine.classList.add('is-hidden');
+        return;
+      }
+
+      // VRAM needs BOTH halves to be meaningful -- "3.2 GB" with no total says
+      // nothing about headroom, which is the whole reason the number is here.
+      const used = gb(stats.vramUsedMB);
+      const total = gb(stats.vramTotalMB);
+      const hasVram = used !== null && total !== null;
+
+      // Utilization is a separate source (NVML) and fails independently; it is
+      // a percentage, so it is clamped rather than trusted.
+      const utilRaw = stats.gpuUtilPct;
+      const hasUtil = typeof utilRaw === 'number' && Number.isFinite(utilRaw);
+      const util = hasUtil ? Math.round(Math.max(0, Math.min(100, utilRaw))) : 0;
+
+      // Neither half reporting is the same as no data at all.
+      if (!hasVram && !hasUtil) {
+        if (!gpuLine.classList.contains('is-hidden')) gpuLine.classList.add('is-hidden');
+        return;
+      }
+
+      if (hasVram) {
+        setText(gpuVram, `VRAM ${used} / ${total} GB`);
+        gpuVram.style.display = '';
+      } else {
+        gpuVram.style.display = 'none';
+      }
+
+      if (hasUtil) {
+        setText(gpuUtil, `GPU ${util}%`);
+        gpuUtil.style.display = '';
+      } else {
+        gpuUtil.style.display = 'none';
+      }
+
+      if (gpuLine.classList.contains('is-hidden')) gpuLine.classList.remove('is-hidden');
     },
 
     /**

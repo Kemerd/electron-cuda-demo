@@ -43,6 +43,161 @@ const PRELOAD = path.join(here, 'preload.cjs');
 /** Headless verification mode. */
 const SMOKE_TEST = process.argv.includes('--smoke-test');
 
+/* ------------------------------------------------------------------ *
+ *  File logging
+ *
+ *  Console output is ephemeral -- a windowed run's renderer messages live in
+ *  devtools and vanish, which makes "it looked wrong ten minutes ago" almost
+ *  impossible to investigate after the fact. Both streams are therefore
+ *  mirrored to logs/ at the repo root, one file pair per launch.
+ *
+ *  Deliberately plain append streams: no rotation, no levels, no formatting
+ *  layer. The console line is the record, and anything cleverer is a logging
+ *  framework nobody asked for. Files are created LAZILY on the first line, so
+ *  a run that never logs leaves no empty file behind.
+ * ------------------------------------------------------------------ */
+
+/** Where the per-launch log pair goes. Gitignored. */
+const LOG_DIR = path.join(repoRoot, 'logs');
+
+/** One launch stamp shared by both files, so a pair is obvious at a glance. */
+const LOG_STAMP = (() => {
+  const d = new Date();
+  const p = (n: number, w = 2): string => String(n).padStart(w, '0');
+  return (
+    `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}` +
+    `-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
+  );
+})();
+
+/** Open streams, keyed by which output they mirror. Null until first write. */
+const logStreams: Record<'main' | 'renderer', fs.WriteStream | null> = {
+  main: null,
+  renderer: null,
+};
+
+/** True once a stream failed to open -- we stop retrying rather than log-spam. */
+const logBroken: Record<'main' | 'renderer', boolean> = { main: false, renderer: false };
+
+/**
+ * Append one line to a log file, opening it on first use.
+ *
+ * Every failure path is swallowed: logging is a diagnostic aid and must never
+ * be able to take the app down or, worse, recurse into the console hook that
+ * called it.
+ *
+ * @param which which of the two files to write
+ * @param line text to append; a trailing newline is added here
+ */
+function appendLog(which: 'main' | 'renderer', line: string): void {
+  if (logBroken[which]) return;
+
+  try {
+    let stream = logStreams[which];
+    if (!stream) {
+      fs.mkdirSync(LOG_DIR, { recursive: true });
+      stream = fs.createWriteStream(path.join(LOG_DIR, `${which}-${LOG_STAMP}.log`), {
+        flags: 'a',
+      });
+      // An error on the stream (disk full, permissions) must not throw from a
+      // later write() and take down whatever was logging.
+      stream.on('error', () => {
+        logBroken[which] = true;
+      });
+      logStreams[which] = stream;
+    }
+
+    // ASCII only, per the repo's console rules -- a stray wide character in a
+    // renderer message must not corrupt the file on a Windows console.
+    const ascii = line.replace(/[^\x20-\x7E\t]/g, '?');
+    stream.write(`${ascii}\n`);
+  } catch {
+    logBroken[which] = true;
+  }
+}
+
+/**
+ * Mirror the main process's own console to logs/main-*.log.
+ *
+ * The four console methods are wrapped rather than process.stdout being patched
+ * directly: stdout carries the SMOKE_OK/SMOKE_FAIL verdict line, which the
+ * orchestrator parses, and a write hook there risks interleaving with it.
+ * Wrapping console leaves that one write path untouched.
+ */
+function installMainLogTap(): void {
+  const levels = ['log', 'info', 'warn', 'error'] as const;
+
+  for (const level of levels) {
+    const original = console[level].bind(console);
+    console[level] = (...args: unknown[]): void => {
+      // Always call through first, so a failure in the mirror cannot swallow
+      // the message the developer was actually looking for.
+      original(...args);
+      try {
+        // console's own %s/%d substitution happens inside the real console, so
+        // the mirror does the same join Node would print for a plain call.
+        appendLog('main', formatLogArgs(args));
+      } catch {
+        /* never let logging break logging */
+      }
+    };
+  }
+}
+
+/**
+ * Render console arguments the way Node's console would print them.
+ *
+ * The printf-style placeholders matter: this codebase uses
+ * `console.log('[pump] scene "%s" configured', scene)` extensively, and a naive
+ * join writes the literal "%s" to the file with the substitutions dangling
+ * after it -- which is exactly the hazard app.ts already documents for the
+ * renderer console tap. So the first argument is treated as a format string
+ * when it contains placeholders, and only the leftovers are appended.
+ */
+function formatLogArgs(args: readonly unknown[]): string {
+  if (args.length === 0) return '';
+
+  const first = args[0];
+  const rest = args.slice(1);
+
+  if (typeof first !== 'string' || !/%[sdifoOj%]/.test(first)) {
+    return args.map(stringifyLogArg).join(' ');
+  }
+
+  let index = 0;
+  const formatted = first.replace(/%([sdifoOj%])/g, (match, spec: string) => {
+    if (spec === '%') return '%';
+    if (index >= rest.length) return match; // more placeholders than arguments
+    const value = rest[index++];
+
+    switch (spec) {
+      case 'd':
+      case 'i':
+        return String(typeof value === 'bigint' ? value : Math.trunc(Number(value)));
+      case 'f':
+        return String(Number(value));
+      default:
+        return stringifyLogArg(value);
+    }
+  });
+
+  // Arguments beyond the placeholders are appended, exactly as console does.
+  const extra = rest.slice(index).map(stringifyLogArg);
+  return extra.length > 0 ? `${formatted} ${extra.join(' ')}` : formatted;
+}
+
+/** Printable form of one console argument. */
+function stringifyLogArg(arg: unknown): string {
+  if (typeof arg === 'string') return arg;
+  if (arg instanceof Error) return arg.stack || arg.message;
+  try {
+    return JSON.stringify(arg) ?? String(arg);
+  } catch {
+    // Circular structures and the like -- String() always produces something.
+    return String(arg);
+  }
+}
+
 /**
  * Hard upper bound on the smoke test, in ms. Beyond this we call it a hang.
  * Raised from the load-only era's 30 s: the run now waits on a real frame
@@ -178,19 +333,35 @@ function readPumpStats(): PumpStats | null {
 }
 
 /**
- * Watch the renderer console for the two things the main process cannot see on
- * its own: engine ERROR messages (they travel main -> renderer, so only the
- * renderer knows one arrived) and the record count of the first entity frame.
+ * Tap the renderer console.
+ *
+ * Two jobs, one listener. Always: mirror every line into logs/renderer-*.log,
+ * because the renderer's output is otherwise trapped in devtools and gone the
+ * moment the window closes.
+ *
+ * Under --smoke-test it additionally watches for the two things the main
+ * process cannot see on its own: engine ERROR messages (they travel main ->
+ * renderer, so only the renderer knows one arrived) and the record count of the
+ * first entity frame.
  *
  * Parsing console lines is not elegant, but the alternative is a second IPC
  * channel that exists purely for the test -- production surface added for a
  * test path is worse than a narrow read-only tap on output the renderer already
  * produces.
  */
-function wireSmokeConsoleTap(wc: WebContents): void {
+function wireRendererConsoleTap(wc: WebContents): void {
   wc.on('console-message', (details) => {
     const line = typeof details?.message === 'string' ? details.message : '';
     if (!line) return;
+
+    // Mirror every renderer line to logs/renderer-*.log. This hook already
+    // existed for the smoke run's MSG.ERROR detection, so the file mirror is an
+    // extension of it rather than a second console-message listener competing
+    // for the same events. It runs in EVERY mode, smoke or windowed -- the
+    // smoke-only patterns below are what stay conditional.
+    appendLog('renderer', line);
+
+    if (!SMOKE_TEST) return;
 
     // Engine failures. app.ts logs every MSG.ERROR it receives through
     // onSourceError() as "[app] engine error: <reason>" -- these two patterns
@@ -390,7 +561,9 @@ function errText(err: unknown): string {
 function wireWindowDiagnostics(win: BrowserWindow): void {
   const wc = win.webContents;
 
-  if (SMOKE_TEST) wireSmokeConsoleTap(wc);
+  // Always attached: it mirrors the renderer console to logs/ in every mode and
+  // additionally arms the smoke patterns when SMOKE_TEST is set.
+  wireRendererConsoleTap(wc);
 
   wc.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL) => {
     // -3 is ERR_ABORTED, which fires on ordinary navigation cancellation and is
@@ -466,6 +639,9 @@ if (!gotLock) {
   });
 
   app.whenReady().then(() => {
+    // Before anything else logs, so the file captures the whole startup.
+    installMainLogTap();
+
     if (SMOKE_TEST) armSmokeWatchdog();
 
     // Probe before the window exists so the renderer's first GET_CAPS is a

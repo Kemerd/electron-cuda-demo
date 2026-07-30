@@ -512,6 +512,40 @@ Napi::Value GetWeatherField(const Napi::CallbackInfo& info) {
   return o;
 }
 
+/**
+ * @brief getGpuStats() -> { ok, vramUsedMB?, vramTotalMB?, gpuUtilPct?, memUtilPct?, reason? }
+ *
+ * No arguments, and safe to call at any point in the lifecycle - the overlay
+ * polls it at ~1 Hz from before init() until after shutdown().
+ *
+ * Fields are set only when their source produced them, which is the whole point
+ * of the shape: a machine whose driver has no NVML still gets vramUsedMB and
+ * vramTotalMB with ok:true, and the absence of gpuUtilPct is how the JS side
+ * knows to render that half of the line as unavailable rather than as 0%.
+ */
+Napi::Value GetGpuStats(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+
+  geoswarm::GpuStats s = GetEngine().QueryGpuStats();
+  if (!s.ok) return MakeFail(env, s.reason);
+
+  Napi::Object o = MakeOk(env);
+  if (s.hasVram) {
+    o.Set("vramUsedMB", Napi::Number::New(env, s.vramUsedMB));
+    o.Set("vramTotalMB", Napi::Number::New(env, s.vramTotalMB));
+  }
+  if (s.hasUtil) {
+    o.Set("gpuUtilPct", Napi::Number::New(env, static_cast<double>(s.gpuUtilPct)));
+    o.Set("memUtilPct", Napi::Number::New(env, static_cast<double>(s.memUtilPct)));
+  }
+  // A reason on an ok result is not a failure - it explains which optional
+  // fields are missing and why (typically "no nvml.dll on this machine").
+  if (!s.reason.empty()) {
+    o.Set("reason", Napi::String::New(env, s.reason));
+  }
+  return o;
+}
+
 /** @brief renderFrame(scene, w, h, dtMs, out) -> { ok, simMs, renderMs, copyMs, reason? } */
 Napi::Value RenderFrame(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
@@ -711,6 +745,7 @@ Napi::Value NativeViewStats(const Napi::CallbackInfo& info) {
 
 Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
   exports.Set("getDeviceInfo", Napi::Function::New(env, GetDeviceInfo));
+  exports.Set("getGpuStats", Napi::Function::New(env, GetGpuStats));
   exports.Set("init", Napi::Function::New(env, Init));
   exports.Set("shutdown", Napi::Function::New(env, ShutdownFn));
 

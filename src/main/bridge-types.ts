@@ -22,6 +22,7 @@
 
 import type {
   Capabilities,
+  GpuStats,
   OkResult,
   PumpToRendererMsg,
   SceneParams,
@@ -77,6 +78,16 @@ export type Unsubscribe = () => void;
 export interface GeoSwarmBridge {
   /** Capabilities from main. Always resolves, even if the IPC call fails. */
   getCaps(): Promise<Capabilities>;
+
+  /**
+   * VRAM + utilization snapshot for the overlay's GPU line.
+   *
+   * Polled at ~1 Hz and nowhere near a frame path. Resolves with
+   * { ok:false, reason } when the addon is missing, has no getGpuStats export
+   * yet, or the IPC itself fails -- the overlay hides its GPU line on anything
+   * but ok:true, so a failure is a UI state, never an error to handle.
+   */
+  gpuStats(): Promise<GpuStats>;
 
   /** (Re)allocate device buffers for a scene. */
   configureScene(scene: string, params?: SceneParams | null): Promise<OkResult>;

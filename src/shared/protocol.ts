@@ -321,6 +321,7 @@ export const IPC = Object.freeze({
   RENDERER_READY: 'renderer:ready',     // send (one-shot handshake)
   ENGINE_PORT: 'engine:port',           // webContents.postMessage carrying the port
   GET_CAPS: 'caps:get',                 // -> Capabilities
+  GPU_STATS: 'gpu:stats',               // -> GpuStats (1 Hz overlay poll)
   CONFIGURE_SCENE: 'scene:configure',   // {scene, params} -> ConfigureResult
   UPLOAD_EARTH: 'texture:earth',        // -> {ok} (main decodes + uploads to engine)
   NVIEW_CREATE: 'nview:create',         // {x,y,w,h,dpr} css px -> {ok, reason?}
@@ -358,6 +359,20 @@ export interface OkResult {
   ok: boolean;
   reason?: string | null;
   vramUsedMB?: number;
+}
+
+/**
+ * Live GPU telemetry for the overlay (IPC.GPU_STATS, ~1 Hz).
+ * VRAM comes from cudaMemGetInfo; utilization from NVML when the driver's
+ * nvml.dll is loadable — fields absent when their source is unavailable.
+ */
+export interface GpuStats {
+  ok: boolean;
+  vramUsedMB?: number;
+  vramTotalMB?: number;
+  gpuUtilPct?: number;
+  memUtilPct?: number;
+  reason?: string | null;
 }
 
 /*

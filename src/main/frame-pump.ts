@@ -44,6 +44,7 @@ import {
 } from '../shared/protocol.js';
 import type {
   FrameMsg,
+  GpuStats,
   OkResult,
   PayloadKind,
   ReqMsg,
@@ -762,6 +763,59 @@ function uploadEarthTexture(): EarthUploadResult {
 }
 
 /* ------------------------------------------------------------------ *
+ *  GPU telemetry (IPC.GPU_STATS, ~1 Hz from the overlay)
+ * ------------------------------------------------------------------ */
+
+/**
+ * Snapshot VRAM + utilization for the overlay's GPU line.
+ *
+ * Same typeof-guard shape as every other engine call in this file, and it earns
+ * its keep here more than most: the addon export lands independently of this
+ * code, so "the .node loaded but has no getGpuStats yet" is a state that really
+ * occurs and must read as a clean { ok:false, reason } rather than a TypeError.
+ * The renderer hides the whole line on anything but ok:true.
+ *
+ * Every returned field is re-validated. NVML is documented as allowed to fail
+ * on its own while cudaMemGetInfo succeeds, so a partial answer -- VRAM present,
+ * utilization absent -- is a legitimate ok:true result and is passed through as
+ * such instead of being flattened into a failure.
+ */
+function collectGpuStats(): GpuStats {
+  const engine = getEngine();
+  if (!engine) return { ok: false, reason: 'CUDA engine unavailable' };
+
+  const getStats = engine.getGpuStats;
+  if (typeof getStats !== 'function') {
+    return { ok: false, reason: 'Engine does not export getGpuStats()' };
+  }
+
+  let res;
+  try {
+    res = getStats.call(engine);
+  } catch (err) {
+    return { ok: false, reason: `getGpuStats() threw: ${errText(err)}` };
+  }
+
+  if (!res || res.ok !== true) {
+    return { ok: false, reason: res?.reason || 'getGpuStats() failed' };
+  }
+
+  // Trust boundary: the numbers come out of a compiled .node, so anything
+  // non-finite or negative is dropped rather than forwarded to the UI, where it
+  // would render as "NaN / NaN GB".
+  const gauge = (x: unknown): number | undefined =>
+    typeof x === 'number' && Number.isFinite(x) && x >= 0 ? x : undefined;
+
+  return {
+    ok: true,
+    vramUsedMB: gauge(res.vramUsedMB),
+    vramTotalMB: gauge(res.vramTotalMB),
+    gpuUtilPct: gauge(res.gpuUtilPct),
+    memUtilPct: gauge(res.memUtilPct),
+  };
+}
+
+/* ------------------------------------------------------------------ *
  *  IPC registration
  * ------------------------------------------------------------------ */
 
@@ -861,6 +915,16 @@ export function registerFramePump(): void {
         ok: false,
         reason: `earth upload failed: ${errText(err)}`,
       };
+    }
+  });
+
+  ipcMain.handle(IPC.GPU_STATS, (): GpuStats => {
+    try {
+      return collectGpuStats();
+    } catch (err) {
+      // Backstop: a 1 Hz poll that rejects would surface as an unhandled
+      // rejection once a second for the life of the session.
+      return { ok: false, reason: `gpu stats failed: ${errText(err)}` };
     }
   });
 

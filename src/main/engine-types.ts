@@ -23,6 +23,7 @@
 
 import type {
   CudaCaps,
+  GpuStats,
   InputState,
   OkResult,
   SceneId,
@@ -90,6 +91,19 @@ export interface RenderFrameResult {
   reason?: string;
 }
 
+/**
+ * getGpuStats() -- live telemetry for the overlay's GPU line.
+ *
+ * Exactly the GpuStats shape from protocol.ts, for the same reason
+ * DeviceInfoResult is CudaCaps: the IPC handler forwards this straight to the
+ * renderer, so a second declaration here would only be a way for the two to
+ * drift. Every numeric field is optional because the two sources fail
+ * independently -- cudaMemGetInfo gives VRAM without the driver's nvml.dll
+ * being loadable, and a partial answer is documented as ok:true with the
+ * utilization fields simply absent.
+ */
+export type GpuStatsResult = GpuStats;
+
 /** nativeViewStats() -- read off atomics on the render thread, never blocking. */
 export interface NativeViewStats {
   fps: number;
@@ -149,6 +163,14 @@ export interface CudaEngine {
     dtMs: number,
     out: ArrayBuffer,
   ): RenderFrameResult;
+
+  /**
+   * VRAM + utilization snapshot. Documented as costing well under 0.1 ms, but
+   * it is still polled at ~1 Hz and never per frame -- NVML's first call pays a
+   * dynamic load of the driver's nvml.dll, and none of these numbers change
+   * meaningfully inside a frame anyway.
+   */
+  getGpuStats?(): GpuStatsResult;
 
   /* --- Native D3D11 child window (CONTRACTS section 6) --- */
 

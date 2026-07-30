@@ -110,6 +110,26 @@ struct FieldResult {
   std::string reason;
 };
 
+/**
+ * @brief Live GPU telemetry for the overlay. Mirrors GpuStats in protocol.ts.
+ *
+ * Two independent sources, and either can be missing without failing the call:
+ * VRAM comes from the CUDA runtime, utilization from NVML. The `has*` flags say
+ * which fields the addon should actually put on the JS object - an absent field
+ * is meaningfully different from a zero, and the overlay renders it as "n/a"
+ * rather than "0%".
+ */
+struct GpuStats {
+  bool ok = false;
+  bool hasVram = false;
+  bool hasUtil = false;
+  double vramUsedMB = 0.0;
+  double vramTotalMB = 0.0;
+  unsigned int gpuUtilPct = 0;  ///< percent of the last sample period with work resident
+  unsigned int memUtilPct = 0;  ///< percent of that period the memory bus was busy
+  std::string reason;           ///< populated even when ok, to explain missing fields
+};
+
 /* ====================================================================== *
  *  Scene sizing
  * ====================================================================== */
@@ -223,6 +243,25 @@ class Engine {
    */
   FieldResult GetWeatherField(void* out, size_t outBytes);
 
+  /* ---- telemetry ------------------------------------------------------ */
+
+  /**
+   * @brief Sample VRAM and GPU utilization for the overlay.
+   *
+   * Cheap by contract (CONTRACTS section 4, under 0.1 ms) - it is polled at
+   * about 1 Hz and must never be called per frame. Does no allocation, no
+   * synchronisation and no kernel launch.
+   *
+   * VRAM comes from cudaMemGetInfo. Utilization comes from NVML, whose DLL is
+   * loaded lazily from the installed driver on the first call and never linked
+   * against - see EnsureNvml(). A machine without NVML still gets its VRAM
+   * numbers and ok:true, with the reason string explaining the gap.
+   *
+   * Safe to call before Init(): cudaMemGetInfo creates the context implicitly,
+   * and a machine with no device returns ok:false rather than failing hard.
+   */
+  GpuStats QueryGpuStats();
+
   /**
    * @brief Advance the sim AND rasterize a full RGBA8 frame into @p out.
    *
@@ -288,6 +327,27 @@ class Engine {
   /** @brief Read a start/stop event pair back as milliseconds. */
   double ElapsedMs(cudaEvent_t start, cudaEvent_t stop) const;
 
+  /**
+   * @brief Load nvml.dll and resolve the three entry points we need, once.
+   *
+   * Deliberately dynamic. nvml.lib is NOT linked and nvml.dll is NOT shipped -
+   * the DLL that gets loaded is the one the installed display driver put in the
+   * system directory, which is the only build of it guaranteed to match the
+   * running driver. Linking it would also break the addon's zero-DLL property
+   * (CONTRACTS section 5): the process would refuse to load at all on a machine
+   * without the driver, instead of degrading to "no utilization numbers".
+   *
+   * Result is cached both ways - a successful load is never repeated, and a
+   * failure is remembered so a machine without NVML does not pay for a failing
+   * LoadLibraryW on every 1 Hz poll.
+   *
+   * @return true when the function pointers and the device handle are usable
+   */
+  bool EnsureNvml();
+
+  /** @brief Unload NVML and drop the cached pointers. Safe when never loaded. */
+  void ShutdownNvml();
+
   /* ---- state --------------------------------------------------------- */
 
   bool initialized_ = false;
@@ -338,6 +398,35 @@ class Engine {
 
   // Running total of per-scene device bytes, reported by ConfigureScene().
   size_t scene_bytes_ = 0;
+
+  /* ---- NVML (dynamically loaded, never linked) ------------------------ *
+   *
+   * Everything here is opaque on purpose so this header stays free of both
+   * windows.h and nvml.h - it is included by the .cu translation units, and
+   * dragging windows.h through nvcc is a reliable way to collect macro
+   * collisions. engine.cc casts these back to their real types.
+   */
+
+  /** HMODULE from LoadLibraryW(L"nvml.dll"), or null. */
+  void* nvml_module_ = nullptr;
+
+  /** Resolved entry points, stored type-erased (see NvmlApi in engine.cc). */
+  void* nvml_get_handle_ = nullptr;  ///< nvmlDeviceGetHandleByIndex_v2
+  void* nvml_get_util_ = nullptr;    ///< nvmlDeviceGetUtilizationRates
+
+  /** nvmlDevice_t for device 0. It is a pointer-sized opaque handle in NVML's
+   *  own ABI, so a void* holds it exactly. */
+  void* nvml_device_ = nullptr;
+
+  /** True once the load has been attempted, whatever the outcome. Stops a
+   *  machine without the driver from retrying LoadLibraryW at every poll. */
+  bool nvml_attempted_ = false;
+
+  /** True when nvmlInit_v2 succeeded and the handle resolved. */
+  bool nvml_ready_ = false;
+
+  /** Why NVML is unavailable, surfaced in GpuStats::reason. */
+  std::string nvml_reason_;
 };
 
 /** @brief Process-wide engine instance. */

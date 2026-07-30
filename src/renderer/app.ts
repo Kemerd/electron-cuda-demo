@@ -81,6 +81,8 @@ import type { CudaBlitApi } from './present/cuda-blit';
 import type { CudaSourceApi, RgbaFrame } from './cuda-source';
 
 import { createSidebar } from './ui/sidebar';
+import { createSceneControls } from './ui/scene-controls';
+import type { SceneControlsApi } from './ui/scene-controls';
 import { createMatrix } from './ui/matrix';
 import { createPresets } from './ui/presets';
 import { createBadges } from './ui/badges';
@@ -166,6 +168,17 @@ let activeScene: Scene | null = null;
 
 /** Guards against a slow dynamic import landing after the user moved on. */
 let sceneLoadToken = 0;
+
+/**
+ * The visible per-scene controls, rebuilt on every scene mount.
+ *
+ * Held here rather than inside the scene modules because the counts they drive
+ * are a BACKEND concern -- they go through configureScene on the active
+ * DataSource, which is the router's business. A scene that owned its own count
+ * slider would have to know which backend is live, which is exactly the
+ * coupling the DataSource seam exists to prevent.
+ */
+let sceneControls: SceneControlsApi | null = null;
 
 /**
  * Reusable InputState. Allocating this per frame would be a garbage source at
@@ -859,6 +872,11 @@ async function configureSource(
     console.warn('[app] source configure failed: %s', why);
     setChip('source', 'Compute source failed to configure', 'warn', why);
 
+    // A refused configure (the VRAM guard is the usual cause) must never be
+    // silent: the slider moved and nothing happened, so say why right next to
+    // the slider that did it.
+    if (sceneControls) sceneControls.setNote(`Refused: ${why}`, 'warn');
+
     // A refused configure is one of the concrete link-failure causes, so record
     // it: if the deadline later expires the chip tooltip says "configureScene
     // refused: ..." rather than a generic timeout.
@@ -871,6 +889,7 @@ async function configureSource(
   sourceConfigured = true;
   clearChip('source');
   updateCapChip(source);
+  updateControlNote(source);
 
   // The engine reports how much device memory the new allocation took.
   if (isFiniteNumber(result.vramUsedMB)) {
@@ -921,12 +940,131 @@ function updateCapChip(source: DataSource): void {
   );
 }
 
+/**
+ * Mirror the CPU auto-cap into the scene control strip.
+ *
+ * The cap chip already says it in the topbar, but the slider is where the user
+ * just asked for a count -- leaving that slider showing 2M while the worker
+ * runs 20k is the silent lie CONTRACTS forbids. The slider is snapped to the
+ * count actually being simulated and the note explains the gap.
+ */
+function updateControlNote(source: DataSource): void {
+  if (!sceneControls) return;
+
+  const capped = source as Partial<{
+    wasCapped(): boolean;
+    activeCount(): number;
+    requestedCount(): number;
+  }>;
+
+  if (typeof capped.wasCapped !== 'function' || !capped.wasCapped()) {
+    sceneControls.setNote('');
+    return;
+  }
+
+  const active = typeof capped.activeCount === 'function' ? capped.activeCount() : 0;
+  const asked = typeof capped.requestedCount === 'function' ? capped.requestedCount() : 0;
+
+  // Snap the slider to what is really running, so the control never disagrees
+  // with the scene it is controlling.
+  sceneControls.setCount('swarm', active);
+  sceneControls.setCount('storm', active);
+
+  sceneControls.setNote(
+    `CPU baseline capped to ${fmtCount(active)} of ${fmtCount(asked)} -- ` +
+      `switch to a GPU backend for the full count.`,
+    'warn',
+  );
+}
+
 /** Compact count formatting shared by the chip and the overlay. */
 function fmtCount(n: number): string {
   if (!Number.isFinite(n) || n <= 0) return '0';
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
   if (n >= 1000) return `${(n / 1000).toFixed(0)}k`;
   return String(Math.round(n));
+}
+
+/* ------------------------------------------------------------------ *
+ *  GPU telemetry poll (overlay GPU line)
+ *
+ *  A setInterval rather than anything hung off the frame loop, and that is the
+ *  point: VRAM and utilization are properties of the machine, not of a frame,
+ *  and CONTRACTS section 8 pins the overlay to zero per-frame allocation. One
+ *  IPC round trip a second is the entire cost of this feature -- the frame path
+ *  never learns it exists.
+ *
+ *  It runs ONLY while caps.cuda.ok. Without a CUDA device the handler would
+ *  answer { ok:false } once a second forever, which is a pointless IPC wakeup to
+ *  paint a line that stays hidden either way.
+ * ------------------------------------------------------------------ */
+
+/** Poll period. Matches the ~1 Hz cadence CONTRACTS section 4 specifies. */
+const GPU_STATS_INTERVAL_MS = 1000;
+
+/** Live interval handle, or 0 when the poll is not running. */
+let gpuStatsTimer = 0;
+
+/**
+ * True while a poll is in flight, so a slow main process cannot stack requests.
+ * The handler is documented as costing well under a millisecond, but an IPC
+ * round trip is not, and a queue of overlapping invokes would be a leak that
+ * only shows up under load.
+ */
+let gpuStatsInFlight = false;
+
+/** Fetch one snapshot and hand it to the overlay. Never throws. */
+async function pollGpuStats(): Promise<void> {
+  if (gpuStatsInFlight) return;
+
+  const bridge = window.geoswarm;
+  if (!bridge || typeof bridge.gpuStats !== 'function') {
+    // An old preload with no gpuStats(): hide the line and stop asking rather
+    // than testing a missing method once a second.
+    if (ui.overlay) ui.overlay.setGpuStats(null);
+    stopGpuStatsPoll();
+    return;
+  }
+
+  gpuStatsInFlight = true;
+  try {
+    const stats = await bridge.gpuStats();
+    // The overlay decides what an unusable snapshot looks like; it only needs
+    // to be handed whatever came back.
+    if (ui.overlay) ui.overlay.setGpuStats(stats);
+  } catch (err) {
+    // The preload already converts a rejected invoke into { ok:false }, so this
+    // is the belt-and-braces path: hide the line, keep the poll alive.
+    console.warn('[app] gpu stats poll failed: %s', errText(err));
+    if (ui.overlay) ui.overlay.setGpuStats(null);
+  } finally {
+    gpuStatsInFlight = false;
+  }
+}
+
+/**
+ * Start the 1 Hz poll if it is not already running. Idempotent -- every caller
+ * (boot, mode change) can call it unconditionally.
+ */
+function startGpuStatsPoll(): void {
+  if (gpuStatsTimer !== 0) return;
+  if (!caps.cuda || !caps.cuda.ok) return;
+
+  // Kick one immediately so the line appears on the first second rather than
+  // after it, then settle into the interval.
+  void pollGpuStats();
+  gpuStatsTimer = window.setInterval(() => {
+    void pollGpuStats();
+  }, GPU_STATS_INTERVAL_MS);
+}
+
+/** Stop the poll and hide the line. Safe when nothing is running. */
+function stopGpuStatsPoll(): void {
+  if (gpuStatsTimer !== 0) {
+    window.clearInterval(gpuStatsTimer);
+    gpuStatsTimer = 0;
+  }
+  if (ui.overlay) ui.overlay.setGpuStats(null);
 }
 
 /* ------------------------------------------------------------------ *
@@ -1081,6 +1219,11 @@ async function mountScene(id: string): Promise<void> {
   activeScene = instance;
   resizeActiveScene();
 
+  // Visible knobs for whatever this scene exposes, and re-apply any appearance
+  // setting the user had already chosen before the remount.
+  mountSceneControls(id);
+  applyStormPointScale();
+
   // The new scene appended its own .scene-root, so re-apply the visibility rule
   // for the active mode -- otherwise a scene mounted while mode 5 is live would
   // paint over the blit canvas.
@@ -1090,6 +1233,101 @@ async function mountScene(id: string): Promise<void> {
   // way: a scene renders its own geometry regardless of whether any records
   // ever arrive.
   await ensureSource(entry.engineScene);
+}
+
+/**
+ * Build the visible control strip for a scene, or tear it down for scenes that
+ * have no counts of their own (weather is sized by its grid, which is a
+ * fidelity concern; benchmark drives its own sweep).
+ *
+ * Every count commits through ensureSource(), which is the single
+ * reconfiguration path -- so a slider commit takes exactly the same route a
+ * preset click does, including the CPU auto-cap and the VRAM guard.
+ *
+ * @param id nav scene id
+ */
+function mountSceneControls(id: string): void {
+  if (sceneControls) {
+    sceneControls.dispose();
+    sceneControls = null;
+  }
+
+  // Anchored to the stage surface, not the overlay layer: the overlay layer
+  // spans the whole shell (inset:0, sidebar included), so an absolutely
+  // positioned child of it lands over the sidebar panels rather than the scene.
+  // #stage-surface is the scene's own box and is position:relative.
+  const layer = document.getElementById('stage-surface');
+  if (!layer) return;
+
+  if (id === 'globe') {
+    sceneControls = createSceneControls({
+      swarm: {
+        label: 'Swarm agents',
+        min: 10_000,
+        max: 5_000_000,
+        value: sceneParams.swarmCount,
+        onCommit: (value) => {
+          sceneParams = { ...sceneParams, swarmCount: value };
+          void ensureSource(activeEngineScene());
+        },
+      },
+    });
+  } else if (id === 'storm') {
+    sceneControls = createSceneControls(
+      {
+        storm: {
+          label: 'Particles',
+          min: 10_000,
+          max: 8_000_000,
+          value: sceneParams.stormCount,
+          onCommit: (value) => {
+            sceneParams = { ...sceneParams, stormCount: value };
+            void ensureSource(activeEngineScene());
+          },
+        },
+      },
+      {
+        // Point size is a uniform, not an allocation -- it applies live and
+        // never touches configureScene.
+        size: {
+          label: 'Particle size',
+          min: 0.5,
+          max: 4,
+          value: stormPointScale,
+          precision: 2,
+          suffix: 'x',
+          onInput: (value) => {
+            stormPointScale = value;
+            applyStormPointScale();
+          },
+        },
+      },
+    );
+  }
+
+  if (sceneControls) layer.appendChild(sceneControls.root);
+}
+
+/**
+ * Current storm point-size multiplier. Lives here rather than in the scene so
+ * it survives a remount and can be re-applied to a freshly mounted scene.
+ */
+let stormPointScale = 1;
+
+/**
+ * Push the point-size multiplier into the active scene, if it accepts one.
+ *
+ * Feature-tested rather than added to the Scene interface: only the storm scene
+ * has points to size, and widening the contract for one implementer is how
+ * interfaces rot.
+ */
+function applyStormPointScale(): void {
+  if (!activeScene || typeof activeScene.setPointScale !== 'function') return;
+  try {
+    activeScene.setPointScale(stormPointScale);
+  } catch (err) {
+    console.warn('[app] setPointScale threw: %s', errText(err));
+  }
 }
 
 /** The engine scene id the active nav scene drives. */
@@ -1540,6 +1778,16 @@ async function boot(): Promise<void> {
   if (caps.cuda.ok && mode.compute === COMPUTE.CUDA) {
     resetLinkAttempt(linkFailureReason || 'waiting for the first frame');
   }
+
+  // Overlay GPU line. Gated on the device being there at all, not on the CUDA
+  // compute mode being selected: the card's memory and utilization are worth
+  // watching precisely WHILE a WebGPU or CPU run is being compared against it.
+  startGpuStatsPoll();
+
+  // A renderer reload leaves the interval behind otherwise. pagehide rather
+  // than beforeunload -- it fires for the bfcache path too, and Electron
+  // dispatches it on navigation and window close alike.
+  window.addEventListener('pagehide', stopGpuStatsPoll);
 
   startFrameLoop();
 }

@@ -404,7 +404,7 @@ function runSmoke() {
   // Every function the contract promises must actually be there. A missing
   // export is a build problem worth catching here rather than three phases on.
   const required = [
-    'getDeviceInfo', 'init', 'shutdown',
+    'getDeviceInfo', 'getGpuStats', 'init', 'shutdown',
     'configureScene', 'setInput', 'uploadEarthTexture',
     'step', 'getWeatherField', 'renderFrame',
     'nativeViewCreate', 'nativeViewSetRect', 'nativeViewSetVisible',
@@ -619,6 +619,63 @@ function runSmoke() {
   process.stdout.write(
     `[smoke] storm step: count=${sRes.count} simMs=${sRes.simMs.toFixed(3)} ` +
     `copyMs=${sRes.copyMs.toFixed(3)} hash=0x${sck.hash.toString(16).padStart(8, '0')}\n`
+  );
+
+  /* --- GPU telemetry -------------------------------------------------- */
+  // Sampled here rather than at the top so a scene's buffers are actually
+  // resident - a VRAM reading taken before any allocation proves the call
+  // works but says nothing about whether it tracks real usage.
+  //
+  // The VRAM half is mandatory: it comes from cudaMemGetInfo, and getting this
+  // far means CUDA is working. The utilization half is optional by contract -
+  // it needs the driver's nvml.dll, which is loaded dynamically and may not be
+  // present, so its absence is reported rather than failed on.
+  const gpu = engine.getGpuStats();
+  if (!gpu || gpu.ok !== true) {
+    fail('getGpuStats', gpu && gpu.reason ? gpu.reason : 'no reason given');
+    return;
+  }
+  if (typeof gpu.vramUsedMB !== 'number' || typeof gpu.vramTotalMB !== 'number') {
+    fail('getGpuStats', 'vramUsedMB / vramTotalMB missing - cudaMemGetInfo fields are mandatory.');
+    return;
+  }
+  if (!(gpu.vramTotalMB > 0) || !(gpu.vramUsedMB >= 0) || gpu.vramUsedMB > gpu.vramTotalMB) {
+    fail('getGpuStats',
+      `implausible VRAM figures: used=${gpu.vramUsedMB} total=${gpu.vramTotalMB}`);
+    return;
+  }
+
+  // Cross-check against getDeviceInfo. Both describe the same card, so a total
+  // that disagrees by more than a few percent means one of them is reading the
+  // wrong device. The tolerance is wide on purpose: cudaMemGetInfo reports what
+  // the context can address, which is slightly below the board's nameplate.
+  if (Math.abs(gpu.vramTotalMB - dev.vramMB) > dev.vramMB * 0.05) {
+    fail('getGpuStats',
+      `vramTotalMB ${gpu.vramTotalMB.toFixed(0)} disagrees with getDeviceInfo ${dev.vramMB}`);
+    return;
+  }
+
+  const hasUtil = typeof gpu.gpuUtilPct === 'number';
+  if (hasUtil) {
+    // Present means NVML answered, so the values must be real percentages.
+    if (typeof gpu.memUtilPct !== 'number') {
+      fail('getGpuStats', 'gpuUtilPct present but memUtilPct missing - NVML fields come in pairs.');
+      return;
+    }
+    for (const [name, v] of [['gpuUtilPct', gpu.gpuUtilPct], ['memUtilPct', gpu.memUtilPct]]) {
+      if (!Number.isFinite(v) || v < 0 || v > 100) {
+        fail('getGpuStats', `${name}=${v} is outside 0..100`);
+        return;
+      }
+    }
+  }
+
+  process.stdout.write(
+    `[smoke] getGpuStats: vram ${gpu.vramUsedMB.toFixed(1)}/${gpu.vramTotalMB.toFixed(1)} MB` +
+    ` (${((gpu.vramUsedMB / gpu.vramTotalMB) * 100).toFixed(1)}%) | ` +
+    (hasUtil
+      ? `gpuUtil ${gpu.gpuUtilPct}% memUtil ${gpu.memUtilPct}% [NVML]`
+      : `util unavailable: ${gpu.reason || 'no reason given'}`) + '\n'
   );
 
   /* --- native view stats (view not created - must not crash) --------- */

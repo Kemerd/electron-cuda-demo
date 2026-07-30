@@ -31,16 +31,17 @@ import type { IpcRendererEvent } from 'electron';
 
 const { contextBridge, ipcRenderer } = electron;
 import type { GeoSwarmBridge, NativeViewRect, NativeViewStartArgs, NativeViewStatsResult, Unsubscribe } from './bridge-types.js';
-import type { Capabilities, OkResult, PumpToRendererMsg, SceneParams } from '../shared/protocol.js';
+import type { Capabilities, GpuStats, OkResult, PumpToRendererMsg, SceneParams } from '../shared/protocol.js';
 
 // Channel names are duplicated as literals here rather than imported: a
 // sandboxed CJS preload cannot import the ESM protocol module, and adding a
-// bundling step for eleven strings would be worse. The comment on each line
+// bundling step for a dozen strings would be worse. The comment on each line
 // names the protocol.ts key it mirrors so drift is easy to spot in review.
 const CH = Object.freeze({
   RENDERER_READY: 'renderer:ready', // IPC.RENDERER_READY
   ENGINE_PORT: 'engine:port',       // IPC.ENGINE_PORT
   GET_CAPS: 'caps:get',             // IPC.GET_CAPS
+  GPU_STATS: 'gpu:stats',           // IPC.GPU_STATS
   CONFIGURE_SCENE: 'scene:configure', // IPC.CONFIGURE_SCENE
   UPLOAD_EARTH: 'texture:earth',    // IPC.UPLOAD_EARTH
   NVIEW_CREATE: 'nview:create',     // IPC.NVIEW_CREATE
@@ -189,6 +190,17 @@ const api: GeoSwarmBridge = {
       },
       versions: { electron: 'unknown', chrome: 'unknown', node: 'unknown' },
     }));
+  },
+
+  /**
+   * VRAM + utilization for the overlay's GPU line, polled at ~1 Hz.
+   *
+   * invokeSafe already turns a rejected handler into { ok:false, reason }, which
+   * is exactly the shape the overlay uses to decide whether the line is drawn at
+   * all -- so this needs no special failure handling of its own.
+   */
+  gpuStats(): Promise<GpuStats> {
+    return invokeSafe<GpuStats>(CH.GPU_STATS);
   },
 
   /**

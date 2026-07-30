@@ -60,6 +60,15 @@ export default function createScene(): Scene {
   let uPixelRatio: { value: number } | null = null;
   let uTime: { value: number } | null = null;
 
+  /**
+   * Point-size multiplier, driven by the scene's size slider.
+   *
+   * A uniform, not a geometry property -- which is the whole reason the slider
+   * can commit on 'input' instead of on release: changing it is one float write
+   * with no reallocation anywhere behind it.
+   */
+  let uPointScale: { value: number } | null = null;
+
   /** Pointer bookkeeping for click detection. */
   let downX = 0;
   let downY = 0;
@@ -108,8 +117,10 @@ export default function createScene(): Scene {
 
     const pixelRatio = { value: 1 };
     const time = { value: 0 };
+    const pointScale = { value: 1 };
     uPixelRatio = pixelRatio;
     uTime = time;
+    uPointScale = pointScale;
 
     const mat = new THREE.ShaderMaterial({
       transparent: true,
@@ -117,13 +128,14 @@ export default function createScene(): Scene {
       // Additive is what makes energy read as heat: overlapping particles sum
       // toward white instead of averaging toward grey.
       blending: THREE.AdditiveBlending,
-      uniforms: { uPixelRatio: pixelRatio, uTime: time },
+      uniforms: { uPixelRatio: pixelRatio, uTime: time, uPointScale: pointScale },
 
       vertexShader: /* glsl */ `
         precision highp float;
 
         attribute float energy;
         uniform float uPixelRatio;
+        uniform float uPointScale;
 
         varying float vEnergy;
 
@@ -136,12 +148,15 @@ export default function createScene(): Scene {
           // Distance attenuation: size falls as 1/d, the same way a real
           // perspective projection scales a sphere of fixed world radius.
           float dist = max(0.05, -mv.z);
-          float base = 2.6 + vEnergy * 3.4;
+          float base = (2.6 + vEnergy * 3.4) * uPointScale;
           gl_PointSize = (base * uPixelRatio) / dist;
 
           // Floor the size so distant particles stay visible as a haze rather
-          // than dropping below a pixel and flickering in and out.
-          gl_PointSize = max(gl_PointSize, 0.8 * uPixelRatio);
+          // than dropping below a pixel and flickering in and out. Scaled by the
+          // same multiplier, so turning the slider down thins the haze too --
+          // otherwise the floor would dominate at small sizes and the slider
+          // would appear to do nothing past halfway.
+          gl_PointSize = max(gl_PointSize, 0.8 * uPixelRatio * uPointScale);
         }
       `,
 
@@ -392,6 +407,7 @@ export default function createScene(): Scene {
       interleaved = null;
       uPixelRatio = null;
       uTime = null;
+      uPointScale = null;
       rings.length = 0;
       sawEngineData = false;
       lastState = null;
@@ -443,6 +459,18 @@ export default function createScene(): Scene {
 
     hasEngineData(): boolean {
       return sawEngineData;
+    },
+
+    /**
+     * Set the point-size multiplier. Applies on the very next frame with no
+     * reallocation, which is what lets its slider commit live.
+     *
+     * @param v multiplier, clamped to the slider's own 0.5x..4x range
+     */
+    setPointScale(v: number): void {
+      if (!uPointScale) return;
+      if (!Number.isFinite(v)) return;
+      uPointScale.value = Math.max(0.5, Math.min(4, v));
     },
 
     frame(dt: number, state: FrameState) {

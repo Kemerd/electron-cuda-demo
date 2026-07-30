@@ -753,6 +753,76 @@ input[type='range']:active::-webkit-slider-thumb { transform: scale(1.06); }
   gap: 9px;
 }
 
+/* ---------------------------------------------------------------------
+   Per-scene controls (ui/scene-controls.ts)
+
+   Bottom-left of the stage, opposite the perf card. These are the knobs that
+   define what the scene IS -- agent count, particle count, point size -- so
+   they sit in front of the user rather than inside the fidelity disclosure.
+   ------------------------------------------------------------------- */
+
+.scene-controls {
+  position: absolute;
+  left: 18px;
+  bottom: 18px;
+  width: 232px;
+  /* Above the scene canvas (z-index 1) and the CUDA blit canvas (z-index 2),
+     below the z-index-10 overlay chrome. */
+  z-index: 5;
+  pointer-events: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+  padding: 13px 14px 12px;
+  background: var(--panel);
+  backdrop-filter: var(--blur);
+  -webkit-backdrop-filter: var(--blur);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-lg);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+}
+
+.scene-control {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.scene-control-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.scene-control-label {
+  font-size: var(--fs-micro);
+  color: var(--text-tertiary);
+  letter-spacing: 0.04em;
+}
+
+/* Tabular figures so the chip does not reflow as digits change mid-drag. */
+.scene-control-value {
+  font-size: var(--fs-small);
+  font-weight: 600;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+
+.scene-control-note {
+  font-size: var(--fs-micro);
+  line-height: 1.35;
+  color: var(--text-tertiary);
+}
+
+.scene-control-note.warn { color: var(--warn, #ffb454); }
+
+/* The controls would crowd a short stage; drop them below the fold instead of
+   letting them overlap the scene on small windows. */
+@media (max-height: 620px), (max-width: 900px) {
+  .scene-controls { display: none; }
+}
+
 .fps-head {
   display: flex;
   align-items: baseline;
@@ -773,6 +843,38 @@ input[type='range']:active::-webkit-slider-thumb { transform: scale(1.06); }
   letter-spacing: 0.1em;
   text-transform: uppercase;
 }
+
+/* GPU telemetry line -- directly under the FPS readout, above the sparkline.
+   Same micro type as the stat cells so it reads as part of the same table
+   rather than a second headline, tinted with the CUDA green because that is
+   what every other device-side number in this UI wears. The negative top
+   margin pulls it against the readout it belongs to; the card's flex gap would
+   otherwise float it midway between the FPS number and the trace. */
+.gpu-line {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: -4px;
+  font-size: var(--fs-micro);
+  color: var(--cuda);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1;
+  /* Numbers arriving on a 1 Hz poll pop in; a short fade makes the update read
+     as a refresh instead of a flicker. */
+  transition: opacity 0.24s cubic-bezier(0.32, 0.72, 0, 1);
+  opacity: 1;
+}
+
+/* Hidden outright when no stats are available -- display:none, not opacity,
+   so the card reclaims the row instead of holding an empty gap. */
+.gpu-line.is-hidden { display: none; }
+
+.gpu-metric { white-space: nowrap; }
+
+/* Utilization is the volatile half; dim it slightly so the eye lands on the
+   VRAM figure first. */
+.gpu-util { color: rgba(118, 185, 0, 0.72); }
 
 .spark {
   display: block;
