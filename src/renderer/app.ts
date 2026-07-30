@@ -52,6 +52,7 @@ import {
 } from '../shared/protocol';
 import type {
   Capabilities,
+  ComputeBackend,
   InputState,
   ModeState,
   PumpToRendererMsg,
@@ -61,6 +62,9 @@ import type {
 
 import { isFiniteNumber } from './types';
 import type {
+  DataSource,
+  EntityFrame,
+  FieldFrame,
   FrameState,
   GeoswarmBridge,
   MergedCaps,
@@ -68,6 +72,9 @@ import type {
   SceneModule,
   WebGpuCaps,
 } from './types';
+
+import { findSource } from './sources/registry';
+import { ageInteractions } from './interaction';
 
 import { createSidebar } from './ui/sidebar';
 import { createMatrix } from './ui/matrix';
@@ -157,6 +164,30 @@ let activeScene: Scene | null = null;
 let sceneLoadToken = 0;
 
 /**
+ * Reusable InputState. Allocating this per frame would be a garbage source at
+ * 240 Hz; the pump structured-clones it on the way out, so mutation is safe.
+ *
+ * Declared here rather than further down because frameState holds a reference
+ * to it: scenes own the camera (OrbitControls lives in the scene), so they
+ * write `state.input.camera` every frame and the router reads it back out on
+ * the way to the compute backend. Exactly one camera exists in the system --
+ * see the FrameState doc comment in types.ts for why that matters.
+ */
+const inputState: InputState = {
+  mouse: { x: 0.5, y: 0.5, down: false, mode: 1 },
+  pointerWorld: null,
+  targets: [],
+  shockwaves: [],
+  camera: {
+    pos: [0, 0, 3.2],
+    quat: [0, 0, 0, 1],
+    fovYDeg: 50,
+    aspect: 1.6,
+  },
+  timeSec: 0,
+};
+
+/**
  * Shared per-frame state handed to scene.frame(). Mutated in place, never
  * reallocated -- scenes hold the reference across frames.
  */
@@ -167,6 +198,7 @@ const frameState: FrameState = {
   pointer: { x: 0.5, y: 0.5, down: false, mode: 0 },
   timeSec: 0,
   frameId: 0,
+  input: inputState,
 };
 
 /** UI module handles, assigned during boot. */
@@ -249,23 +281,29 @@ let nextRequestAllowedMs = 0;
 /** Most specific explanation we have for the link not being up yet. */
 let linkFailureReason = '';
 
+/* ------------------------------------------------------------------ *
+ *  Active data source (the mode router owns exactly one)
+ *
+ *  Scenes never see this. They receive EntityFrame / FieldFrame through their
+ *  optional setEntities / setField hooks and have no idea whether the records
+ *  came off a worker, a WGSL pipeline or a CUDA MessagePort -- which is the
+ *  entire point of the DataSource seam (CONTRACTS section 8).
+ * ------------------------------------------------------------------ */
+
+/** The one live source, or null when the active backend has no implementation. */
+let activeSource: DataSource | null = null;
+
+/** Which backend activeSource is. Lets us skip a rebuild on a no-op change. */
+let activeSourceId: ComputeBackend | null = null;
+
 /**
- * Reusable InputState. Allocating this per frame would be a garbage source at
- * 240 Hz; the pump structured-clones it on the way out, so mutation is safe.
+ * Guards against a slow source construction landing after the user moved on.
+ * Same pattern as sceneLoadToken -- an await in the middle of a swap is a race.
  */
-const inputState: InputState = {
-  mouse: { x: 0.5, y: 0.5, down: false, mode: 1 },
-  pointerWorld: null,
-  targets: [],
-  shockwaves: [],
-  camera: {
-    pos: [0, 0, 3.2],
-    quat: [0, 0, 0, 1],
-    fovYDeg: 50,
-    aspect: 1.6,
-  },
-  timeSec: 0,
-};
+let sourceToken = 0;
+
+/** True once the active source has been configured for the current scene. */
+let sourceConfigured = false;
 
 /* ------------------------------------------------------------------ *
  *  Capability probing

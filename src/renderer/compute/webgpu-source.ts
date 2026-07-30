@@ -56,7 +56,7 @@ import type {
 } from '../../shared/protocol';
 
 import { isFiniteNumber } from '../types';
-import type { DataSource, EntityFrame, FieldFrame } from './datasource';
+import type { DataSource, EntityFrame, FieldFrame } from '../types';
 import {
   acquireWebGpu,
   getWebGpu,
@@ -112,6 +112,35 @@ function errText(err: unknown): string {
   if (err instanceof Error && err.message) return err.message;
   if (typeof err === 'string') return err;
   return String(err);
+}
+
+/* ------------------------------------------------------------------ *
+ *  Device-resident marker
+ *
+ *  In matrix mode 3 the sim output never leaves the GPU, so the EntityFrame
+ *  this source emits carries a zero-length `records` and a real `count`. A
+ *  consumer that plots from `records` needs to distinguish that from "the sim
+ *  produced nothing", hence the flag.
+ *
+ *  It is declared here as a structural extension rather than added to
+ *  EntityFrame in renderer/types.ts, because that file belongs to the scene
+ *  workstream. Consumers that care read it through this type; consumers that
+ *  do not are unaffected, since an extra property is always assignable to the
+ *  base shape. COORDINATION NOTE for the router: if `deviceResident` is
+ *  promoted into EntityFrame/FieldFrame in types.ts later, delete these two
+ *  aliases and the `as` casts at the two emit sites -- nothing else changes.
+ * ------------------------------------------------------------------ */
+
+/** EntityFrame plus the mode-3 marker. */
+export interface DeviceResidentEntityFrame extends EntityFrame {
+  /** True when `records` is empty because the data stayed in GPU memory. */
+  deviceResident: boolean;
+}
+
+/** FieldFrame plus the same marker. */
+export interface DeviceResidentFieldFrame extends FieldFrame {
+  deviceResident: boolean;
+  timings?: FrameTimings;
 }
 
 /** Workgroup count for a linear dispatch of `n` items at @workgroup_size(64). */
@@ -1583,7 +1612,14 @@ export class WebGpuDataSource implements DataSource {
           copyMs: fenceMs + copyMs,
         };
 
-        this.entityCb({ records, count, stride, timings, deviceResident: false });
+        const frame: DeviceResidentEntityFrame = {
+          records,
+          count,
+          stride,
+          timings,
+          deviceResident: false,
+        };
+        this.entityCb(frame);
       })
       .catch((err: unknown) => {
         slot.busy = false;
@@ -1644,13 +1680,14 @@ export class WebGpuDataSource implements DataSource {
         const copyMs = performance.now() - copyStart;
         const fenceMs = copyStart - mapStart;
 
-        this.fieldCb({
+        const frame: DeviceResidentFieldFrame = {
           data,
           w,
           h,
           timings: { simMs: this.lastGpuSimMs > 0 ? this.lastGpuSimMs : submitMs, copyMs: fenceMs + copyMs },
           deviceResident: false,
-        });
+        };
+        this.fieldCb(frame);
       })
       .catch((err: unknown) => {
         slot.busy = false;
@@ -1671,7 +1708,7 @@ export class WebGpuDataSource implements DataSource {
     const res = isStorm ? this.storm : this.swarm;
     if (!res) return;
 
-    this.entityCb({
+    const frame: DeviceResidentEntityFrame = {
       records: WebGpuDataSource.EMPTY_RECORDS,
       count: res.count,
       stride: isStorm ? STORM_FLOATS : SWARM_FLOATS,
@@ -1679,7 +1716,8 @@ export class WebGpuDataSource implements DataSource {
       // copied. That contrast against the mode-2 number is the whole point.
       timings: { simMs: this.lastGpuSimMs > 0 ? this.lastGpuSimMs : submitMs, copyMs: 0 },
       deviceResident: true,
-    });
+    };
+    this.entityCb(frame);
   }
 
   /* ---------------------------------------------------------------- *
