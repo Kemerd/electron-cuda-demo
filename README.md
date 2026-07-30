@@ -2,6 +2,8 @@
 
 **Real CUDA kernels inside an Electron app — benchmarked honestly against WebGPU and JavaScript.**
 
+![Project Screenshot](preview.png)
+
 A 3D globe. A two-million-agent drone swarm. Live procedural weather. Four million GPU particles reacting to your cursor. All of it simulated and drawn through your choice of backend, switchable live, with the frame-time receipts on screen.
 
 The point: Electron doesn't have to mean slow. A Node-API native module puts CUDA one `require()` away from your renderer process, and this repo measures exactly what that buys you — no hand-waving, no rigged comparisons.
