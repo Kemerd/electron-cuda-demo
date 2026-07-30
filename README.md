@@ -141,8 +141,7 @@ native/          CUDA addon: CMakeLists, Node-API surface, kernels, D3D11 presen
   test/          addon test suite (runs under Electron)
 src/main/        Electron main: window, capabilities, frame pump, preload
 src/renderer/    UI, scenes, WGSL compute, WebGL/WebGPU drawing, benchmark runner
-src/shared/      protocol.js — every constant and message shape, single source of truth
+src/shared/      protocol.ts — every constant, type, and message shape; single source of truth
 test/            unit suite (node:test)
-docs/            engineering contracts
 .github/         CI: compile + unit gates on every push
 ```

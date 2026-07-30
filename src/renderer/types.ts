@@ -21,7 +21,19 @@
  * redeclares a shape that lives in either.
  */
 
-import type { Capabilities, CudaCaps, ModeState } from '../shared/protocol';
+import type {
+  Capabilities,
+  ComputeBackend,
+  CudaCaps,
+  FrameTimings,
+  InputState,
+  ModeState,
+  OkResult,
+  SceneId,
+  SceneParams,
+  Shockwave,
+  TargetPoint,
+} from '../shared/protocol';
 import type { GeoSwarmBridge } from '../main/bridge-types';
 
 /* ------------------------------------------------------------------ *
@@ -91,6 +103,14 @@ export interface PointerState {
 /**
  * Shared per-frame state handed to scene.frame(). Mutated in place, never
  * reallocated -- scenes hold the reference across frames.
+ *
+ * `input` is the SAME InputState object app.ts ships to the compute backends.
+ * Handing scenes the reference rather than a copy is deliberate: the globe
+ * scene's OrbitControls own the camera, so the scene WRITES input.camera each
+ * frame and the router reads it back out on the way to the source. That keeps
+ * exactly one camera in the system -- CONTRACTS section 8 requires the CUDA
+ * ray-marcher to see the identical view, and a second serialization step is
+ * precisely where the two would drift apart.
  */
 export interface FrameState {
   mode: ModeState;
@@ -99,6 +119,82 @@ export interface FrameState {
   pointer: PointerState;
   timeSec: number;
   frameId: number;
+  /** Shared input struct; scenes may write camera / pointerWorld / targets. */
+  input: InputState;
+}
+
+/* ------------------------------------------------------------------ *
+ *  DataSource abstraction (CONTRACTS section 8)
+ *
+ *  The mode router drives exactly one active source per frame. Scenes consume
+ *  the callbacks and never learn which backend produced the data -- that is
+ *  the whole point of the seam: swapping cpu -> webgpu -> cuda must be a
+ *  registry lookup, not a scene rewrite.
+ *
+ *  frame() only KICKS work. Every backend is asynchronous in its own way (the
+ *  CPU source round-trips a worker, CUDA round-trips a MessagePort, WebGPU
+ *  round-trips a mapAsync), so none of them can return a payload inline.
+ *  Results always arrive through onEntities / onField.
+ * ------------------------------------------------------------------ */
+
+/**
+ * One batch of interleaved entity records. `records` is a VIEW that stays valid
+ * only until the source hands over the next batch -- consumers upload it to the
+ * GPU during the callback and never retain it.
+ */
+export interface EntityFrame {
+  records: Float32Array;
+  count: number;
+  /** Floats per record: SWARM_FLOATS (8) or STORM_FLOATS (4). */
+  stride: number;
+  timings?: FrameTimings;
+}
+
+/** One RGBA8 equirectangular weather field (w = 2*h). */
+export interface FieldFrame {
+  data: Uint8Array;
+  w: number;
+  h: number;
+}
+
+/**
+ * A compute backend behind a uniform surface.
+ *
+ * Implementations must tolerate being disposed mid-flight: a scene or preset
+ * change disposes the old source while a worker message / port reply is still
+ * in the air, and that late arrival has to be dropped rather than delivered
+ * into a torn-down scene.
+ */
+export interface DataSource {
+  readonly id: ComputeBackend;
+
+  /** (Re)allocate for a scene at the given sizes. Resolves, never rejects. */
+  configure(scene: SceneId, params: SceneParams): Promise<OkResult>;
+
+  /** Kick one step. Results arrive via the callbacks below, not as a return. */
+  frame(scene: SceneId, dtMs: number, input: InputState): void;
+
+  /** Register the entity-batch sink. One sink; a second call replaces it. */
+  onEntities(cb: (f: EntityFrame) => void): void;
+
+  /** Register the weather-field sink. One sink; a second call replaces it. */
+  onField(cb: (f: FieldFrame) => void): void;
+
+  /** Release workers / buffers / listeners. Safe to call twice. */
+  dispose(): void;
+}
+
+/**
+ * How a source is registered with the router. The factory is lazy so a backend
+ * that is never selected never pays its import cost -- and so an unavailable
+ * backend (no WebGPU adapter, no CUDA addon) is never even constructed.
+ */
+export interface DataSourceRegistration {
+  readonly id: ComputeBackend;
+  /** Human-readable label for chips and logs. */
+  readonly label: string;
+  /** Build the source. Rejects if the backend turns out to be unusable. */
+  readonly create: () => Promise<DataSource>;
 }
 
 /* ------------------------------------------------------------------ *
@@ -114,9 +210,9 @@ export interface SceneMountContext {
 }
 
 /**
- * The uniform scene interface. setEntities/hasEngineData are optional because
- * only the scenes that plot engine payloads implement them -- app.ts feature-
- * tests before calling either.
+ * The uniform scene interface. Everything past frame() is optional because only
+ * the scenes that plot engine payloads implement them -- the router feature-
+ * tests before calling any of them.
  */
 export interface Scene {
   mount(ctx: SceneMountContext): void;
@@ -126,9 +222,16 @@ export interface Scene {
   /** @param dt seconds since the previous frame */
   frame(dt: number, state: FrameState): void;
 
-  /** Hand the scene the current entity payload (view over the frame buffer). */
-  setEntities?(view: Float32Array | null, count: number, stride: number): void;
-  /** True once real engine data has been plotted. */
+  /**
+   * Hand the scene one entity batch. The view is only valid for the duration of
+   * this call -- scenes upload it and do not retain it.
+   */
+  setEntities?(f: EntityFrame): void;
+
+  /** Hand the scene one weather field. Same borrow rule as setEntities. */
+  setField?(f: FieldFrame): void;
+
+  /** True once real backend data has been drawn. */
   hasEngineData?(): boolean;
 }
 

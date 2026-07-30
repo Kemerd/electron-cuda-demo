@@ -1,0 +1,1 @@
+Earth textures from the three.js example assets (`examples/textures/planets`), MIT licensed — https://github.com/mrdoob/three.js. `earth.jpg` is a copy of `earth_atmos_2048.jpg` under the filename the main-process uploader probes.

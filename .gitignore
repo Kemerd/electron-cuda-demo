@@ -15,3 +15,7 @@ Thumbs.db
 
 # Local benchmark exports
 bench-results/
+
+# Internal build-coordination docs (machine-specific paths and pins;
+# everything public-facing lives in the README)
+docs/CONTRACTS.md
