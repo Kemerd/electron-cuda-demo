@@ -36,6 +36,8 @@ import { createGlobeControls } from '../globe-controls';
 import type { GlobeControlsApi } from '../globe-controls';
 import { createDartSwarm } from '../dart-swarm';
 import type { DartSwarmApi } from '../dart-swarm';
+import { createEarth } from '../earth';
+import type { EarthApi } from '../earth';
 
 /** Instance ceiling for the dart mesh. */
 const SWARM_CAPACITY = 2_000_000;
@@ -66,6 +68,17 @@ export default function createScene(): Scene {
   let scene: THREE.Scene | null = null;
   let rig: GlobeControlsApi | null = null;
   let swarm: DartSwarmApi | null = null;
+
+  /**
+   * The shared textured earth, dimmed for EFB legibility.
+   *
+   * This used to be a locally-built flat dark sphere, which is why the radar
+   * and wind layers appeared to float with no world under them. An EFB display
+   * IS read against a low-contrast basemap -- but the contract says the radar
+   * is draped ON the globe and clear air shows the earth underneath, so the
+   * answer is the real textured earth turned down, not a different sphere.
+   */
+  let earth: EarthApi | null = null;
 
   /** The live field, kept so the vector rebuild can sample it off-cadence. */
   let fieldData: Uint8Array | null = null;
@@ -189,54 +202,6 @@ export default function createScene(): Scene {
     const geo = new THREE.SphereGeometry(RADAR_SHELL, 128, 80);
     const mesh = new THREE.Mesh(geo, material);
     mesh.renderOrder = 1;
-    return mesh;
-  }
-
-  /**
-   * A plain dark earth under the radar.
-   *
-   * Deliberately NOT the photographic globe from the swarm scene: an EFB radar
-   * display is read against a low-contrast basemap, and a full-color earth
-   * under a six-band reflectivity ramp makes both illegible. This is the
-   * aviation convention, not a shortcut.
-   */
-  function buildBasemap(): THREE.Mesh {
-    const material = new THREE.ShaderMaterial({
-      uniforms: { uSunDir: { value: new THREE.Vector3(1, 0.35, 0.6).normalize() } },
-      vertexShader: /* glsl */ `
-        precision highp float;
-        varying vec3 vNormalW;
-        varying vec3 vViewDir;
-        void main() {
-          vNormalW = normalize(mat3(modelMatrix) * normal);
-          vec4 wp = modelMatrix * vec4(position, 1.0);
-          vViewDir = normalize(cameraPosition - wp.xyz);
-          gl_Position = projectionMatrix * viewMatrix * wp;
-        }
-      `,
-      fragmentShader: /* glsl */ `
-        precision highp float;
-        uniform vec3 uSunDir;
-        varying vec3 vNormalW;
-        varying vec3 vViewDir;
-        void main() {
-          vec3 n = normalize(vNormalW);
-          // Faint terminator so the sphere still reads as a lit globe rather
-          // than a flat disc, without competing with the radar colors.
-          float lam = max(0.0, dot(n, normalize(uSunDir)));
-          vec3 col = mix(vec3(0.035, 0.055, 0.085), vec3(0.10, 0.14, 0.19), lam);
-
-          float fres = pow(1.0 - max(0.0, dot(n, normalize(vViewDir))), 3.0);
-          col += vec3(0.10, 0.24, 0.42) * fres * 0.5;
-
-          gl_FragColor = vec4(col, 1.0);
-        }
-      `,
-    });
-
-    const geo = new THREE.SphereGeometry(GLOBE_RADIUS, 96, 64);
-    const mesh = new THREE.Mesh(geo, material);
-    mesh.renderOrder = 0;
     return mesh;
   }
 
@@ -601,7 +566,12 @@ export default function createScene(): Scene {
       root.appendChild(renderer.domElement);
 
       scene = new THREE.Scene();
-      scene.add(buildBasemap());
+
+      // Dimmed + desaturated so the six-band reflectivity ramp and the wind
+      // barbs stay legible on top, while the continents still read underneath.
+      earth = createEarth({ dim: 0.5, desaturate: 0.45 });
+      scene.add(earth.mesh);
+      earth.loadTextures();
 
       radarMesh = buildRadar();
       scene.add(radarMesh);
@@ -612,6 +582,10 @@ export default function createScene(): Scene {
       swarm = createDartSwarm({ capacity: SWARM_CAPACITY, color: 0xa8e8ff });
       scene.add(swarm.object);
 
+      // Atmosphere last: it is an additive back-face shell that must sit over
+      // everything flying inside it, radar and darts alike.
+      scene.add(earth.atmosphere);
+
       rig = createGlobeControls(renderer.domElement);
 
       console.log('[weather] EFB radar scene mounted');
@@ -620,6 +594,7 @@ export default function createScene(): Scene {
     unmount() {
       if (rig) rig.dispose();
       if (swarm) swarm.dispose();
+      if (earth) earth.dispose();
       if (fieldTexture) fieldTexture.dispose();
 
       if (scene) {
@@ -651,6 +626,7 @@ export default function createScene(): Scene {
       scene = null;
       rig = null;
       swarm = null;
+      earth = null;
       radarMesh = null;
       radarMaterial = null;
       uHasField = null;

@@ -103,17 +103,25 @@ export function createDartSwarm(options: DartSwarmOptions): DartSwarmApi {
 
   const geometry = new THREE.InstancedBufferGeometry();
 
-  const corner = new Float32Array(DART_VERTS.length * 2);
+  // The canonical dart corner rides in 'position', NOT a custom 'corner'
+  // attribute. That is not cosmetic: WebGLRenderer derives the per-instance
+  // vertex count from geometry.attributes.position, and a geometry without one
+  // resolves a count of `undefined` -- so drawArraysInstanced is issued for zero
+  // vertices and the entire swarm renders nothing, however many instances and
+  // however correct the records are. Naming it 'position' is what makes the mesh
+  // draw at all; z stays 0 because the real placement happens in the shader.
+  const position = new Float32Array(DART_VERTS.length * 3);
   const vertId = new Float32Array(DART_VERTS.length);
   for (let i = 0; i < DART_VERTS.length; i++) {
     const v = DART_VERTS[i];
     if (!v) continue;
-    corner[i * 2] = v[0];
-    corner[i * 2 + 1] = v[1];
+    position[i * 3] = v[0];
+    position[i * 3 + 1] = v[1];
+    position[i * 3 + 2] = 0;
     vertId[i] = v[2];
   }
 
-  geometry.setAttribute('corner', new THREE.BufferAttribute(corner, 2));
+  geometry.setAttribute('position', new THREE.BufferAttribute(position, 3));
   geometry.setAttribute('vertId', new THREE.BufferAttribute(vertId, 1));
 
   /* ---- per-instance attributes bound over the raw record buffer ----
@@ -165,7 +173,8 @@ export function createDartSwarm(options: DartSwarmOptions): DartSwarmApi {
     vertexShader: /* glsl */ `
       precision highp float;
 
-      attribute vec2  corner;   // canonical dart-space position
+      // 'position' carries the canonical dart corner (xy; z unused) and is
+      // declared by three.js itself -- redeclaring it is a compile error.
       attribute float vertId;   // 0 nose, 1 rightWing, 2 leftWing, 3 notch
       attribute vec3  iPos;     // instance position (record floats 0..2)
       attribute vec3  iVel;     // instance velocity (record floats 3..5)
@@ -218,7 +227,7 @@ export function createDartSwarm(options: DartSwarmOptions): DartSwarmApi {
         // Under ~6 px: drop the notch by pulling it back to the wing line, so
         // the concave kite becomes a single clean triangle. At that size the
         // notch is under a pixel wide and only produces shimmer.
-        vec2 c = corner;
+        vec2 c = position.xy;
 
         if (pxSize < 1.5) {
           // Shrink hard toward the origin of dart space; keeps a visible dot
@@ -246,7 +255,7 @@ export function createDartSwarm(options: DartSwarmOptions): DartSwarmApi {
         // Edge shading: the trailing corners get the darker rim. Using the
         // canonical y (not the collapsed one) keeps the shading stable across
         // an LOD transition.
-        vEdge = clamp(-corner.y, 0.0, 1.0);
+        vEdge = clamp(-position.y, 0.0, 1.0);
         vType = mod(iFlags, 4.0);
       }
     `,

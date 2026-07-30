@@ -98,6 +98,11 @@ export function createSidebar(opts?: SidebarOptions | null): SidebarApi {
     return { select() {}, getActive: () => '', items: NAV_ITEMS };
   }
 
+  // Re-bound as a non-optional local: the null check above does not narrow
+  // through the closures below, and every one of them would otherwise need its
+  // own guard (the same pattern cuda-source.ts uses for the preload bridge).
+  const navEl: HTMLElement = nav;
+
   // ---- indicator ----------------------------------------------------
   const indicator = document.createElement('div');
   indicator.className = 'nav-indicator';
@@ -116,8 +121,20 @@ export function createSidebar(opts?: SidebarOptions | null): SidebarApi {
       indicator.classList.remove('visible');
       return;
     }
-    indicator.style.height = `${el.offsetHeight}px`;
-    indicator.style.transform = `translateY(${el.offsetTop}px)`;
+
+    // Measure the item against the NAV's own box rather than trusting
+    // offsetTop's offset parent to be the nav. Both rects come from the same
+    // layout pass, so the difference is exactly the item's position inside the
+    // nav -- correct whatever the nav's padding is, at any window size, and
+    // during the collapse animation when padding is mid-transition.
+    const navRect = navEl.getBoundingClientRect();
+    const itemRect = el.getBoundingClientRect();
+    if (itemRect.height <= 0) return; // not laid out yet; a later call fixes it
+
+    const top = itemRect.top - navRect.top;
+
+    indicator.style.height = `${itemRect.height}px`;
+    indicator.style.transform = `translateY(${top}px)`;
     indicator.classList.add('visible');
   }
 

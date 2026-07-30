@@ -29,17 +29,12 @@ import { createGlobeControls } from '../globe-controls';
 import type { GlobeControlsApi } from '../globe-controls';
 import { createDartSwarm } from '../dart-swarm';
 import type { DartSwarmApi } from '../dart-swarm';
+import { createEarth } from '../earth';
+import type { EarthApi } from '../earth';
 import { placeTarget, TARGET_TTL_SEC } from '../../interaction';
 
 /** Instance ceiling for the dart mesh. Matches the Ultra swarm preset. */
 const SWARM_CAPACITY = 2_000_000;
-
-/** Where the texture files live relative to index.html (vite publicDir). */
-const TEX_BASE = './earth/';
-
-/** Sun direction. Fixed rather than animated: a moving terminator is a
- *  distraction in a benchmark, and a static one makes frames comparable. */
-const SUN_DIR = new THREE.Vector3(1, 0.35, 0.6).normalize();
 
 export default function createScene(): Scene {
   let root: HTMLElement | null = null;
@@ -48,21 +43,8 @@ export default function createScene(): Scene {
   let rig: GlobeControlsApi | null = null;
   let swarm: DartSwarmApi | null = null;
 
-  /** Earth material uniforms, held so texture loads can patch them in place. */
-  let earthUniforms: {
-    uDayMap: { value: THREE.Texture | null };
-    uNightMap: { value: THREE.Texture | null };
-    uNormalMap: { value: THREE.Texture | null };
-    uSpecMap: { value: THREE.Texture | null };
-    uHasDay: { value: number };
-    uHasNight: { value: number };
-    uHasNormal: { value: number };
-    uHasSpec: { value: number };
-    uSunDir: { value: THREE.Vector3 };
-  } | null = null;
-
-  /** Every texture we loaded, so unmount can dispose them. */
-  const loadedTextures: THREE.Texture[] = [];
+  /** The shared textured earth (globe + atmosphere + its own texture loads). */
+  let earth: EarthApi | null = null;
 
   /**
    * Rally-target rings. Fixed pool of MAX_TARGETS -- never allocated per shot.
@@ -103,183 +85,6 @@ export default function createScene(): Scene {
    * dead zone -- the same trap the weather scene's scratch buffer documents.
    */
   let lastState: FrameState | null = null;
-
-  /**
-   * Build the earth mesh. Day/night blend plus optional normal and specular.
-   *
-   * Keeping every map optional behind a `uHas*` flag rather than compiling
-   * variants means one shader program, no recompiles as textures land, and no
-   * branch on an unbound sampler (which is undefined behavior in GLSL).
-   */
-  function buildEarth(): THREE.Mesh {
-    const uniforms = {
-      uDayMap: { value: null as THREE.Texture | null },
-      uNightMap: { value: null as THREE.Texture | null },
-      uNormalMap: { value: null as THREE.Texture | null },
-      uSpecMap: { value: null as THREE.Texture | null },
-      uHasDay: { value: 0 },
-      uHasNight: { value: 0 },
-      uHasNormal: { value: 0 },
-      uHasSpec: { value: 0 },
-      uSunDir: { value: SUN_DIR.clone() },
-    };
-    earthUniforms = uniforms;
-
-    const material = new THREE.ShaderMaterial({
-      uniforms,
-      vertexShader: /* glsl */ `
-        precision highp float;
-
-        varying vec2 vUv;
-        varying vec3 vNormalW;
-        varying vec3 vViewDir;
-
-        void main() {
-          vUv = uv;
-          // The globe is never non-uniformly scaled, so the normal matrix is a
-          // pure rotation and normalizing after transform is exact.
-          vNormalW = normalize(mat3(modelMatrix) * normal);
-
-          vec4 worldPos = modelMatrix * vec4(position, 1.0);
-          vViewDir = normalize(cameraPosition - worldPos.xyz);
-
-          gl_Position = projectionMatrix * viewMatrix * worldPos;
-        }
-      `,
-      fragmentShader: /* glsl */ `
-        precision highp float;
-
-        uniform sampler2D uDayMap;
-        uniform sampler2D uNightMap;
-        uniform sampler2D uNormalMap;
-        uniform sampler2D uSpecMap;
-        uniform float uHasDay;
-        uniform float uHasNight;
-        uniform float uHasNormal;
-        uniform float uHasSpec;
-        uniform vec3  uSunDir;
-
-        varying vec2 vUv;
-        varying vec3 vNormalW;
-        varying vec3 vViewDir;
-
-        void main() {
-          vec3 n = normalize(vNormalW);
-
-          // Tangent-space normal perturbation. A full TBN needs tangents the
-          // sphere geometry does not carry, but on an equirect sphere the
-          // tangent basis is analytic: east is d(pos)/d(lon), north completes
-          // it. That is exact here and costs one cross product.
-          if (uHasNormal > 0.5) {
-            vec3 east = normalize(cross(vec3(0.0, 1.0, 0.0), n));
-            vec3 north = cross(n, east);
-            vec3 nm = texture2D(uNormalMap, vUv).xyz * 2.0 - 1.0;
-            // Damped: the 2048 map is aggressive at globe scale and full
-            // strength makes coastlines look like mountain ranges.
-            n = normalize(n + (east * nm.x + north * nm.y) * 0.35);
-          }
-
-          float lambert = dot(n, normalize(uSunDir));
-
-          // Soft terminator. A hard step produces a jagged day/night edge that
-          // crawls with the texture filtering; smoothstep over ~0.2 of the dot
-          // range is about the width of real atmospheric scattering.
-          float dayAmt = smoothstep(-0.12, 0.18, lambert);
-
-          vec3 dayCol = uHasDay > 0.5
-            ? texture2D(uDayMap, vUv).rgb
-            : vec3(0.06, 0.12, 0.22);   // flat ocean tone before the map lands
-
-          // Night side: city lights, additive so they glow rather than washing
-          // the surface out.
-          vec3 nightCol = uHasNight > 0.5
-            ? texture2D(uNightMap, vUv).rgb * 1.35
-            : vec3(0.0);
-
-          // Day surface with a gentle ambient floor so the dark side is not
-          // pure black -- earthshine, and it keeps the silhouette readable.
-          vec3 lit = dayCol * (0.06 + 0.94 * max(0.0, lambert));
-
-          vec3 col = mix(nightCol, lit, dayAmt);
-
-          // Specular on water only. The specular map is bright where water is,
-          // which is exactly the mask we want.
-          if (uHasSpec > 0.5) {
-            float gloss = texture2D(uSpecMap, vUv).r;
-            vec3 h = normalize(normalize(uSunDir) + normalize(vViewDir));
-            float spec = pow(max(0.0, dot(n, h)), 48.0) * gloss;
-            col += vec3(0.55, 0.68, 0.85) * spec * dayAmt * 0.6;
-          }
-
-          // Fresnel rim: a cool limb brightening that reads as atmosphere
-          // depth at the edge of the disc.
-          float fres = pow(1.0 - max(0.0, dot(n, normalize(vViewDir))), 3.0);
-          col += vec3(0.20, 0.45, 0.75) * fres * (0.25 + 0.55 * dayAmt);
-
-          gl_FragColor = vec4(col, 1.0);
-        }
-      `,
-    });
-
-    // 96 segments is where the silhouette stops showing facets at the closest
-    // allowed zoom (1.15 R). Beyond that the extra triangles buy nothing.
-    const geo = new THREE.SphereGeometry(GLOBE_RADIUS, 96, 64);
-    const mesh = new THREE.Mesh(geo, material);
-    mesh.renderOrder = 0;
-    return mesh;
-  }
-
-  /**
-   * Soft atmosphere shell. A back-face-rendered sphere slightly larger than the
-   * globe, with an inverse-fresnel alpha -- brightest at the limb, invisible
-   * face-on, which is what a thin scattering shell actually looks like.
-   */
-  function buildAtmosphere(): THREE.Mesh {
-    const material = new THREE.ShaderMaterial({
-      transparent: true,
-      // BackSide + no depth write: the shell must never occlude the globe or
-      // the swarm flying inside it.
-      side: THREE.BackSide,
-      depthWrite: false,
-      blending: THREE.AdditiveBlending,
-      uniforms: { uSunDir: { value: SUN_DIR.clone() } },
-      vertexShader: /* glsl */ `
-        precision highp float;
-        varying vec3 vNormalW;
-        varying vec3 vViewDir;
-        void main() {
-          vNormalW = normalize(mat3(modelMatrix) * normal);
-          vec4 wp = modelMatrix * vec4(position, 1.0);
-          vViewDir = normalize(cameraPosition - wp.xyz);
-          gl_Position = projectionMatrix * viewMatrix * wp;
-        }
-      `,
-      fragmentShader: /* glsl */ `
-        precision highp float;
-        uniform vec3 uSunDir;
-        varying vec3 vNormalW;
-        varying vec3 vViewDir;
-        void main() {
-          // Back faces, so the geometric normal points away from the camera --
-          // negate to get the outward-facing one the fresnel expects.
-          vec3 n = normalize(-vNormalW);
-          float rim = pow(1.0 - max(0.0, dot(n, normalize(vViewDir))), 2.4);
-
-          // Only the sunlit limb scatters; the night limb stays dark or the
-          // globe ends up with a halo all the way around.
-          float sun = smoothstep(-0.35, 0.5, dot(n, normalize(uSunDir)));
-
-          vec3 col = mix(vec3(0.16, 0.36, 0.72), vec3(0.45, 0.70, 1.0), rim);
-          gl_FragColor = vec4(col, rim * sun * 0.55);
-        }
-      `,
-    });
-
-    const geo = new THREE.SphereGeometry(GLOBE_RADIUS * 1.035, 64, 48);
-    const mesh = new THREE.Mesh(geo, material);
-    mesh.renderOrder = 3;
-    return mesh;
-  }
 
   /**
    * Starfield. Points on a large sphere with hash-varied brightness.
@@ -427,74 +232,6 @@ export default function createScene(): Scene {
     }
   }
 
-  /**
-   * Load the earth maps. Every load is independent and optional: a 404 logs one
-   * line and leaves that channel's `uHas*` flag at zero.
-   */
-  function loadTextures(): void {
-    const loader = new THREE.TextureLoader();
-
-    /**
-     * @param file filename under assets/earth
-     * @param apply called with the texture once it lands
-     * @param srgb true for color maps (day, lights); false for data maps
-     */
-    const load = (
-      file: string,
-      apply: (t: THREE.Texture) => void,
-      srgb: boolean,
-    ): void => {
-      loader.load(
-        TEX_BASE + file,
-        (tex) => {
-          // The scene may have been unmounted while this was in flight.
-          if (!earthUniforms) {
-            tex.dispose();
-            return;
-          }
-          // Color maps carry sRGB-encoded values; data maps (normal, specular)
-          // are linear and must NOT be decoded or the lighting goes wrong.
-          tex.colorSpace = srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
-          tex.anisotropy = 8;
-          // Equirect maps wrap in longitude and clamp in latitude.
-          tex.wrapS = THREE.RepeatWrapping;
-          tex.wrapT = THREE.ClampToEdgeWrapping;
-          loadedTextures.push(tex);
-          apply(tex);
-          console.log(`[globe] loaded ${file}`);
-        },
-        undefined,
-        () => {
-          console.warn(`[globe] texture unavailable: ${file} (globe renders without it)`);
-        },
-      );
-    };
-
-    load('earth_atmos_2048.jpg', (t) => {
-      if (!earthUniforms) return;
-      earthUniforms.uDayMap.value = t;
-      earthUniforms.uHasDay.value = 1;
-    }, true);
-
-    load('earth_lights_2048.png', (t) => {
-      if (!earthUniforms) return;
-      earthUniforms.uNightMap.value = t;
-      earthUniforms.uHasNight.value = 1;
-    }, true);
-
-    load('earth_normal_2048.jpg', (t) => {
-      if (!earthUniforms) return;
-      earthUniforms.uNormalMap.value = t;
-      earthUniforms.uHasNormal.value = 1;
-    }, false);
-
-    load('earth_specular_2048.jpg', (t) => {
-      if (!earthUniforms) return;
-      earthUniforms.uSpecMap.value = t;
-      earthUniforms.uHasSpec.value = 1;
-    }, false);
-  }
-
   return {
     mount(ctx: SceneMountContext) {
       root = document.createElement('div');
@@ -523,11 +260,15 @@ export default function createScene(): Scene {
       // ---- scene graph ----
       scene = new THREE.Scene();
       scene.add(buildStars());
-      scene.add(buildEarth());
-      scene.add(buildAtmosphere());
+
+      // Shared textured earth -- the same construction the weather scene mounts
+      // under its radar, so the two globes can never drift apart again.
+      earth = createEarth();
+      scene.add(earth.mesh);
+      scene.add(earth.atmosphere);
       buildMarkers(scene);
 
-      loadTextures();
+      earth.loadTextures();
 
       // ---- swarm ----
       swarm = createDartSwarm({ capacity: SWARM_CAPACITY });
@@ -549,6 +290,9 @@ export default function createScene(): Scene {
     unmount() {
       if (rig) rig.dispose();
       if (swarm) swarm.dispose();
+      // Releases the earth's textures, geometry and materials, and nulls its
+      // uniform handle so any texture still in flight disposes itself.
+      if (earth) earth.dispose();
 
       // Walk the graph and release every GPU resource. Leaving this to the GC
       // means WebGL contexts and their buffers survive scene changes, and a few
@@ -569,9 +313,6 @@ export default function createScene(): Scene {
         scene.clear();
       }
 
-      for (const tex of loadedTextures) tex.dispose();
-      loadedTextures.length = 0;
-
       if (renderer) {
         renderer.dispose();
         // forceContextLoss releases the GPU context immediately instead of
@@ -589,7 +330,7 @@ export default function createScene(): Scene {
       scene = null;
       rig = null;
       swarm = null;
-      earthUniforms = null;
+      earth = null;
       markers.length = 0;
       sawEngineData = false;
       lastState = null;

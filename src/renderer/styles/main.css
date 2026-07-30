@@ -254,8 +254,16 @@ button {
 
 /* The indicator is a single absolutely-positioned pill that springs between
    items -- one animated element instead of N cross-fading backgrounds. */
+/* top:0 is load-bearing. Without it the indicator has `top:auto` and resolves
+   to its STATIC position -- i.e. wherever it lands in the nav's flex flow,
+   which is after the items -- while positionIndicator() translates it by the
+   item's offsetTop measured from the nav's padding box. The two origins differ
+   by the nav's padding plus the flow offset, so the pill sat low/high of the
+   item it was marking. Anchoring it at the top makes translateY(offsetTop)
+   exact for every item at every window size. */
 .nav-indicator {
   position: absolute;
+  top: 0;
   left: 10px;
   right: 10px;
   height: 0;
@@ -374,11 +382,16 @@ button {
    Segmented control (backend matrix)
    ------------------------------------------------------------------- */
 
+/* Three equal columns that are allowed to be NARROWER than their text.
+   grid-auto-columns:1fr looks equal but its automatic minimum is min-content,
+   so three nowrap labels ("Composite" / "Native vsync" / "Native unlocked")
+   forced the track wider than the sidebar and the row broke out of its row --
+   Compute and Raster have short labels and happened to fit, which is why only
+   Present looked wrong. minmax(0, 1fr) lets the cells shrink and ellipsize. */
 .segmented {
   position: relative;
   display: grid;
-  grid-auto-flow: column;
-  grid-auto-columns: 1fr;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 2px;
   padding: 2px;
   background: rgba(0, 0, 0, 0.34);

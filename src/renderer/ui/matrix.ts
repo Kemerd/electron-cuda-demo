@@ -29,6 +29,11 @@ type ControlKey = keyof ModeState;
 interface ControlOption {
   readonly value: ModeState[ControlKey];
   readonly label: string;
+  /**
+   * Full wording, when the visible label is abbreviated to keep three cells on
+   * one row. Shown as the cell's title so the meaning is still reachable.
+   */
+  readonly full?: string;
   /** Paints the cell with the CUDA accent. */
   readonly cuda?: boolean;
 }
@@ -62,10 +67,12 @@ const CONTROLS: readonly ControlDef[] = Object.freeze([
   {
     key: 'present',
     label: 'Present',
+    // Short labels so all three fit one row at the sidebar's width; the full
+    // wording rides the title attribute.
     options: [
-      { value: PRESENT.COMPOSITE, label: 'Composite' },
-      { value: PRESENT.NATIVE_VSYNC, label: 'Native vsync', cuda: true },
-      { value: PRESENT.NATIVE_UNLOCKED, label: 'Native unlocked', cuda: true },
+      { value: PRESENT.COMPOSITE, label: 'Composite', full: 'Composite (normal Chromium compositing)' },
+      { value: PRESENT.NATIVE_VSYNC, label: 'Native', full: 'Native vsync (D3D11 child window, vsync on)', cuda: true },
+      { value: PRESENT.NATIVE_UNLOCKED, label: 'Unlocked', full: 'Native unlocked (D3D11 child window, tearing allowed)', cuda: true },
     ],
   },
 ] as const);
@@ -297,6 +304,9 @@ export function createMatrix(host: HTMLElement | null, opts?: MatrixOptions | nu
       btn.type = 'button';
       btn.className = `segment${option.cuda ? ' cuda' : ''}`;
       btn.textContent = option.label;
+      // Abbreviated cells keep their full wording as a native tooltip. The
+      // disabled-reason tooltip is a separate element, so the two never fight.
+      if (option.full) btn.title = option.full;
       btn.dataset.value = option.value;
       btn.setAttribute('role', 'radio');
       btn.setAttribute('aria-checked', 'false');

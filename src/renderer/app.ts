@@ -630,6 +630,10 @@ function onSourceEntities(f: EntityFrame): void {
   if (ui.overlay) {
     ui.overlay.setCount(f.count);
     if (f.timings) ui.overlay.setTimings(f.timings);
+    // One delivered batch is one completed sim step. Counted here rather than
+    // where the REQ goes out, because a request that is still in flight has not
+    // simulated anything yet -- that distinction IS the CPU baseline's story.
+    ui.overlay.pushSimStep();
   }
 
   // The CUDA link verdict is driven by real records arriving on the CUDA path.
@@ -677,6 +681,9 @@ function onSourceRgba(f: RgbaFrame): void {
     // the honest "what did it take to put this on screen" number.
     ui.overlay.setTimings({ simMs: f.simMs, copyMs: f.copyMs });
     ui.overlay.setDrawMs(f.renderMs + uploadMs);
+    // A rastered frame advanced the sim too (renderFrame does both), so it
+    // counts as a step exactly as an entity batch does.
+    ui.overlay.pushSimStep();
   }
 
   // A rastered frame is proof of a live link exactly as an entity batch is --

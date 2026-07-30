@@ -41,6 +41,15 @@ export interface FpsOverlayApi {
   setDrawMs(value: number): void;
   /** Record count from the last entity frame. */
   setCount(n: number): void;
+  /**
+   * Mark that the compute backend delivered one simulation step.
+   *
+   * Presentation rate and simulation rate are different numbers and conflating
+   * them is how a 158 ms/step CPU baseline reads as "240 fps". The render loop
+   * runs at the monitor's refresh whatever the backend is doing; this counts the
+   * steps that actually came back, so a slow backend is visibly slow.
+   */
+  pushSimStep(): void;
   /** Per-frame update. @param nowMs performance.now() from the frame loop */
   tick(nowMs: number): void;
 }
@@ -59,6 +68,7 @@ export function createFpsOverlay(host: HTMLElement | null): FpsOverlayApi {
       setTimings() {},
       setDrawMs() {},
       setCount() {},
+      pushSimStep() {},
       tick() {},
     };
   }
@@ -70,11 +80,27 @@ export function createFpsOverlay(host: HTMLElement | null): FpsOverlayApi {
   let ringHead = 0; // next write index
   let ringCount = 0; // valid samples, saturating at SAMPLES
 
-  // Rolling FPS is computed from a windowed mean rather than 1000/lastFrame:
-  // instantaneous FPS from a single frame flickers by tens of Hz.
-  let fpsAccumMs = 0;
-  let fpsAccumFrames = 0;
+  /**
+   * Render-rate accounting.
+   *
+   * Frames are counted against REAL elapsed wall-clock time between readouts,
+   * not against the sum of the (clamped) frame samples. Summing samples makes
+   * the divisor drift away from the true window as soon as any sample is
+   * clamped, which biases the rate; measuring the window directly cannot.
+   */
+  let renderFrames = 0;
+  let renderWindowStartMs = 0;
   let displayFps = 0;
+
+  /**
+   * Simulation-rate accounting, counted the same way over the same window.
+   * A backend that returns one step per 158 ms shows ~6 steps/s here while the
+   * presentation loop above happily reports the monitor's refresh rate.
+   */
+  let simSteps = 0;
+  let displaySimHz = 0;
+  /** ms per step, derived from the measured rate -- the cost of one step. */
+  let displayStepMs = 0;
 
   // Latest engine timings. Held as plain numbers, never an object we replace.
   let simMs = 0;
@@ -97,7 +123,14 @@ export function createFpsOverlay(host: HTMLElement | null): FpsOverlayApi {
 
   const fpsUnit = document.createElement('span');
   fpsUnit.className = 'fps-unit';
-  fpsUnit.textContent = 'fps';
+  // Labelled RENDER, not "fps": this is presentation rate and it is pinned to
+  // the display's refresh in every mode. The number that says whether the
+  // compute backend is keeping up is the sim rate below.
+  fpsUnit.textContent = 'render fps';
+  fpsUnit.title =
+    'Presentation rate (requestAnimationFrame). Capped by the monitor refresh ' +
+    'rate regardless of which compute backend is selected -- compare backends ' +
+    'with the sim rate, not this number.';
 
   head.append(fpsValue, fpsUnit);
 
@@ -132,6 +165,15 @@ export function createFpsOverlay(host: HTMLElement | null): FpsOverlayApi {
 
   const p50El = makeStat('p50');
   const p99El = makeStat('p99');
+
+  const dividerSim = document.createElement('div');
+  dividerSim.className = 'stat-divider';
+  stats.appendChild(dividerSim);
+
+  // The honest backend comparison lives in these two cells: how many steps the
+  // sim actually completed per second, and what one step cost.
+  const simRateEl = makeStat('sim rate', 'accent');
+  const stepMsEl = makeStat('per step', 'accent');
 
   const divider = document.createElement('div');
   divider.className = 'stat-divider';
@@ -285,8 +327,9 @@ export function createFpsOverlay(host: HTMLElement | null): FpsOverlayApi {
       ringHead = (ringHead + 1) % SAMPLES;
       if (ringCount < SAMPLES) ringCount++;
 
-      fpsAccumMs += v;
-      fpsAccumFrames++;
+      // Only the count is accumulated; the divisor is real elapsed time, read
+      // in tick(). See the renderFrames declaration for why.
+      renderFrames++;
     },
 
     setTimings(t) {
@@ -305,6 +348,10 @@ export function createFpsOverlay(host: HTMLElement | null): FpsOverlayApi {
       if (Number.isFinite(n) && n >= 0) entityCount = n;
     },
 
+    pushSimStep() {
+      simSteps++;
+    },
+
     /**
      * Draws the sparkline every call; refreshes the text and percentiles on the
      * slower cadence.
@@ -313,16 +360,41 @@ export function createFpsOverlay(host: HTMLElement | null): FpsOverlayApi {
       drawSpark();
 
       if (!Number.isFinite(nowMs)) return;
+
+      // Seed the window on the first tick so the first readout divides by a
+      // real interval instead of by zero.
+      if (renderWindowStartMs === 0) {
+        renderWindowStartMs = nowMs;
+        lastReadoutMs = nowMs;
+        return;
+      }
+
       if (nowMs - lastReadoutMs < READOUT_INTERVAL_MS) return;
       lastReadoutMs = nowMs;
 
-      if (fpsAccumFrames > 0 && fpsAccumMs > 0) {
-        displayFps = (fpsAccumFrames * 1000) / fpsAccumMs;
-        fpsAccumMs = 0;
-        fpsAccumFrames = 0;
+      // One measured window drives BOTH rates, so render fps and sim rate are
+      // directly comparable -- they are counts over the identical interval.
+      const windowMs = nowMs - renderWindowStartMs;
+      if (windowMs > 0) {
+        displayFps = (renderFrames * 1000) / windowMs;
+        displaySimHz = (simSteps * 1000) / windowMs;
+        // Cost of one step, inverted from the rate. Reporting this rather than
+        // the engine's self-reported simMs makes a backend that is merely SLOW
+        // to answer look slow, which self-reported kernel time never does.
+        displayStepMs = displaySimHz > 0 ? 1000 / displaySimHz : 0;
       }
+      renderFrames = 0;
+      simSteps = 0;
+      renderWindowStartMs = nowMs;
 
       setText(fpsValue, displayFps > 0 ? String(Math.round(displayFps)) : '--');
+      setText(
+        simRateEl,
+        displaySimHz > 0
+          ? `${displaySimHz >= 10 ? displaySimHz.toFixed(0) : displaySimHz.toFixed(1)}/s`
+          : '--',
+      );
+      setText(stepMsEl, `${ms(displayStepMs)} ms`);
       setText(p50El, `${ms(percentile(0.5))} ms`);
       setText(p99El, `${ms(percentile(0.99))} ms`);
       setText(simEl, `${ms(simMs)} ms`);
