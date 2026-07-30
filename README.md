@@ -118,12 +118,31 @@ Benchmarks you can't trust are decoration. Ground rules here:
 - **The blit path (mode 5) is deliberately wasteful** — pixels leave the GPU and come straight back so Chromium can composite them. It exists so mode 6 has something to embarrass.
 - **WebGPU is genuinely good.** On memory-bandwidth-bound advection it lands close to CUDA. The gap opens on workloads that want warp-level intrinsics and fine-grained memory control — the numbers show where, not adjectives.
 
+## Testing
+
+Performance claims deserve the same rigor as correctness claims, so the repo ships a layered, automated pipeline:
+
+```bash
+npm test               # everything below, in order
+npm run test:unit      # protocol invariants, mode legality, math — plain node:test, no GPU needed
+npm run test:native    # addon suite under Electron's ABI: format/bounds/determinism checks on real kernels
+npm run test:smoke     # full app launch, capability probe, one end-to-end frame through the pump
+```
+
+- **Unit** — the shared protocol is the contract everything hangs off, so it's tested exhaustively: matrix legality (every cell, both directions), buffer stride math, coordinate conversions, preset sanity.
+- **Native** — runs inside Electron (a Node-built addon wouldn't even load — the ABI is the point): device probe, every API's argument validation, entity records land inside the flight shell, RGBA output is well-formed, sim steps are deterministic for a fixed seed + input stream, timings are sane.
+- **Smoke** — `electron . --smoke-test` boots the real app headless, gathers capabilities, pushes a frame end-to-end, and exits with a machine-readable verdict. One command, no excuses.
+- **CI** — GitHub Actions on Windows: full CUDA compile (the toolkit installs fine on runners; kernels compile without a GPU) + unit suite on every push. GPU-dependent suites run on real hardware and publish their numbers to the benchmark table above.
+
 ## Layout
 
 ```
 native/          CUDA addon: CMakeLists, Node-API surface, kernels, D3D11 presenter
+  test/          addon test suite (runs under Electron)
 src/main/        Electron main: window, capabilities, frame pump, preload
 src/renderer/    UI, scenes, WGSL compute, WebGL/WebGPU drawing, benchmark runner
 src/shared/      protocol.js — every constant and message shape, single source of truth
+test/            unit suite (node:test)
 docs/            engineering contracts
+.github/         CI: compile + unit gates on every push
 ```
