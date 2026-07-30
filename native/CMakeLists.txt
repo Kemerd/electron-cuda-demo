@@ -70,6 +70,7 @@ set(SOURCES
     src/addon.cc
     src/engine.cc
     src/native_view.cc
+    src/kernels/scene_state.cc
     src/kernels/swarm.cu
     src/kernels/weather.cu
     src/kernels/storm.cu

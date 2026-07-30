@@ -1,6 +1,6 @@
 /**
  * @file weather.cu
- * @brief Equirectangular weather field generation.
+ * @brief Equirectangular weather solver and the 3D density volume it feeds.
  *
  * Texel layout (protocol.js, FIELD_CHANNELS = 4, RGBA8):
  *   R = wind u   (-1..1 mapped to 0..255)
@@ -10,103 +10,579 @@
  *
  * Grid is equirectangular with W = 2*H, x spanning longitude -180..180 and y
  * spanning latitude +90..-90 (row 0 is the north pole - standard image
- * orientation, so the renderer can bind it as a texture with no flip).
+ * orientation, so the renderer binds it as a texture with no flip).
  *
- * Infrastructure stage: the field is an animated analytic pattern - banded
- * zonal flow plus a couple of travelling waves. Every channel is in range and
- * correctly encoded, so the texture upload, the readback path and the
- * renderer's sampling can all be validated before the real advection solver
- * lands in WeatherStepKernel.
+ * Solver
+ * ------
+ *   Wind        = analytic curl of a layered gradient-noise stream function
+ *                 (divergence-free by construction) + a set of drifting vortex
+ *                 systems that supply the large-scale cyclone structure.
+ *   Density     = semi-Lagrangian advection along that wind, plus injection at
+ *                 the vortex cores, minus a gentle dissipation.
+ *   Temperature = slow large-scale noise with a latitude baseline.
+ *
+ * Semi-Lagrangian is the right choice here specifically because it is
+ * unconditionally stable: the field survives a 100 ms frame (the protocol's dt
+ * ceiling) without the CFL blowup a forward-Euler advection would produce, and
+ * it needs exactly one texture read per texel instead of a scatter.
+ *
+ * Double buffering
+ * ----------------
+ * Advection reads a neighbourhood and writes one texel, so it cannot run in
+ * place - a texel already updated this frame would be read as if it were last
+ * frame's value. The solver keeps a private float density/temperature pair of
+ * buffers and ping-pongs them, then packs the result into the RGBA8 field the
+ * protocol specifies. Float working buffers rather than round-tripping through
+ * RGBA8 every frame: eight bits of density quantised twice per frame visibly
+ * banded the advection trails.
  */
+
+#include <cstdio>
 
 #include "../engine.h"
 #include "common.cuh"
+#include "noise.cuh"
+#include "scene_state.h"
 
 namespace geoswarm {
 
 namespace {
 
-/** Latitude of the mid-latitude jet cores, in radians. Two bands, one per
- *  hemisphere, mirroring the real circulation the production solver targets. */
-constexpr float kJetLat = 0.6981317f;  // 40 degrees
+/* ===================================================================== *
+ *  Tunables
+ * ===================================================================== */
 
-/** Width of the jet in radians of latitude. */
-constexpr float kJetWidth = 0.2617994f;  // 15 degrees
+/** Vortex systems driving the cyclone structure. Twelve is enough to keep both
+ *  hemispheres populated without any single one dominating the frame. */
+constexpr int kVortexCount = 12;
+
+/** Base angular drift rate of a vortex centre, radians/second. Slow: a storm
+ *  system that crosses an ocean in ten seconds reads as noise, not weather. */
+constexpr float kVortexDrift = 0.012f;
+
+/** How strongly the vortex set contributes to the wind, relative to the noise. */
+constexpr float kVortexWeight = 0.85f;
+
+/** Curl-noise contribution and its spatial frequency on the sphere. */
+constexpr float kNoiseWindWeight = 0.55f;
+constexpr float kNoiseWindScale = 2.4f;
+
+/** Density injected per second at a vortex core. */
+constexpr float kDensitySource = 0.85f;
+
+/** Fraction of density lost per second to dissipation. Balances the sources so
+ *  the global mean settles instead of saturating at 1.0 everywhere. */
+constexpr float kDensityDecay = 0.22f;
+
+/** Advection speed scale: wind is in -1..1 field units, this converts to
+ *  radians of arc per second. */
+constexpr float kAdvectScale = 0.10f;
+
+/** Latitude of the mid-latitude jet cores, radians (40 degrees), and the jet
+ *  half-width. Gives the field its zonal banding under the vortices. */
+constexpr float kJetLat = 0.6981317f;
+constexpr float kJetWidth = 0.2617994f;
+
+/** Volume extrusion: the shell the 2D density is lofted into, as a fraction of
+ *  the volume's half-extent. Matches the raster's march range. */
+constexpr float kVolumeInner = GS_GLOBE_RADIUS;
+constexpr float kVolumeOuter = GS_ALTITUDE_MAX * 1.5f;
+
+/** Half-extent of the cube the density volume covers, world units. Sized to
+ *  just contain kVolumeOuter so no resolution is wasted on empty corners. */
+constexpr float kVolumeHalfExtent = kVolumeOuter;
+
+/* ===================================================================== *
+ *  Vortex systems
+ * ===================================================================== */
 
 /**
- * @brief Generate one field texel.
+ * @brief One cyclone, evaluated analytically from its index and the clock.
  *
- * Split out so the raster kernel can eventually sample the same function
- * without a round trip through memory.
+ * Nothing is stored: positions, strengths and radii are all hashes of the
+ * index, and the migration is a closed-form function of time. That means the
+ * vortex set costs zero memory and zero setup, and it is identical on every
+ * run - which matters for a benchmark that has to be comparable frame to frame.
  */
-__device__ __forceinline__ void EvalWeather(float lonRad, float latRad, float t,
-                                            float* u, float* v, float* density, float* temp) {
-  // Zonal (east-west) flow: westerlies in the mid-latitudes, easterlies at the
-  // equator and poles. Two gaussians against a weak background.
-  const float dN = (latRad - kJetLat) / kJetWidth;
-  const float dS = (latRad + kJetLat) / kJetWidth;
-  const float jet = expf(-dN * dN) + expf(-dS * dS);
-  float zonal = jet * 0.9f - 0.25f * cosf(latRad * 2.0f);
+struct Vortex {
+  float3 axis;    ///< unit vector to the vortex centre on the sphere
+  float strength; ///< signed rotation rate; sign sets the hemisphere spin
+  float radius;   ///< angular radius in radians
+};
 
-  // Travelling planetary waves - two wavenumbers drifting at different rates,
-  // which is what keeps the pattern from looking like a repeating loop.
-  const float wave1 = sinf(lonRad * 4.0f - t * 0.25f + latRad * 1.7f);
-  const float wave2 = sinf(lonRad * 7.0f + t * 0.13f - latRad * 2.3f);
+/**
+ * @brief Build vortex @p k at time @p t.
+ *
+ * The centre migrates along a great circle whose pole is a second hashed axis,
+ * which produces a curved track rather than a straight latitude line - closer
+ * to how real systems move, and it keeps the vortices from all drifting into a
+ * single band.
+ */
+__device__ __forceinline__ Vortex MakeVortex(int k, float t) {
+  const unsigned int idx = static_cast<unsigned int>(k);
 
-  // Meridional (north-south) component comes from the waves only; a net
-  // pole-ward drift would drain one hemisphere over time.
-  float merid = 0.35f * wave1 + 0.18f * wave2;
+  // Seed position, uniform on the sphere.
+  const float u = gsRandRange(idx, 0x101u, -0.85f, 0.85f);  // avoid the poles
+  const float phi = gsRandRange(idx, 0x202u, 0.0f, 6.2831853f);
+  const float s = sqrtf(fmaxf(0.0f, 1.0f - u * u));
+  const float3 seed = gsMake(s * cosf(phi), u, s * sinf(phi));
 
-  // Fade both components to zero at the poles: the equirect grid crowds
-  // infinitely many texels into the pole rows and any residual flow there
-  // reads as a pinwheel artifact.
-  const float poleFade = cosf(latRad);
-  zonal *= poleFade;
-  merid *= poleFade * poleFade;
+  // Migration pole: a second hashed axis the centre rotates about.
+  const float pu = gsRandRange(idx, 0x303u, -1.0f, 1.0f);
+  const float pphi = gsRandRange(idx, 0x404u, 0.0f, 6.2831853f);
+  const float ps = sqrtf(fmaxf(0.0f, 1.0f - pu * pu));
+  const float3 pole = gsNormalize(gsMake(ps * cosf(pphi), pu, ps * sinf(pphi)));
 
-  *u = gsClampf(zonal, -1.0f, 1.0f);
-  *v = gsClampf(merid, -1.0f, 1.0f);
+  // Rodrigues rotation of the seed about the pole by the accumulated angle.
+  const float rate = gsRandRange(idx, 0x505u, 0.5f, 1.8f) * kVortexDrift;
+  const float ang = t * rate;
+  const float ca = cosf(ang);
+  const float sa = sinf(ang);
+  const float3 axis = gsNormalize(
+      gsAdd(gsAdd(gsScale(seed, ca), gsScale(gsCross(pole, seed), sa)),
+            gsScale(pole, gsDot(pole, seed) * (1.0f - ca))));
 
-  // Density: cloud-like banding driven by the same waves plus the shared
-  // swirl field, biased toward the ITCZ and the storm tracks.
-  const float3 sphere = gsMake(cosf(latRad) * sinf(lonRad), sinf(latRad),
-                               cosf(latRad) * cosf(lonRad));
-  const float swirl = gsSwirl(gsScale(sphere, 2.5f), t * 0.35f);
-  float d = 0.42f + 0.30f * swirl + 0.20f * wave1 * poleFade;
-  d += 0.18f * expf(-(latRad * latRad) / 0.02f);  // equatorial convergence band
-  *density = gsClampf(d, 0.0f, 1.0f);
-
-  // Temperature: cosine of latitude is the dominant term, with a small
-  // wave-driven anomaly and a slow diurnal-ish sweep in longitude.
-  float tempK = 0.5f + 0.5f * cosf(latRad) * cosf(latRad);
-  tempK += 0.06f * sinf(lonRad - t * 0.08f) * poleFade;
-  tempK -= 0.10f * (*density);  // thick cloud reads cooler
-  *temp = gsClampf(tempK, 0.0f, 1.0f);
+  Vortex v;
+  v.axis = axis;
+  // Northern systems spin one way, southern the other - the Coriolis signature
+  // that makes a weather map read as a weather map.
+  v.strength = gsRandRange(idx, 0x606u, 0.55f, 1.35f) * ((axis.y >= 0.0f) ? 1.0f : -1.0f);
+  v.radius = gsRandRange(idx, 0x707u, 0.22f, 0.55f);
+  // Slow strength pulsing so systems visibly deepen and fill.
+  v.strength *= 0.7f + 0.3f * sinf(t * gsRandRange(idx, 0x808u, 0.05f, 0.16f) +
+                                   gsRandRange(idx, 0x909u, 0.0f, 6.2831853f));
+  return v;
 }
 
 /**
- * @brief Fill the RGBA8 equirect field.
+ * @brief Accumulated tangential wind at a point from every vortex system.
  *
- * One thread per texel, 16x16 tiles. Writes are coalesced within a row because
- * consecutive threadIdx.x land on consecutive texels.
+ * Each vortex contributes a rotation about its own axis, falling off with
+ * angular distance from its centre. The falloff is a smoothstep rather than a
+ * gaussian so the influence reaches exactly zero at the radius - a gaussian
+ * tail means every vortex touches every texel and the whole field becomes one
+ * smeared average.
+ *
+ * @param dir      unit direction on the sphere
+ * @param t        scene clock
+ * @param east     local east basis vector
+ * @param north    local north basis vector
+ * @param outU     receives the zonal component
+ * @param outV     receives the meridional component
+ * @param outCore  receives 0..1 core proximity, used as the density source term
  */
-__global__ void WeatherStepKernel(unsigned char* __restrict__ field, int w, int h, float t) {
+__device__ __forceinline__ void VortexWind(const float3& dir, float t, const float3& east,
+                                           const float3& north, float* outU, float* outV,
+                                           float* outCore) {
+  float3 flow = gsSplat(0.0f);
+  float core = 0.0f;
+
+  #pragma unroll 4
+  for (int k = 0; k < kVortexCount; ++k) {
+    const Vortex v = MakeVortex(k, t);
+
+    // Angular distance from the vortex centre.
+    const float cosd = gsClampf(gsDot(dir, v.axis), -1.0f, 1.0f);
+    const float dist = acosf(cosd);
+    if (dist > v.radius) continue;
+
+    // Tangential direction: perpendicular to both the centre axis and the
+    // local radial. cross(axis, dir) is exactly that, and its magnitude is
+    // sin(dist), which conveniently already vanishes at the core.
+    const float3 tangent = gsCross(v.axis, dir);
+    const float tlen2 = gsDot(tangent, tangent);
+    if (tlen2 < 1e-10f) continue;  // dead centre, no defined tangent
+
+    // Rankine-like profile: solid-body rotation inside the core, decaying
+    // outside. Peak speed sits at roughly a third of the radius, which is where
+    // a real cyclone's eyewall is.
+    const float rn = dist / v.radius;
+    const float profile = rn * expf(1.0f - rn * 3.0f) * 1.6f;
+    const float envelope = gsSmoothstep(1.0f, 0.75f, rn);
+
+    flow = gsAdd(flow, gsScale(gsScale(tangent, gsRsqrt(tlen2)),
+                               v.strength * profile * envelope));
+
+    // Core proximity for the density source. Tight so the injection happens in
+    // the eyewall, not across the whole system.
+    core += gsSmoothstep(0.45f, 0.0f, rn) * fabsf(v.strength);
+  }
+
+  *outU = gsDot(flow, east) * kVortexWeight;
+  *outV = gsDot(flow, north) * kVortexWeight;
+  *outCore = gsClampf(core, 0.0f, 1.0f);
+}
+
+/**
+ * @brief Full wind evaluation at a direction: vortices + curl noise + jets.
+ *
+ * @param dir     unit direction on the sphere
+ * @param t       scene clock
+ * @param latRad  latitude, passed in because the caller already has it
+ * @param outU    receives the zonal (east) component, -1..1
+ * @param outV    receives the meridional (north) component, -1..1
+ * @param outCore receives the vortex core proximity for density injection
+ */
+__device__ __forceinline__ void EvalWind(const float3& dir, float t, float latRad, float* outU,
+                                         float* outV, float* outCore) {
+  // Local tangent basis. gsNormalize's degenerate guard handles the poles,
+  // where east is undefined.
+  const float3 east = gsNormalize(gsCross(gsMake(0.0f, 1.0f, 0.0f), dir));
+  const float3 north = gsCross(dir, east);
+
+  /* --- vortex systems ------------------------------------------------ */
+  float vu, vv, core;
+  VortexWind(dir, t, east, north, &vu, &vv, &core);
+
+  /* --- curl of a noise stream function -------------------------------- */
+  // Sampling the stream function in 3D on the sphere (rather than in the 2D
+  // equirect parameter space) is what makes it seamless in longitude and
+  // artifact-free at the poles - there is no parameterisation to tear.
+  const float3 q = gsScale(dir, kNoiseWindScale);
+  const float3 curl = gsCurlNoise3(gsMake(q.x, q.y, q.z + t * 0.05f), 3, 0xC10Du);
+  // Project onto the tangent plane; a radial component is meaningless for a
+  // surface wind field.
+  const float3 tangentCurl = gsSub(curl, gsScale(dir, gsDot(curl, dir)));
+  const float nu = gsDot(tangentCurl, east) * kNoiseWindWeight;
+  const float nv = gsDot(tangentCurl, north) * kNoiseWindWeight;
+
+  /* --- zonal jets ------------------------------------------------------ */
+  const float dN = (latRad - kJetLat) / kJetWidth;
+  const float dS = (latRad + kJetLat) / kJetWidth;
+  const float jet = (expf(-dN * dN) + expf(-dS * dS)) * 0.55f - 0.18f * cosf(latRad * 2.0f);
+
+  // Fade everything toward the poles. The equirect grid crowds infinitely many
+  // texels into the pole rows, and residual flow there reads as a pinwheel.
+  const float poleFade = cosf(latRad);
+
+  *outU = gsClampf((vu + nu + jet) * poleFade, -1.0f, 1.0f);
+  *outV = gsClampf((vv + nv) * poleFade * poleFade, -1.0f, 1.0f);
+  *outCore = core * poleFade;
+}
+
+/* ===================================================================== *
+ *  Equirect <-> sphere helpers
+ * ===================================================================== */
+
+/** @brief Texel centre -> unit direction. Row 0 is the north pole. */
+__device__ __forceinline__ float3 TexelToDir(int x, int y, int w, int h, float* outLon,
+                                             float* outLat) {
+  const float lon = ((x + 0.5f) / static_cast<float>(w)) * 6.2831853f - 3.1415927f;
+  const float lat = 1.5707963f - ((y + 0.5f) / static_cast<float>(h)) * 3.1415927f;
+  if (outLon) *outLon = lon;
+  if (outLat) *outLat = lat;
+  const float cl = cosf(lat);
+  return gsMake(cl * sinf(lon), sinf(lat), cl * cosf(lon));
+}
+
+/**
+ * @brief Bilinear sample of a float scalar field on the equirect grid.
+ *
+ * Wraps in longitude, clamps in latitude - the same convention the wind
+ * sampler in swarm.cu uses, so the two agree at the seam.
+ */
+__device__ __forceinline__ float SampleScalar(const float* __restrict__ src, int w, int h,
+                                              float fx, float fy) {
+  const int x0 = static_cast<int>(floorf(fx));
+  const int y0 = static_cast<int>(floorf(fy));
+  const float tx = fx - static_cast<float>(x0);
+  const float ty = fy - static_cast<float>(y0);
+
+  const int xa = ((x0 % w) + w) % w;
+  const int xb = (((x0 + 1) % w) + w) % w;
+  const int ya = min(max(y0, 0), h - 1);
+  const int yb = min(max(y0 + 1, 0), h - 1);
+
+  const float s00 = src[static_cast<size_t>(ya) * w + xa];
+  const float s10 = src[static_cast<size_t>(ya) * w + xb];
+  const float s01 = src[static_cast<size_t>(yb) * w + xa];
+  const float s11 = src[static_cast<size_t>(yb) * w + xb];
+
+  return gsLerpf(gsLerpf(s00, s10, tx), gsLerpf(s01, s11, tx), ty);
+}
+
+/* ===================================================================== *
+ *  Initialisation
+ * ===================================================================== */
+
+/**
+ * @brief Seed the density/temperature working buffers.
+ *
+ * A cold start from zero density takes several seconds of simulated time to
+ * fill in from the sources alone, and the first frames would show an empty
+ * planet. Seeding from the same noise the solver uses gets a plausible field on
+ * frame one.
+ */
+__global__ void WeatherSeedKernel(float* __restrict__ density, float* __restrict__ temperature,
+                                  int w, int h) {
+  const int x = blockIdx.x * blockDim.x + threadIdx.x;
+  const int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= w || y >= h) return;
+
+  float lon, lat;
+  const float3 dir = TexelToDir(x, y, w, h, &lon, &lat);
+
+  // Two-octave cloud base, biased toward the ITCZ.
+  const float base = gsFbm3(gsScale(dir, 3.2f), 4, 0xD3A5u);
+  float d = 0.34f + 0.34f * base;
+  d += 0.20f * expf(-(lat * lat) / 0.03f);  // equatorial convergence band
+
+  const size_t o = static_cast<size_t>(y) * w + x;
+  density[o] = gsClampf(d, 0.0f, 1.0f);
+
+  // Temperature baseline: cos^2 of latitude, warm equator, cold poles.
+  const float tempBase = 0.5f + 0.48f * cosf(lat) * cosf(lat);
+  temperature[o] = gsClampf(tempBase, 0.0f, 1.0f);
+}
+
+/* ===================================================================== *
+ *  Advection + packing
+ * ===================================================================== */
+
+/**
+ * @brief One solver step: advect, inject, dissipate, and pack to RGBA8.
+ *
+ * Semi-Lagrangian: for each destination texel, trace the wind BACKWARD by one
+ * timestep to find where the parcel now here came from, and sample the previous
+ * field there. Backward tracing is what makes it unconditionally stable - the
+ * departure point is always somewhere in the domain no matter how large dt is.
+ *
+ * The backtrace happens on the sphere (rotate the direction vector against the
+ * wind) rather than in equirect texel space. Tracing in texel space would move
+ * parcels near the poles far too slowly in longitude, since a texel there
+ * covers a tiny arc.
+ *
+ * @param dstDensity,dstTemp  destination working buffers
+ * @param srcDensity,srcTemp  previous frame's working buffers
+ * @param field               RGBA8 output, protocol layout
+ * @param w,h                 grid dimensions, w == 2*h
+ * @param dtSec               timestep
+ * @param t                   scene clock
+ */
+__global__ __launch_bounds__(GS_TILE_X * GS_TILE_Y)
+void WeatherStepKernel(float* __restrict__ dstDensity, float* __restrict__ dstTemp,
+                       const float* __restrict__ srcDensity, const float* __restrict__ srcTemp,
+                       unsigned char* __restrict__ field, int w, int h, float dtSec, float t) {
   const int x = blockIdx.x * blockDim.x + threadIdx.x;
   const int y = blockIdx.y * blockDim.y + threadIdx.y;
   if (x >= w || y >= h) return;  // bounds guard for the rounded-up grid
 
-  // Sample at texel centres so the wrap at +-180 longitude is seamless.
-  const float lonRad = ((x + 0.5f) / static_cast<float>(w)) * 6.2831853f - 3.1415927f;
-  const float latRad = 1.5707963f - ((y + 0.5f) / static_cast<float>(h)) * 3.1415927f;
+  float lon, lat;
+  const float3 dir = TexelToDir(x, y, w, h, &lon, &lat);
 
-  float u, v, density, temp;
-  EvalWeather(lonRad, latRad, t, &u, &v, &density, &temp);
+  /* --- wind at this texel --------------------------------------------- */
+  float u, v, core;
+  EvalWind(dir, t, lat, &u, &v, &core);
 
-  const size_t o = (static_cast<size_t>(y) * w + x) * GS_RGBA_CHANNELS;
-  field[o + 0] = gsPackSnorm8(u);        // R: wind u, -1..1
-  field[o + 1] = gsPackSnorm8(v);        // G: wind v, -1..1
-  field[o + 2] = gsPackUnorm8(density);  // B: density, 0..1
-  field[o + 3] = gsPackUnorm8(temp);     // A: temperature, 0..1
+  /* --- semi-Lagrangian backtrace -------------------------------------- */
+  // Convert the wind into an angular displacement over dt, then walk the
+  // direction vector backward along it. For the small angles involved
+  // (kAdvectScale * dt is well under a degree), the first-order tangent step
+  // followed by a renormalize is accurate enough and avoids a full Rodrigues.
+  const float3 east = gsNormalize(gsCross(gsMake(0.0f, 1.0f, 0.0f), dir));
+  const float3 north = gsCross(dir, east);
+  const float3 step = gsAdd(gsScale(east, u), gsScale(north, v));
+  const float3 back = gsNormalize(gsSub(dir, gsScale(step, kAdvectScale * dtSec)));
+
+  // Departure point in texel coordinates.
+  const float backLat = asinf(gsClampf(back.y, -1.0f, 1.0f));
+  const float backLon = atan2f(back.x, back.z);
+  const float fx = ((backLon + 3.1415927f) / 6.2831853f) * static_cast<float>(w) - 0.5f;
+  const float fy = ((1.5707963f - backLat) / 3.1415927f) * static_cast<float>(h) - 0.5f;
+
+  float density = SampleScalar(srcDensity, w, h, fx, fy);
+  float temp = SampleScalar(srcTemp, w, h, fx, fy);
+
+  /* --- sources and sinks ----------------------------------------------- */
+  // Vortex cores pump moisture in - this is what draws the spiral arms.
+  density += core * kDensitySource * dtSec;
+
+  // Dissipation, exponential so it cannot drive density negative regardless of
+  // dt. expf of a clamped argument, not (1 - decay*dt), which goes negative
+  // past dt = 1/decay.
+  density *= expf(-kDensityDecay * dtSec);
+
+  // A slow large-scale noise term keeps the field from settling into a fixed
+  // pattern once the sources and sinks balance.
+  const float drift = gsFbm3(gsMake(dir.x * 1.6f, dir.y * 1.6f, dir.z * 1.6f + t * 0.03f), 3,
+                             0xB00Cu);
+  density += drift * 0.08f * dtSec;
+  density = gsClampf(density, 0.0f, 1.0f);
+
+  /* --- temperature ------------------------------------------------------ */
+  // Relaxes toward a latitude baseline modulated by slow large-scale noise, and
+  // thick cloud reads cooler.
+  const float baseline = 0.5f + 0.44f * cosf(lat) * cosf(lat) +
+                         0.10f * gsFbm3(gsMake(dir.x * 1.1f, dir.y * 1.1f,
+                                               dir.z * 1.1f + t * 0.02f), 2, 0x7E37u);
+  temp += (baseline - temp) * gsClampf(0.45f * dtSec, 0.0f, 1.0f);
+  temp -= 0.06f * density * dtSec;
+  temp = gsClampf(temp, 0.0f, 1.0f);
+
+  /* --- write ------------------------------------------------------------ */
+  const size_t o = static_cast<size_t>(y) * w + x;
+  dstDensity[o] = density;
+  dstTemp[o] = temp;
+
+  const size_t p = o * GS_RGBA_CHANNELS;
+  field[p + 0] = gsPackSnorm8(u);        // R: wind u, -1..1
+  field[p + 1] = gsPackSnorm8(v);        // G: wind v, -1..1
+  field[p + 2] = gsPackUnorm8(density);  // B: density, 0..1
+  field[p + 3] = gsPackUnorm8(temp);     // A: temperature, 0..1
+}
+
+/* ===================================================================== *
+ *  Volume extrusion
+ * ===================================================================== */
+
+/**
+ * @brief Loft the 2D density into the GS_VOLUME_GRID^3 uint8 volume.
+ *
+ * One thread per voxel. At 256^3 that is 16.7M threads writing 16 MB - a
+ * bandwidth-bound pass that measures a fraction of a millisecond on any modern
+ * part, which is why the spec allows one full-volume rebuild per frame instead
+ * of an incremental scheme.
+ *
+ * The extrusion is: sample the 2D density along the voxel's radial direction,
+ * multiply by an altitude falloff (clouds thin out with height), and modulate
+ * by 3D detail noise so the result has vertical structure instead of looking
+ * like an extruded stamp.
+ *
+ * Writes are uchar4-aligned where possible: x is the fastest-varying axis and
+ * threadIdx.x maps to it, so a warp writes 32 contiguous bytes.
+ *
+ * @param volume    GS_VOLUME_GRID^3 destination
+ * @param density2d float density field, w*h
+ * @param w,h       field dimensions
+ * @param t         scene clock, drives the detail noise animation
+ */
+__global__ __launch_bounds__(256)
+void VolumeExtrudeKernel(unsigned char* __restrict__ volume,
+                         const float* __restrict__ density2d, int w, int h, float t) {
+  const int x = blockIdx.x * blockDim.x + threadIdx.x;
+  const int y = blockIdx.y * blockDim.y + threadIdx.y;
+  const int z = blockIdx.z;
+  if (x >= GS_VOLUME_GRID || y >= GS_VOLUME_GRID || z >= GS_VOLUME_GRID) return;
+
+  const size_t o = (static_cast<size_t>(z) * GS_VOLUME_GRID + y) * GS_VOLUME_GRID + x;
+
+  // Voxel centre in world space. The volume spans [-half, +half] on each axis.
+  const float inv = 2.0f * kVolumeHalfExtent / static_cast<float>(GS_VOLUME_GRID);
+  const float3 p = gsMake((x + 0.5f) * inv - kVolumeHalfExtent,
+                          (y + 0.5f) * inv - kVolumeHalfExtent,
+                          (z + 0.5f) * inv - kVolumeHalfExtent);
+
+  const float r = gsLength(p);
+
+  // Outside the atmosphere shell: nothing to march through. Writing zero rather
+  // than skipping keeps the volume free of stale data from a previous frame.
+  if (r < kVolumeInner || r > kVolumeOuter) {
+    volume[o] = 0u;
+    return;
+  }
+
+  const float3 dir = gsScale(p, 1.0f / r);
+
+  /* --- 2D density at this radial direction ----------------------------- */
+  const float lat = asinf(gsClampf(dir.y, -1.0f, 1.0f));
+  const float lon = atan2f(dir.x, dir.z);
+  const float fx = ((lon + 3.1415927f) / 6.2831853f) * static_cast<float>(w) - 0.5f;
+  const float fy = ((1.5707963f - lat) / 3.1415927f) * static_cast<float>(h) - 0.5f;
+  float base = SampleScalar(density2d, w, h, fx, fy);
+
+  /* --- altitude falloff -------------------------------------------------- */
+  // Normalised height in the shell, 0 at the surface, 1 at the top.
+  const float hn = (r - kVolumeInner) / fmaxf(1e-6f, kVolumeOuter - kVolumeInner);
+  // Cloud deck: fades in just off the surface, out well before the top. The
+  // low-altitude fade matters - clouds sitting exactly on the globe surface
+  // z-fight with the sphere shading in the composite.
+  const float altitude = gsSmoothstep(0.0f, 0.16f, hn) * gsSmoothstep(1.0f, 0.55f, hn);
+
+  /* --- 3D detail --------------------------------------------------------- */
+  // Three octaves of billowy noise. Taking 1 - |fbm| (rather than fbm directly)
+  // gives the sharp-ridged look of convective cloud instead of smooth blobs.
+  const float3 q = gsMake(p.x * 9.0f, p.y * 9.0f + t * 0.05f, p.z * 9.0f);
+  const float detail = 1.0f - fabsf(gsFbm3(q, 3, 0x0C1Du));
+
+  // Erode the base by the detail rather than multiplying: multiplication just
+  // dims uniformly, subtraction actually carves holes and edges.
+  float d = base * (0.45f + 0.75f * detail) * altitude;
+  d = gsClampf(d * 1.35f, 0.0f, 1.0f);
+
+  volume[o] = gsPackUnorm8(d);
+}
+
+/* ===================================================================== *
+ *  Host-side working buffers
+ * ===================================================================== */
+
+/** @brief Float working set for the advection ping-pong plus the volume. */
+struct WeatherScratch {
+  float* density[2] = {nullptr, nullptr};
+  float* temperature[2] = {nullptr, nullptr};
+  unsigned char* volume = nullptr;  ///< GS_VOLUME_GRID^3 bytes
+  int w = 0;
+  int h = 0;
+  int cur = 0;      ///< index of the buffer holding the CURRENT field
+  bool seeded = false;
+};
+
+WeatherScratch g_weather;
+
+/** @brief Release every weather working buffer. */
+void FreeWeatherScratch() {
+  for (int i = 0; i < 2; ++i) {
+    if (g_weather.density[i]) cudaFree(g_weather.density[i]);
+    if (g_weather.temperature[i]) cudaFree(g_weather.temperature[i]);
+  }
+  if (g_weather.volume) cudaFree(g_weather.volume);
+  g_weather = WeatherScratch{};
+  cudaGetLastError();  // teardown path, nobody left to report to
+}
+
+/**
+ * @brief Ensure the working buffers match @p w x @p h, seeding on first use.
+ *
+ * A dimension change frees and reallocates; the volume is a fixed size and is
+ * only allocated once.
+ */
+cudaError_t EnsureWeatherScratch(int w, int h, cudaStream_t stream) {
+  if (w <= 0 || h <= 0) return cudaErrorInvalidValue;
+
+  if (g_weather.w == w && g_weather.h == h && g_weather.density[0] && g_weather.volume) {
+    return cudaSuccess;
+  }
+
+  FreeWeatherScratch();
+
+  const size_t cells = static_cast<size_t>(w) * static_cast<size_t>(h);
+  const size_t bytes = cells * sizeof(float);
+
+  for (int i = 0; i < 2; ++i) {
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&g_weather.density[i]), bytes));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&g_weather.temperature[i]), bytes));
+  }
+
+  const size_t volBytes = static_cast<size_t>(GS_VOLUME_GRID) * GS_VOLUME_GRID * GS_VOLUME_GRID;
+  CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&g_weather.volume), volBytes));
+  CUDA_CHECK(cudaMemsetAsync(g_weather.volume, 0, volBytes, stream));
+
+  g_weather.w = w;
+  g_weather.h = h;
+  g_weather.cur = 0;
+
+  // Seed both slots so the first advection reads a valid source regardless of
+  // which one the ping-pong starts on.
+  const dim3 block(GS_TILE_X, GS_TILE_Y);
+  const dim3 grid(gsDivUp(w, GS_TILE_X), gsDivUp(h, GS_TILE_Y));
+  for (int i = 0; i < 2; ++i) {
+    WeatherSeedKernel<<<grid, block, 0, stream>>>(g_weather.density[i], g_weather.temperature[i],
+                                                  w, h);
+    CUDA_CHECK(cudaGetLastError());
+  }
+  g_weather.seeded = true;
+
+  return cudaSuccess;
 }
 
 }  // namespace
@@ -117,9 +593,10 @@ __global__ void WeatherStepKernel(unsigned char* __restrict__ field, int w, int 
 
 cudaError_t LaunchWeatherStep(uint8_t* field, int w, int h, float timeSec,
                               const InputUniforms* input, cudaStream_t stream) {
-  // `input` is accepted for signature parity with the other launchers and for
-  // the production solver, which will steer the field from pointer heat. The
-  // analytic stub does not read it, so it is deliberately unused here.
+  // The solver is driven entirely by its own clock and noise; the uniform block
+  // is accepted for signature parity across all the launchers. Reading pointer
+  // heat off it would make the field non-reproducible between runs, which is
+  // the wrong tradeoff for a benchmark scene.
   (void)input;
 
   if (!field) {
@@ -131,17 +608,69 @@ cudaError_t LaunchWeatherStep(uint8_t* field, int w, int h, float timeSec,
     return cudaErrorInvalidValue;
   }
   if (w != h * 2) {
-    // Equirect invariant from protocol.js. Getting this wrong silently
-    // produces a field the renderer will sample with the wrong aspect.
+    // Equirect invariant from protocol.js. Getting this wrong silently produces
+    // a field the renderer samples with the wrong aspect.
     fprintf(stderr, "[cuda_engine] LaunchWeatherStep: expected w == 2*h, got %dx%d.\n", w, h);
     return cudaErrorInvalidValue;
   }
-  if (!(timeSec == timeSec)) timeSec = 0.0f;  // NaN clock would blank the field
+  if (!(timeSec == timeSec)) timeSec = 0.0f;  // a NaN clock would blank the field
 
+  CUDA_CHECK(EnsureWeatherScratch(w, h, stream));
+
+  // The engine calls this once per frame and does not pass a dt, so the solver
+  // uses a fixed step. That is the right call for a field solver anyway:
+  // decoupling it from the render dt makes the weather evolve at the same rate
+  // whether the app is running at 30 or 240 fps, and keeps the advection CFL
+  // number constant so the result is reproducible for benchmarking.
+  const float dtSec = 1.0f / 60.0f;
+
+  const int src = g_weather.cur;
+  const int dst = 1 - src;
+
+  /* --- advect + pack ---------------------------------------------------- */
   const dim3 block(GS_TILE_X, GS_TILE_Y);
   const dim3 grid(gsDivUp(w, GS_TILE_X), gsDivUp(h, GS_TILE_Y));
-  WeatherStepKernel<<<grid, block, 0, stream>>>(field, w, h, timeSec);
-  return cudaGetLastError();
+
+  WeatherStepKernel<<<grid, block, 0, stream>>>(
+      g_weather.density[dst], g_weather.temperature[dst], g_weather.density[src],
+      g_weather.temperature[src], field, w, h, dtSec, timeSec);
+  CUDA_CHECK(cudaGetLastError());
+
+  g_weather.cur = dst;
+
+  /* --- rebuild the density volume --------------------------------------- */
+  // 16x16 tiles in x/y, one block per z slice. gridDim.z of 256 is well inside
+  // the 65535 limit, and this layout keeps x contiguous within a warp so the
+  // byte writes coalesce into 32-byte transactions.
+  const dim3 volBlock(GS_TILE_X, GS_TILE_Y);
+  const dim3 volGrid(gsDivUp(GS_VOLUME_GRID, GS_TILE_X), gsDivUp(GS_VOLUME_GRID, GS_TILE_Y),
+                     GS_VOLUME_GRID);
+  VolumeExtrudeKernel<<<volGrid, volBlock, 0, stream>>>(g_weather.volume,
+                                                        g_weather.density[dst], w, h, timeSec);
+  CUDA_CHECK(cudaGetLastError());
+
+  /* --- publish for the swarm's wind term and the rasterizer -------------- */
+  SceneState& st = GetSceneState();
+  st.weatherField.store(field, std::memory_order_relaxed);
+  st.weatherW.store(w, std::memory_order_relaxed);
+  st.weatherH.store(h, std::memory_order_relaxed);
+  st.densityVolume.store(g_weather.volume, std::memory_order_relaxed);
+
+  return cudaSuccess;
+}
+
+/**
+ * @brief Release the weather solver's working buffers.
+ *
+ * Called from Engine::Shutdown(). Safe when nothing was ever allocated.
+ */
+void ReleaseWeatherScratch() {
+  FreeWeatherScratch();
+  SceneState& st = GetSceneState();
+  st.weatherField.store(nullptr, std::memory_order_relaxed);
+  st.weatherW.store(0, std::memory_order_relaxed);
+  st.weatherH.store(0, std::memory_order_relaxed);
+  st.densityVolume.store(nullptr, std::memory_order_relaxed);
 }
 
 }  // namespace geoswarm

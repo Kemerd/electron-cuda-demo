@@ -17,6 +17,8 @@
 #include <algorithm>
 #include <cstring>
 
+#include "kernels/scene_state.h"
+
 namespace geoswarm {
 
 namespace {
@@ -248,6 +250,15 @@ void Engine::Shutdown() {
   if (sim_stream_) CUDA_CHECK_SOFT(cudaStreamSynchronize(sim_stream_));
   if (copy_stream_) CUDA_CHECK_SOFT(cudaStreamSynchronize(copy_stream_));
 
+  // The kernels own working sets the launcher ABI has no room to pass through
+  // (sort scratch, the weather ping-pong, the density volume, the splat
+  // accumulator, the earth texture object). Release those before the record
+  // buffers, since some of them hold published pointers into these.
+  ReleaseSwarmScratch();
+  ReleaseWeatherScratch();
+  ReleaseStormScratch();
+  ReleaseRasterScratch();
+
   FreeSceneBuffers();
 
   if (d_frame_) {
@@ -301,6 +312,22 @@ void Engine::Shutdown() {
 }
 
 void Engine::FreeSceneBuffers() {
+  // Unpublish BEFORE freeing. The native view's render thread reads these
+  // pointers to splat entities; retiring the pointer first means the worst case
+  // is a frame that skips a pass, not a dereference of freed device memory.
+  // The counts go to zero too, so a reader that already loaded a pointer still
+  // has a guard it can fail on.
+  {
+    SceneState& st = GetSceneState();
+    st.swarmCount.store(0, std::memory_order_relaxed);
+    st.swarmRecords.store(nullptr, std::memory_order_relaxed);
+    st.stormCount.store(0, std::memory_order_relaxed);
+    st.stormRecords.store(nullptr, std::memory_order_relaxed);
+    st.weatherW.store(0, std::memory_order_relaxed);
+    st.weatherH.store(0, std::memory_order_relaxed);
+    st.weatherField.store(nullptr, std::memory_order_relaxed);
+  }
+
   if (d_swarm_) {
     CUDA_CHECK_SOFT(cudaFree(d_swarm_));
     d_swarm_ = nullptr;
@@ -456,6 +483,12 @@ ConfigureResult Engine::ConfigureScene(SceneId scene, const SceneParams& params)
   scene_ = scene;
   scene_bytes_ = total;
 
+  // Tell the rasterizer which scene it is drawing. It picks its passes from
+  // the registry rather than from a parameter, because the frozen launcher ABI
+  // has no scene argument and the native view's render thread has no other way
+  // to learn what is resident.
+  GetSceneState().scene.store(static_cast<int>(scene), std::memory_order_relaxed);
+
   // Seed the freshly allocated buffers so the very first step() reads sane
   // state rather than whatever the allocator handed back.
   if (needSwarm) {
@@ -589,6 +622,17 @@ Status Engine::UploadEarthTexture(const uint8_t* rgba, size_t bytes, int w, int 
   cudaError_t err = cudaMemcpy(d_earth_, rgba, need, cudaMemcpyHostToDevice);
   if (err != cudaSuccess) {
     return Status::Fail(std::string("earth texture upload failed: ") + cudaGetErrorString(err));
+  }
+
+  // The rasterizer samples the globe through a texture object, not this linear
+  // copy: it needs hardware bilinear filtering and the wrap/clamp addressing
+  // that only a cudaArray-backed texture provides. The linear copy above stays
+  // as the canonical record of what was uploaded (and is what a future
+  // compute-only consumer would read), so both live side by side.
+  err = SetEarthTexture(rgba, w, h);
+  if (err != cudaSuccess) {
+    return Status::Fail(std::string("earth texture object creation failed: ") +
+                        cudaGetErrorString(err));
   }
   return Status::Ok();
 }

@@ -37,6 +37,9 @@
 #include <d3d11.h>
 #include <dxgi1_5.h>
 #include <cuda_runtime.h>
+// cudaGraphicsD3D11RegisterResource lives here, not in cuda_runtime.h. Must
+// come after d3d11.h so the ID3D11Resource forward declarations resolve.
+#include <cuda_d3d11_interop.h>
 
 #include <atomic>
 #include <condition_variable>

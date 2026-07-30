@@ -389,6 +389,42 @@ cudaError_t LaunchRasterSurface(cudaSurfaceObject_t surf, int w, int h,
                                 const InputUniforms* input, float timeSec,
                                 cudaStream_t stream);
 
+/* ---------------------------------------------------------------------- *
+ *  Kernel-owned resource lifetime
+ *
+ *  The launchers above own working sets the ABI has no room to pass through:
+ *  the swarm's sort/grid scratch, the weather solver's float ping-pong plus the
+ *  density volume, and the rasterizer's splat accumulation buffer. Each .cu
+ *  allocates its own lazily on first use and releases it here, from
+ *  Engine::Shutdown(). All are safe to call when nothing was ever allocated.
+ * ---------------------------------------------------------------------- */
+
+/** @brief Free the swarm spatial-hash and radix-sort scratch buffers. */
+void ReleaseSwarmScratch();
+
+/** @brief Free the weather solver's working buffers and the density volume. */
+void ReleaseWeatherScratch();
+
+/** @brief Clear the storm scene's published device pointers. */
+void ReleaseStormScratch();
+
+/** @brief Free the splat accumulation buffer and the earth texture object. */
+void ReleaseRasterScratch();
+
+/**
+ * @brief Wrap an uploaded RGBA8 earth texture in a cudaTextureObject_t.
+ *
+ * The rasterizer samples the globe through a texture object so it gets hardware
+ * bilinear filtering and the 8-bit-to-float conversion for free. This copies
+ * the pixels into a cudaArray (texture objects cannot be built over plain
+ * linear memory with filtering enabled) and publishes the handle.
+ *
+ * @param rgba tightly packed w*h*4 host bytes
+ * @param w,h  texture dimensions
+ * @return cudaSuccess, or the first failure with nothing published
+ */
+cudaError_t SetEarthTexture(const uint8_t* rgba, int w, int h);
+
 }  // namespace geoswarm
 
 #endif  // GEOSWARM_ENGINE_H

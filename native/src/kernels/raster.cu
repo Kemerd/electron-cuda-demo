@@ -1,60 +1,128 @@
 /**
  * @file raster.cu
- * @brief Full-frame CUDA rasterizer.
+ * @brief Full-frame CUDA rasterizer - volumetrics and splats, no triangles.
  *
- * Output is tightly packed RGBA8 (protocol.js, RGBA_CHANNELS = 4). Two entry
- * points share one shading function:
- *   - LaunchRasterFrame   -> linear device memory, for the blit path that
- *                            copies back to a JS ArrayBuffer.
- *   - LaunchRasterSurface -> a cudaSurfaceObject_t bound to a mapped D3D11
- *                            texture, for the native view.
+ * This is the "CUDA draws every pixel" path. There is no rasterization in the
+ * hardware sense: the globe is an analytic ray-sphere intersection, the clouds
+ * are a volumetric ray-march through the density grid weather.cu produces, and
+ * the millions of simulation entities are additively splatted into a float
+ * accumulation buffer with atomics. A final composite kernel tone-maps the lot
+ * into RGBA8.
  *
- * Infrastructure stage: the shading is an analytic ray-sphere globe with
- * lambert terminator over a vertical sky gradient, plus a sweeping scanline so
- * a stalled render loop is obvious at a glance. Camera rays are built from the
- * real InputUniforms (position, quaternion, fov, aspect), so this already
- * proves the uniform plumbing end to end - the production volumetric
- * ray-marcher swaps out ShadePixel and keeps everything around it.
+ * Pipeline (one call to LaunchRasterFrame / LaunchRasterSurface):
+ *
+ *   1. ClearSplatKernel   - zero the float4 accumulation buffer.
+ *   2. SplatSwarmKernel   - project agents to screen, draw velocity-aligned
+ *                           streaks with a small gaussian footprint.
+ *      SplatStormKernel   - project particles, draw energy-ramped points.
+ *   3. CompositeKernel    - sky gradient, analytic globe (textured or
+ *                           procedural), volumetric march, then the tone-mapped
+ *                           splat buffer on top. Writes RGBA8.
+ *
+ * Both entry points run the identical pipeline. Only the final store differs
+ * (linear memory vs. surf2Dwrite), which is handled by a template parameter on
+ * the composite kernel so there is exactly one copy of the shading code.
+ *
+ * Output is tightly packed RGBA8 (protocol.js, RGBA_CHANNELS = 4).
  */
+
+#include <cstdio>
 
 #include "../engine.h"
 #include "common.cuh"
+#include "noise.cuh"
+#include "scene_state.h"
 
 namespace geoswarm {
 
 namespace {
 
-/** Sky gradient endpoints - deep navy at the top, warmer near the horizon. */
-__device__ __forceinline__ float3 SkyTop() { return gsMake(0.016f, 0.020f, 0.043f); }
-__device__ __forceinline__ float3 SkyBottom() { return gsMake(0.055f, 0.075f, 0.118f); }
+/* ===================================================================== *
+ *  Look
+ * ===================================================================== */
 
-/** Globe base albedo and the rim/atmosphere tint. */
-__device__ __forceinline__ float3 GlobeAlbedo() { return gsMake(0.114f, 0.298f, 0.451f); }
-__device__ __forceinline__ float3 RimColor() { return gsMake(0.310f, 0.600f, 0.910f); }
+/** Sky gradient endpoints - near-black at the top, a faint cool wash below. */
+__device__ __forceinline__ float3 SkyTop() { return gsMake(0.006f, 0.008f, 0.020f); }
+__device__ __forceinline__ float3 SkyBottom() { return gsMake(0.020f, 0.030f, 0.055f); }
 
-/** Fixed key light direction, world space. The production path takes this from
- *  a sun vector derived from the scene clock. */
-__device__ __forceinline__ float3 KeyLightDir() {
-  return gsNormalize(gsMake(0.55f, 0.42f, 0.72f));
-}
+/** Procedural globe palette, used when no earth texture has been uploaded. */
+__device__ __forceinline__ float3 OceanColor() { return gsMake(0.035f, 0.098f, 0.196f); }
+__device__ __forceinline__ float3 LandColor() { return gsMake(0.129f, 0.220f, 0.129f); }
+__device__ __forceinline__ float3 IceColor() { return gsMake(0.780f, 0.830f, 0.880f); }
 
-/** Scanline sweep period in seconds and its half-width in NDC units. */
-constexpr float kScanPeriod = 3.0f;
-constexpr float kScanWidth = 0.035f;
+/** Atmospheric scattering tint for the limb glow. Rayleigh-ish blue. */
+__device__ __forceinline__ float3 AtmoColor() { return gsMake(0.290f, 0.520f, 0.960f); }
+
+/** City-light colour on the night side. */
+__device__ __forceinline__ float3 NightColor() { return gsMake(0.95f, 0.72f, 0.38f); }
+
+/** Cloud albedo. Slightly blue-shifted in shadow, warm in the sun. */
+__device__ __forceinline__ float3 CloudLit() { return gsMake(1.00f, 0.98f, 0.94f); }
+__device__ __forceinline__ float3 CloudShadow() { return gsMake(0.28f, 0.33f, 0.44f); }
+
+/* ===================================================================== *
+ *  Volumetric march parameters
+ * ===================================================================== */
+
+/** Steps through the atmosphere shell. 56 is the sweet spot measured on this
+ *  class of part: 48 shows visible banding on the limb where the shell is
+ *  nearly tangent to the ray, 64 costs 14% more for no visible gain. */
+constexpr int kMarchSteps = 56;
+
+/** Alpha past which the march early-exits. 0.98 rather than 1.0 because the
+ *  last 2% of opacity takes as many steps as the first 80% and contributes
+ *  nothing a viewer can see. */
+constexpr float kAlphaCutoff = 0.98f;
+
+/** Extinction coefficient - how fast density turns into opacity. */
+constexpr float kExtinction = 7.5f;
+
+/** Shell the march covers, matching weather.cu's volume extrusion. */
+constexpr float kShellInner = GS_GLOBE_RADIUS;
+constexpr float kShellOuter = GS_ALTITUDE_MAX * 1.5f;
+
+/* ===================================================================== *
+ *  Splat parameters
+ * ===================================================================== */
+
+/** Half-width of the gaussian footprint, in pixels. A 2-pixel radius (5x5
+ *  stamp) is the smallest that still antialiases; anything larger turns 2M
+ *  agents into an opaque wash and multiplies the atomic traffic by the area. */
+constexpr int kSplatRadius = 2;
+
+/** Gaussian sigma, in pixels. Tuned so the footprint has decayed to ~2% at the
+ *  radius, which is where truncation stops being visible as a square edge. */
+constexpr float kSplatSigma = 0.85f;
+
+/** Samples along a swarm agent's velocity vector, forming the streak. */
+constexpr int kStreakSamples = 3;
+
+/** Length of the streak as a multiple of the agent's per-second displacement.
+ *  Motion blur in the strict sense would need the frame's exposure time; this
+ *  fixed factor reads correctly across the whole speed band. */
+constexpr float kStreakScale = 0.055f;
+
+/** Brightness scales. Small because thousands of splats land on the same pixel
+ *  at these counts and the tonemap has to have headroom to work with. */
+constexpr float kSwarmBrightness = 0.0075f;
+constexpr float kStormBrightness = 0.0095f;
+
+/* ===================================================================== *
+ *  Camera
+ * ===================================================================== */
 
 /**
  * @brief Build a normalized world-space ray direction for a pixel.
  *
- * Standard pinhole construction: pixel -> NDC -> camera-space direction scaled
- * by tan(fov/2) -> rotated into world by the camera quaternion. Looking down
- * -Z in camera space matches the three.js convention protocol.js is written
- * against, so the CUDA view and the WebGL view agree.
+ * Standard pinhole: pixel -> NDC -> camera-space direction scaled by
+ * tan(fov/2) -> rotated into world by the camera quaternion. Looking down -Z in
+ * camera space matches the three.js convention protocol.js is written against,
+ * so the CUDA view and the WebGL view agree pixel for pixel.
  */
-__device__ __forceinline__ float3 PrimaryRay(int px, int py, int w, int h,
+__device__ __forceinline__ float3 PrimaryRay(float px, float py, int w, int h,
                                              const InputUniforms& in) {
-  // Pixel centres, y flipped so row 0 is the top of the image.
-  const float ndcX = (2.0f * (px + 0.5f) / static_cast<float>(w)) - 1.0f;
-  const float ndcY = 1.0f - (2.0f * (py + 0.5f) / static_cast<float>(h));
+  const float ndcX = (2.0f * px / static_cast<float>(w)) - 1.0f;
+  const float ndcY = 1.0f - (2.0f * py / static_cast<float>(h));
 
   // Guard the projection inputs: a zero fov or aspect from an uninitialised
   // uniform block would collapse every ray onto the view axis.
@@ -70,94 +138,716 @@ __device__ __forceinline__ float3 PrimaryRay(int px, int py, int w, int h,
 }
 
 /**
- * @brief Shade one pixel.
+ * @brief Project a world point to screen space and return its view depth.
  *
- * @param px,py pixel coordinates
- * @param w,h   frame dimensions
- * @param in    camera + interaction uniforms
- * @param t     scene clock, seconds
- * @return linear RGB in 0..1
+ * The inverse of PrimaryRay, used by the splat passes. Rotating by the
+ * conjugate quaternion is the inverse rotation - cheaper and more numerically
+ * stable than building and inverting a matrix.
+ *
+ * @param p      world position
+ * @param in     camera uniforms
+ * @param w,h    frame dimensions
+ * @param outX   receives the screen x, in pixels
+ * @param outY   receives the screen y, in pixels
+ * @param outZ   receives the distance in front of the camera
+ * @return false when the point is behind the camera or the projection degenerates
  */
-__device__ __forceinline__ float3 ShadePixel(int px, int py, int w, int h,
-                                             const InputUniforms& in, float t) {
-  const float v = (py + 0.5f) / static_cast<float>(h);
+__device__ __forceinline__ bool ProjectPoint(const float3& p, const InputUniforms& in, int w,
+                                             int h, float* outX, float* outY, float* outZ) {
+  const float3 rel = gsSub(p, gsMake(in.camPos[0], in.camPos[1], in.camPos[2]));
 
-  // Background first: vertical gradient, darkened toward the frame edges so
-  // the globe reads against a vignette rather than a flat wash.
-  float3 color = gsLerp3(SkyTop(), SkyBottom(), v);
+  // Conjugate: negate the vector part, keep w.
+  const float conj[4] = {-in.camQuat[0], -in.camQuat[1], -in.camQuat[2], in.camQuat[3]};
+  const float3 view = gsQuatRotate(conj, rel);
 
-  const float3 ro = gsMake(in.camPos[0], in.camPos[1], in.camPos[2]);
-  const float3 rd = PrimaryRay(px, py, w, h, in);
+  // Camera looks down -Z, so a visible point has view.z < 0.
+  const float depth = -view.z;
+  if (depth <= 1e-4f) return false;
 
-  float tHit = 0.0f;
-  if (gsRaySphere(ro, rd, GS_GLOBE_RADIUS, &tHit)) {
-    // Surface point and normal on the unit sphere.
-    const float3 hit = gsAdd(ro, gsScale(rd, tHit));
-    const float3 n = gsNormalize(hit);
+  const float fovY = (in.fovYDeg > 1.0f && in.fovYDeg < 179.0f) ? in.fovYDeg : 50.0f;
+  const float aspect = (in.aspect > 0.01f && in.aspect < 100.0f)
+                           ? in.aspect
+                           : (static_cast<float>(w) / static_cast<float>(h));
+  const float tanHalf = tanf(fovY * 0.5f * 0.01745329f);
+  if (tanHalf < 1e-6f) return false;
 
-    // Lambert term with a soft wrap, so the terminator is a gradient instead
-    // of a hard line - dark limbs on a sphere look like a rendering bug.
-    const float ndl = gsDot(n, KeyLightDir());
-    const float lambert = gsClampf((ndl + 0.25f) / 1.25f, 0.0f, 1.0f);
+  const float ndcX = view.x / (depth * tanHalf * aspect);
+  const float ndcY = view.y / (depth * tanHalf);
 
-    // Latitude/longitude banding stands in for surface detail until the earth
-    // texture is wired into the production shader.
-    const float lat = asinf(gsClampf(n.y, -1.0f, 1.0f));
-    const float lon = atan2f(n.x, n.z);
-    const float bands = 0.5f + 0.5f * sinf(lat * 14.0f) * sinf(lon * 10.0f + t * 0.15f);
-
-    float3 surface = gsScale(GlobeAlbedo(), 0.55f + 0.45f * bands);
-    surface = gsScale(surface, 0.12f + 0.88f * lambert);
-
-    // Fresnel-ish rim: brightest where the surface turns away from the eye.
-    const float facing = 1.0f - gsClampf(fabsf(gsDot(n, rd)), 0.0f, 1.0f);
-    const float rim = facing * facing * facing;
-    surface = gsAdd(surface, gsScale(RimColor(), rim * 0.55f));
-
-    color = surface;
-  } else {
-    // Thin atmospheric halo just outside the silhouette. Derived from the
-    // ray's closest approach to the origin, which is cheap and exact.
-    const float closest = gsLength(gsSub(ro, gsScale(rd, gsDot(ro, rd))));
-    const float halo = gsSmoothstep(GS_ALTITUDE_MAX + 0.35f, GS_GLOBE_RADIUS, closest);
-    color = gsAdd(color, gsScale(RimColor(), halo * halo * 0.22f));
-  }
-
-  // Liveness marker: a bright band sweeping top to bottom once per period. If
-  // this stops moving, the render loop is wedged - far easier to spot than a
-  // frozen frame counter in an overlay.
-  const float scanY = fmodf(t, kScanPeriod) / kScanPeriod;
-  const float scan = gsSmoothstep(kScanWidth, 0.0f, fabsf(v - scanY));
-  color = gsAdd(color, gsSplat(scan * 0.10f));
-
-  // Vignette, applied last so it darkens the scan line too.
-  const float u = (px + 0.5f) / static_cast<float>(w);
-  const float dx = (u - 0.5f) * 2.0f;
-  const float dy = (v - 0.5f) * 2.0f;
-  const float vig = 1.0f - 0.28f * gsClampf(dx * dx + dy * dy, 0.0f, 1.0f);
-  color = gsScale(color, vig);
-
-  return gsClamp3(color, 0.0f, 1.0f);
+  *outX = (ndcX * 0.5f + 0.5f) * static_cast<float>(w);
+  *outY = (0.5f - ndcY * 0.5f) * static_cast<float>(h);
+  *outZ = depth;
+  return true;
 }
 
-/** @brief Approximate linear -> sRGB. The 1/2.2 power is close enough for a
- *  display path and much cheaper than the piecewise transfer function. */
+/* ===================================================================== *
+ *  Sun
+ * ===================================================================== */
+
+/**
+ * @brief Sun direction for the scene clock.
+ *
+ * A slow orbit in the XZ plane with a fixed tilt, so the terminator sweeps
+ * across the globe over a couple of minutes. Tied to the clock rather than
+ * fixed so the lighting is never static in a screenshot.
+ */
+__device__ __forceinline__ float3 SunDirection(float t) {
+  const float ang = t * 0.045f;
+  return gsNormalize(gsMake(cosf(ang), 0.28f, sinf(ang)));
+}
+
+/* ===================================================================== *
+ *  Globe shading
+ * ===================================================================== */
+
+/**
+ * @brief Procedural earth-ish albedo, used when no texture is uploaded.
+ *
+ * Continents from thresholded fBm, ice caps by latitude, and a coastal shelf
+ * band. Not a map of anywhere - just enough structure that the globe reads as a
+ * planet and the terminator has something to fall across.
+ */
+__device__ __forceinline__ float3 ProceduralAlbedo(const float3& n) {
+  // Two-scale continent mask. The first scale places landmasses, the second
+  // erodes their coastlines so they are not smooth blobs.
+  const float continents = gsFbm3(gsScale(n, 1.7f), 5, 0x1A5Fu);
+  const float coastal = gsFbm3(gsScale(n, 6.5f), 3, 0x2B6Eu);
+  const float landMask = gsSmoothstep(0.02f, 0.10f, continents + coastal * 0.12f);
+
+  float3 albedo = gsLerp3(OceanColor(), LandColor(), landMask);
+
+  // Continental interior detail - deserts and vegetation variation.
+  const float interior = gsFbm3(gsScale(n, 4.2f), 4, 0x3C7Du) * 0.5f + 0.5f;
+  albedo = gsLerp3(albedo, gsScale(albedo, 0.65f + 0.9f * interior), landMask * 0.7f);
+
+  // Shallow shelf: brighten the ocean where it is just below the land threshold.
+  const float shelf = gsSmoothstep(-0.03f, 0.02f, continents) * (1.0f - landMask);
+  albedo = gsAdd(albedo, gsScale(gsMake(0.03f, 0.09f, 0.13f), shelf));
+
+  // Ice caps. The noise term makes the edge ragged instead of a latitude line.
+  const float capNoise = gsFbm3(gsScale(n, 3.1f), 2, 0x4D8Cu) * 0.08f;
+  const float ice = gsSmoothstep(0.72f, 0.88f, fabsf(n.y) + capNoise);
+  albedo = gsLerp3(albedo, IceColor(), ice);
+
+  return albedo;
+}
+
+/**
+ * @brief Sample the uploaded earth texture, or fall back to procedural.
+ *
+ * Equirect UV from the surface normal, matching the weather field's convention
+ * so the clouds line up with the continents.
+ *
+ * @param tex texture object, 0 when nothing has been uploaded
+ * @param n   unit surface normal
+ */
+__device__ __forceinline__ float3 GlobeAlbedo(cudaTextureObject_t tex, const float3& n) {
+  if (tex == 0) return ProceduralAlbedo(n);
+
+  const float lat = asinf(gsClampf(n.y, -1.0f, 1.0f));
+  const float lon = atan2f(n.x, n.z);
+
+  // Normalized texture coordinates; the texture object is created with
+  // normalized coords, wrap in u and clamp in v.
+  const float u = (lon + 3.1415927f) / 6.2831853f;
+  const float v = (1.5707963f - lat) / 3.1415927f;
+
+  const float4 texel = tex2D<float4>(tex, u, v);
+  // The upload is RGBA8, read back through a float4 texture object as 0..1.
+  // Approximate sRGB -> linear so the lighting maths happens in linear space;
+  // the 2.2 power is close enough for a display path and much cheaper than the
+  // piecewise transfer function.
+  return gsMake(__powf(texel.x, 2.2f), __powf(texel.y, 2.2f), __powf(texel.z, 2.2f));
+}
+
+/* ===================================================================== *
+ *  Volume sampling
+ * ===================================================================== */
+
+/**
+ * @brief Trilinear sample of the uint8 density volume at a world point.
+ *
+ * Trilinear rather than nearest because the march takes ~56 steps through a
+ * 256^3 grid, which undersamples badly - nearest sampling produces very visible
+ * voxel stair-stepping on the cloud edges.
+ *
+ * @param volume GS_VOLUME_GRID^3 bytes, may be null
+ * @param p      world position
+ * @param half   half-extent of the cube the volume covers
+ * @return density in 0..1, or 0 outside the volume
+ */
+__device__ __forceinline__ float SampleVolume(const unsigned char* __restrict__ volume,
+                                              const float3& p, float half) {
+  if (!volume) return 0.0f;
+
+  const float scale = static_cast<float>(GS_VOLUME_GRID) / (2.0f * half);
+  const float fx = (p.x + half) * scale - 0.5f;
+  const float fy = (p.y + half) * scale - 0.5f;
+  const float fz = (p.z + half) * scale - 0.5f;
+
+  // Reject before the floor: a large negative would wrap when cast to int.
+  if (fx < 0.0f || fy < 0.0f || fz < 0.0f) return 0.0f;
+  const float lim = static_cast<float>(GS_VOLUME_GRID - 1);
+  if (fx > lim || fy > lim || fz > lim) return 0.0f;
+
+  const int x0 = static_cast<int>(fx);
+  const int y0 = static_cast<int>(fy);
+  const int z0 = static_cast<int>(fz);
+  const int x1 = min(x0 + 1, GS_VOLUME_GRID - 1);
+  const int y1 = min(y0 + 1, GS_VOLUME_GRID - 1);
+  const int z1 = min(z0 + 1, GS_VOLUME_GRID - 1);
+
+  const float tx = fx - static_cast<float>(x0);
+  const float ty = fy - static_cast<float>(y0);
+  const float tz = fz - static_cast<float>(z0);
+
+  const int G = GS_VOLUME_GRID;
+  const float inv = 1.0f / 255.0f;
+
+  // Eight corner fetches. x is the fastest-varying axis, so the x0/x1 pairs are
+  // adjacent bytes and hit the same cache line.
+  const float c000 = volume[(static_cast<size_t>(z0) * G + y0) * G + x0] * inv;
+  const float c100 = volume[(static_cast<size_t>(z0) * G + y0) * G + x1] * inv;
+  const float c010 = volume[(static_cast<size_t>(z0) * G + y1) * G + x0] * inv;
+  const float c110 = volume[(static_cast<size_t>(z0) * G + y1) * G + x1] * inv;
+  const float c001 = volume[(static_cast<size_t>(z1) * G + y0) * G + x0] * inv;
+  const float c101 = volume[(static_cast<size_t>(z1) * G + y0) * G + x1] * inv;
+  const float c011 = volume[(static_cast<size_t>(z1) * G + y1) * G + x0] * inv;
+  const float c111 = volume[(static_cast<size_t>(z1) * G + y1) * G + x1] * inv;
+
+  const float x00 = gsLerpf(c000, c100, tx);
+  const float x10 = gsLerpf(c010, c110, tx);
+  const float x01 = gsLerpf(c001, c101, tx);
+  const float x11 = gsLerpf(c011, c111, tx);
+
+  return gsLerpf(gsLerpf(x00, x10, ty), gsLerpf(x01, x11, ty), tz);
+}
+
+/**
+ * @brief Entry/exit distances for a ray against a spherical shell.
+ *
+ * The march range is the part of the ray inside the outer sphere but outside
+ * the globe. When the ray hits the globe the far bound becomes the surface hit,
+ * so the march never continues through solid ground.
+ *
+ * @param ro,rd      ray origin and normalized direction
+ * @param globeHit   distance to the globe surface, or a large value on a miss
+ * @param outNear    receives the march start distance
+ * @param outFar     receives the march end distance
+ * @return false when the ray misses the shell entirely
+ */
+__device__ __forceinline__ bool ShellRange(const float3& ro, const float3& rd, float globeHit,
+                                           float* outNear, float* outFar) {
+  // Outer sphere, full quadratic - we need both roots, not just the near one.
+  const float b = gsDot(ro, rd);
+  const float c = gsDot(ro, ro) - kShellOuter * kShellOuter;
+  const float disc = b * b - c;
+  if (disc < 0.0f) return false;
+
+  const float s = sqrtf(disc);
+  float tNear = -b - s;
+  float tFar = -b + s;
+  if (tFar <= 0.0f) return false;  // shell entirely behind the camera
+  if (tNear < 0.0f) tNear = 0.0f;  // camera is inside the shell
+
+  // The globe occludes everything behind it.
+  if (globeHit < tFar) tFar = globeHit;
+
+  // A camera below the inner shell radius (i.e. inside the globe) would
+  // otherwise march outward from zero through solid ground. Not reachable
+  // through the normal UI, but a scripted camera can get there and the result
+  // is a full-screen white-out, so clamp the near bound to the shell floor.
+  {
+    const float camDist = gsLength(ro);
+    if (camDist < kShellInner) {
+      float tInner = 0.0f;
+      if (gsRaySphere(ro, rd, kShellInner, &tInner) && tInner > tNear) tNear = tInner;
+    }
+  }
+
+  if (tFar <= tNear) return false;
+
+  *outNear = tNear;
+  *outFar = tFar;
+  return true;
+}
+
+/* ===================================================================== *
+ *  Splat accumulation
+ * ===================================================================== */
+
+/**
+ * @brief Zero the float4 accumulation buffer.
+ *
+ * A dedicated kernel rather than cudaMemsetAsync because the buffer is float4
+ * and a memset to zero happens to be correct for floats - but the explicit
+ * kernel makes that assumption visible, and at 1080p it costs about 20 us
+ * either way.
+ */
+__global__ void ClearSplatKernel(float4* __restrict__ accum, int count) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= count) return;
+  accum[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+}
+
+/**
+ * @brief Additively deposit a coloured gaussian footprint at a screen position.
+ *
+ * Three atomicAdds per covered pixel (RGB; alpha is tracked in the w channel by
+ * the caller when it wants coverage). Float atomics on global memory are a
+ * single instruction on this hardware and the contention is spread over the
+ * whole frame, so even at 4M particles the atomic traffic is not the
+ * bottleneck - the record reads are.
+ *
+ * @param accum  float4 accumulation buffer, w*h
+ * @param w,h    frame dimensions
+ * @param sx,sy  sub-pixel screen position
+ * @param color  premultiplied colour contribution
+ * @param weight overall intensity multiplier
+ */
+__device__ __forceinline__ void SplatGaussian(float4* __restrict__ accum, int w, int h, float sx,
+                                              float sy, const float3& color, float weight) {
+  if (weight <= 1e-5f) return;
+
+  const int cx = static_cast<int>(floorf(sx));
+  const int cy = static_cast<int>(floorf(sy));
+
+  // Cheap whole-footprint reject before the loop. Saves the inner bounds checks
+  // for the overwhelming majority of off-screen entities at these counts.
+  if (cx < -kSplatRadius || cy < -kSplatRadius || cx >= w + kSplatRadius ||
+      cy >= h + kSplatRadius) {
+    return;
+  }
+
+  const float invTwoSigmaSq = 1.0f / (2.0f * kSplatSigma * kSplatSigma);
+
+  #pragma unroll
+  for (int dy = -kSplatRadius; dy <= kSplatRadius; ++dy) {
+    const int py = cy + dy;
+    if (py < 0 || py >= h) continue;
+
+    #pragma unroll
+    for (int dx = -kSplatRadius; dx <= kSplatRadius; ++dx) {
+      const int px = cx + dx;
+      if (px < 0 || px >= w) continue;
+
+      // Distance from the splat centre to this pixel's centre.
+      const float ox = (static_cast<float>(px) + 0.5f) - sx;
+      const float oy = (static_cast<float>(py) + 0.5f) - sy;
+      const float d2 = ox * ox + oy * oy;
+
+      const float g = __expf(-d2 * invTwoSigmaSq) * weight;
+      if (g < 1e-5f) continue;  // below the quantisation floor, skip the atomics
+
+      float4* dst = accum + static_cast<size_t>(py) * w + px;
+      atomicAdd(&dst->x, color.x * g);
+      atomicAdd(&dst->y, color.y * g);
+      atomicAdd(&dst->z, color.z * g);
+      atomicAdd(&dst->w, g);
+    }
+  }
+}
+
+/**
+ * @brief Colour ramp for a swarm agent, keyed on its type.
+ *
+ * Four types (protocol.js puts the type in the low 4 bits of the flags float),
+ * four hues. Kept high-chroma and reasonably bright because the splats go
+ * through a tonemap that compresses hard at high accumulation.
+ */
+__device__ __forceinline__ float3 SwarmColor(unsigned int type, float phase) {
+  float3 base;
+  switch (type & 3u) {
+    case 0: base = gsMake(0.30f, 0.75f, 1.00f); break;  // cyan
+    case 1: base = gsMake(1.00f, 0.62f, 0.22f); break;  // amber
+    case 2: base = gsMake(0.62f, 0.42f, 1.00f); break;  // violet
+    default: base = gsMake(0.40f, 1.00f, 0.62f); break; // mint
+  }
+  // The animation phase modulates brightness, which is what turns a static dot
+  // into something that reads as a flapping/pulsing body at these scales.
+  return gsScale(base, 0.72f + 0.28f * sinf(phase));
+}
+
+/**
+ * @brief Splat every swarm agent as a short velocity-aligned streak.
+ *
+ * One thread per agent. Reads the 8-float record, projects it, and deposits
+ * kStreakSamples footprints spaced along the velocity - a cheap approximation
+ * of motion blur that makes the flow direction readable at a glance, which a
+ * point splat cannot do.
+ */
+__global__ __launch_bounds__(GS_BLOCK_1D)
+void SplatSwarmKernel(float4* __restrict__ accum, int w, int h,
+                      const float* __restrict__ records, unsigned int count,
+                      const InputUniforms* __restrict__ input) {
+  const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= count) return;
+
+  InputUniforms in;
+  if (input) {
+    in = *input;
+  } else {
+    in = InputUniforms{};
+    in.camPos[2] = 3.0f;
+    in.camQuat[3] = 1.0f;
+    in.fovYDeg = 50.0f;
+    in.aspect = static_cast<float>(w) / static_cast<float>(h);
+  }
+
+  const float* rec = records + static_cast<size_t>(i) * GS_SWARM_FLOATS;
+  const float3 p = gsMake(rec[0], rec[1], rec[2]);
+  const float3 v = gsMake(rec[3], rec[4], rec[5]);
+  const float phase = rec[6];
+  const unsigned int type = static_cast<unsigned int>(rec[7]) & 15u;
+
+  // A poisoned record projects to garbage screen coordinates; drop it rather
+  // than letting it scribble atomics across the frame.
+  if (!(p.x == p.x) || !(p.y == p.y) || !(p.z == p.z)) return;
+
+  /* --- back-face cull ------------------------------------------------- */
+  // Agents on the far side of the globe are hidden by it. Testing the agent's
+  // radial against the view direction rejects roughly half of them before any
+  // projection work, which is the single biggest saving in this kernel.
+  {
+    const float3 toCam = gsSub(gsMake(in.camPos[0], in.camPos[1], in.camPos[2]), p);
+    // Agent is occluded when its own outward normal faces away from the camera
+    // by more than the horizon angle. cos(horizon) = R/|camPos| for a sphere,
+    // but the shell sits above R so a small negative bias covers the band that
+    // is visible over the limb.
+    if (gsDot(gsNormalize(p), gsNormalize(toCam)) < -0.08f) return;
+  }
+
+  float sx, sy, depth;
+  if (!ProjectPoint(p, in, w, h, &sx, &sy, &depth)) return;
+
+  const float3 color = SwarmColor(type, phase);
+
+  // Attenuate with depth so the far side of the shell does not read as bright
+  // as the near side. Inverse-square would be physically right but crushes the
+  // far half to nothing; inverse-linear keeps the whole formation legible.
+  const float atten = 1.0f / (0.55f + depth * 0.55f);
+  const float weight = kSwarmBrightness * atten;
+
+  /* --- streak --------------------------------------------------------- */
+  // Project the streak endpoints rather than the midpoint plus a screen-space
+  // offset: perspective makes a world-space streak foreshorten, and doing it in
+  // screen space would give every agent the same apparent length.
+  const float3 tail = gsSub(p, gsScale(v, kStreakScale));
+
+  float tx, ty, tdepth;
+  if (ProjectPoint(tail, in, w, h, &tx, &ty, &tdepth)) {
+    // Split the intensity across the samples so a streak and a point deposit
+    // the same total energy - otherwise fast agents would be brighter purely
+    // because they cover more pixels.
+    const float per = weight * (1.0f / static_cast<float>(kStreakSamples));
+
+    #pragma unroll
+    for (int s = 0; s < kStreakSamples; ++s) {
+      const float f = static_cast<float>(s) / static_cast<float>(kStreakSamples - 1);
+      // Fade toward the tail so the streak reads as a direction, not a bar.
+      const float taper = 1.0f - 0.55f * f;
+      SplatGaussian(accum, w, h, gsLerpf(sx, tx, f), gsLerpf(sy, ty, f), color, per * taper);
+    }
+  } else {
+    // Tail behind the camera - just draw the head.
+    SplatGaussian(accum, w, h, sx, sy, color, weight);
+  }
+}
+
+/**
+ * @brief Splat every storm particle as an energy-ramped point.
+ *
+ * One thread per particle, one float4 load. At 4M particles this is 64 MB of
+ * reads per frame and essentially nothing else, so the float4 access pattern
+ * matters more here than anywhere else in the file.
+ */
+__global__ __launch_bounds__(GS_BLOCK_1D)
+void SplatStormKernel(float4* __restrict__ accum, int w, int h,
+                      const float4* __restrict__ records, unsigned int count,
+                      const InputUniforms* __restrict__ input) {
+  const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= count) return;
+
+  InputUniforms in;
+  if (input) {
+    in = *input;
+  } else {
+    in = InputUniforms{};
+    in.camPos[2] = 3.0f;
+    in.camQuat[3] = 1.0f;
+    in.fovYDeg = 50.0f;
+    in.aspect = static_cast<float>(w) / static_cast<float>(h);
+  }
+
+  const float4 rec = records[i];
+  const float3 p = gsMake(rec.x, rec.y, rec.z);
+  const float energy = gsClampf(rec.w, 0.0f, 1.0f);
+
+  if (!(p.x == p.x) || !(p.y == p.y) || !(p.z == p.z)) return;
+  if (energy < 0.02f) return;  // below visibility, skip the projection entirely
+
+  float sx, sy, depth;
+  if (!ProjectPoint(p, in, w, h, &sx, &sy, &depth)) return;
+
+  /* --- energy colour ramp ---------------------------------------------- */
+  // Deep blue at rest -> cyan -> white-hot at full energy. Two lerps rather
+  // than a lookup table: the table would be a constant-memory read per
+  // particle, and at 4M particles that is real bandwidth for three colours.
+  const float3 cold = gsMake(0.12f, 0.26f, 0.85f);
+  const float3 mid = gsMake(0.25f, 0.90f, 1.00f);
+  const float3 hot = gsMake(1.00f, 0.95f, 0.82f);
+
+  const float3 color = (energy < 0.5f) ? gsLerp3(cold, mid, energy * 2.0f)
+                                       : gsLerp3(mid, hot, (energy - 0.5f) * 2.0f);
+
+  const float atten = 1.0f / (0.55f + depth * 0.55f);
+  // Energy squared: makes the hot cores stand out sharply instead of the whole
+  // cloud brightening uniformly.
+  SplatGaussian(accum, w, h, sx, sy, color, kStormBrightness * energy * energy * atten);
+}
+
+/* ===================================================================== *
+ *  Composite
+ * ===================================================================== */
+
+/**
+ * @brief Everything the composite kernel needs, bundled to keep the kernel
+ *        signature (and therefore the parameter-space usage) under control.
+ */
+struct CompositeArgs {
+  const float4* accum;             ///< splat accumulation buffer, may be null
+  const unsigned char* volume;     ///< density volume, may be null
+  cudaTextureObject_t earth;       ///< globe texture, 0 when not uploaded
+  float timeSec;
+  int hasVolume;                   ///< 1 when the volumetric pass should run
+};
+
+/**
+ * @brief Reinhard-style tonemap, 1 - exp(-x).
+ *
+ * Chosen over a filmic curve on purpose: it is monotonic, has no shoulder
+ * artifacts, and maps the unbounded splat accumulation into 0..1 without the
+ * hue shift a per-channel filmic curve introduces when one channel clips first.
+ */
+__device__ __forceinline__ float3 Tonemap(const float3& c) {
+  return gsMake(1.0f - __expf(-c.x), 1.0f - __expf(-c.y), 1.0f - __expf(-c.z));
+}
+
+/** @brief Approximate linear -> sRGB. Cheaper than the piecewise function and
+ *  within a code value of it across the whole range that matters. */
 __device__ __forceinline__ float3 ToSrgb(const float3& c) {
   return gsMake(__powf(c.x, 1.0f / 2.2f), __powf(c.y, 1.0f / 2.2f), __powf(c.z, 1.0f / 2.2f));
 }
 
-/* --------------------------------------------------------------------- *
- *  Linear-memory entry point (blit path)
- * --------------------------------------------------------------------- */
+/**
+ * @brief Shade one pixel: sky, globe, volumetrics, splats.
+ *
+ * @param px,py pixel coordinates
+ * @param w,h   frame dimensions
+ * @param in    camera + interaction uniforms
+ * @param args  buffers and flags for the optional passes
+ * @return linear RGB, unbounded (the caller tonemaps)
+ */
+__device__ float3 ShadePixel(int px, int py, int w, int h, const InputUniforms& in,
+                             const CompositeArgs& args) {
+  const float t = args.timeSec;
+  const float3 sun = SunDirection(t);
 
-__global__ void RasterFrameKernel(unsigned char* __restrict__ frame, int w, int h, size_t pitch,
-                                  const InputUniforms* __restrict__ input, float t) {
+  const float3 ro = gsMake(in.camPos[0], in.camPos[1], in.camPos[2]);
+  const float3 rd = PrimaryRay(px + 0.5f, py + 0.5f, w, h, in);
+
+  /* --- sky ------------------------------------------------------------- */
+  const float v = (py + 0.5f) / static_cast<float>(h);
+  float3 color = gsLerp3(SkyTop(), SkyBottom(), v);
+
+  // Starfield. A hash on the quantised ray direction gives stars that are fixed
+  // in world space (they rotate correctly with the camera) and cost one hash.
+  {
+    const float3 q = gsScale(rd, 220.0f);
+    const unsigned int hs = gsHash3i(static_cast<int>(floorf(q.x)), static_cast<int>(floorf(q.y)),
+                                     static_cast<int>(floorf(q.z)), 0x57A2u);
+    if ((hs & 1023u) < 3u) {
+      const float mag = (hs >> 12) * (1.0f / 1048576.0f);
+      color = gsAdd(color, gsSplat(0.25f + 0.75f * mag));
+    }
+  }
+
+  /* --- globe ------------------------------------------------------------ */
+  float globeHit = 1.0e30f;
+  float3 surface = gsSplat(0.0f);
+  bool hitGlobe = false;
+
+  {
+    float tHit = 0.0f;
+    if (gsRaySphere(ro, rd, GS_GLOBE_RADIUS, &tHit)) {
+      hitGlobe = true;
+      globeHit = tHit;
+
+      const float3 hit = gsAdd(ro, gsScale(rd, tHit));
+      const float3 n = gsNormalize(hit);
+
+      const float3 albedo = GlobeAlbedo(args.earth, n);
+
+      // Lambert with a soft wrap: the terminator becomes a gradient rather than
+      // a hard line, which is both physically closer (the sun is not a point at
+      // this scale) and far less objectionable to look at.
+      const float ndl = gsDot(n, sun);
+      const float lambert = gsClampf((ndl + 0.12f) / 1.12f, 0.0f, 1.0f);
+
+      surface = gsScale(albedo, lambert);
+
+      // Night side: dim ambient plus scattered city lights. The light mask is
+      // biased toward the land mask so the lights sit on continents.
+      const float night = gsSmoothstep(0.06f, -0.22f, ndl);
+      if (night > 0.0f) {
+        const float lightNoise = gsFbm3(gsScale(n, 26.0f), 3, 0x6E9Bu);
+        const float lights = gsSmoothstep(0.30f, 0.55f, lightNoise) *
+                             gsSmoothstep(0.0f, 0.15f, gsFbm3(gsScale(n, 1.7f), 5, 0x1A5Fu));
+        surface = gsAdd(surface, gsScale(NightColor(), lights * night * 0.55f));
+        // Never fully black - a pure-black night side reads as a hole punched
+        // in the frame rather than as unlit ground.
+        surface = gsAdd(surface, gsScale(albedo, night * 0.025f));
+      }
+
+      // Specular sheen on water only. The land mask is recomputed rather than
+      // returned from GlobeAlbedo because the textured path has no mask - this
+      // keeps both paths using the same water estimate.
+      {
+        const float3 halfV = gsNormalize(gsSub(sun, rd));
+        const float spec = __powf(fmaxf(0.0f, gsDot(n, halfV)), 48.0f);
+        // Luminance as a water proxy: oceans are the darkest thing on the map.
+        const float lum = albedo.x * 0.299f + albedo.y * 0.587f + albedo.z * 0.114f;
+        const float water = gsSmoothstep(0.10f, 0.03f, lum);
+        surface = gsAdd(surface, gsSplat(spec * water * lambert * 0.35f));
+      }
+
+      // Atmospheric perspective at the limb: the air column is longest where
+      // the surface turns away from the eye.
+      const float facing = 1.0f - gsClampf(fabsf(gsDot(n, rd)), 0.0f, 1.0f);
+      const float limb = facing * facing * facing;
+      surface = gsAdd(surface, gsScale(AtmoColor(), limb * lambert * 0.42f));
+
+      color = surface;
+    }
+  }
+
+  /* --- atmospheric limb glow -------------------------------------------- */
+  // Analytic: the glow strength is a function of the ray's closest approach to
+  // the globe centre, which is exact and costs one dot product. Applied whether
+  // or not the globe was hit so the glow wraps the silhouette.
+  {
+    const float closest = gsLength(gsSub(ro, gsScale(rd, gsDot(ro, rd))));
+    if (!hitGlobe) {
+      const float halo = gsSmoothstep(kShellOuter + 0.30f, GS_GLOBE_RADIUS, closest);
+      // Forward scattering: the glow is far brighter on the sun side.
+      const float phase = 0.5f + 0.5f * gsDot(rd, sun);
+      const float sunlit = gsSmoothstep(-0.35f, 0.45f, gsDot(gsNormalize(
+          gsSub(gsScale(rd, gsDot(ro, rd) * -1.0f), ro)), sun));
+      color = gsAdd(color, gsScale(AtmoColor(),
+                                   halo * halo * (0.10f + 0.55f * phase * phase) *
+                                       (0.20f + 0.80f * sunlit)));
+    }
+  }
+
+  /* --- volumetric clouds -------------------------------------------------- */
+  if (args.hasVolume && args.volume) {
+    float tNear, tFar;
+    if (ShellRange(ro, rd, globeHit, &tNear, &tFar)) {
+      const float span = tFar - tNear;
+      const float stepLen = span / static_cast<float>(kMarchSteps);
+
+      // Blue-noise-ish jitter of the start offset. Without it the fixed step
+      // size produces concentric banding rings that are extremely visible on a
+      // sphere; a per-pixel hash breaks them into film grain the eye ignores.
+      const float jitter = gsRand01(static_cast<unsigned int>(py) * 1973u +
+                                        static_cast<unsigned int>(px) * 9277u,
+                                    static_cast<unsigned int>(t * 60.0f) & 15u);
+
+      float3 scattered = gsSplat(0.0f);
+      float transmittance = 1.0f;
+
+      // Front-to-back accumulation. The loop is written so every thread in a
+      // warp executes the same number of iterations unless they ALL break -
+      // an early `continue` on a zero-density sample would diverge without
+      // saving any time, since the warp still waits for its slowest lane.
+      float dist = tNear + jitter * stepLen;
+      for (int s = 0; s < kMarchSteps; ++s) {
+        const float3 sp = gsAdd(ro, gsScale(rd, dist));
+        const float density = SampleVolume(args.volume, sp, kShellOuter);
+
+        if (density > 0.003f) {
+          // Beer-Lambert absorption over this segment.
+          const float sigma = density * kExtinction;
+          const float alpha = 1.0f - __expf(-sigma * stepLen);
+
+          // Lighting: one cheap shadow estimate from the density a short step
+          // toward the sun. A full secondary march would be 6-8x the cost for a
+          // difference that the tonemap mostly swallows.
+          const float3 lightSample = gsAdd(sp, gsScale(sun, 0.035f));
+          const float occl = SampleVolume(args.volume, lightSample, kShellOuter);
+          const float shadow = __expf(-occl * 5.5f);
+
+          // Sun visibility at this point: the globe itself casts the night side
+          // into shadow, so clouds there must not be lit.
+          const float sunFacing = gsClampf(gsDot(gsNormalize(sp), sun) * 2.6f + 0.35f, 0.0f, 1.0f);
+
+          // Henyey-Greenstein-ish forward scattering, approximated with a
+          // squared cosine lobe - one multiply instead of a pow and a divide.
+          const float cosT = gsDot(rd, sun);
+          const float forward = 0.55f + 0.45f * cosT * cosT * (cosT > 0.0f ? 1.0f : 0.35f);
+
+          float3 lit = gsLerp3(CloudShadow(), CloudLit(), shadow * sunFacing);
+          lit = gsScale(lit, forward * (0.18f + 0.82f * sunFacing));
+
+          scattered = gsAdd(scattered, gsScale(lit, alpha * transmittance));
+          transmittance *= (1.0f - alpha);
+        }
+
+        dist += stepLen;
+
+        // Early exit once the accumulated opacity is effectively total. This is
+        // the one branch worth diverging on: it typically halves the loop count
+        // for the pixels over thick cloud, which are the expensive ones.
+        if (transmittance < (1.0f - kAlphaCutoff)) break;
+      }
+
+      color = gsAdd(gsScale(color, transmittance), scattered);
+    }
+  }
+
+  /* --- splats ------------------------------------------------------------- */
+  if (args.accum) {
+    const float4 s = args.accum[static_cast<size_t>(py) * w + px];
+    // Tonemap the splat layer on its own before adding. Tonemapping the sum
+    // would let a bright globe crush the entity layer into invisibility; doing
+    // it separately keeps the entities readable over any background.
+    const float3 splat = Tonemap(gsMake(s.x, s.y, s.z));
+    color = gsAdd(color, splat);
+  }
+
+  return color;
+}
+
+/**
+ * @brief Composite kernel, shared by both output paths.
+ *
+ * @tparam ToSurface true writes through a cudaSurfaceObject_t (native view),
+ *                   false writes to linear memory (blit path). A template
+ *                   rather than a runtime branch so neither path pays for the
+ *                   other's parameters, and there is exactly one copy of the
+ *                   shading code to keep correct.
+ */
+template <bool ToSurface>
+__global__ __launch_bounds__(GS_TILE_X * GS_TILE_Y)
+void CompositeKernel(unsigned char* __restrict__ frame, cudaSurfaceObject_t surf, int w, int h,
+                     size_t pitch, const InputUniforms* __restrict__ input, CompositeArgs args) {
   const int x = blockIdx.x * blockDim.x + threadIdx.x;
   const int y = blockIdx.y * blockDim.y + threadIdx.y;
   if (x >= w || y >= h) return;
 
-  // Copy the uniforms into registers once. Reading them field-by-field out of
-  // global memory inside the shading code would cost a load per access.
+  // Copy the uniforms into registers once. Reading them field by field out of
+  // global memory inside the shading code would cost a load per access, and the
+  // march reads the camera position on every step.
   InputUniforms in;
   if (input) {
     in = *input;
@@ -171,54 +861,127 @@ __global__ void RasterFrameKernel(unsigned char* __restrict__ frame, int w, int 
     in.aspect = static_cast<float>(w) / static_cast<float>(h);
   }
 
-  const float3 lin = ShadePixel(x, y, w, h, in, t);
-  const float3 srgb = ToSrgb(lin);
+  float3 color = ShadePixel(x, y, w, h, in, args);
 
-  unsigned char* px = frame + static_cast<size_t>(y) * pitch + static_cast<size_t>(x) * GS_RGBA_CHANNELS;
-  px[0] = gsPackUnorm8(srgb.x);
-  px[1] = gsPackUnorm8(srgb.y);
-  px[2] = gsPackUnorm8(srgb.z);
-  px[3] = 255u;
-}
-
-/* --------------------------------------------------------------------- *
- *  Surface entry point (native view / D3D11 interop path)
- * --------------------------------------------------------------------- */
-
-__global__ void RasterSurfaceKernel(cudaSurfaceObject_t surf, int w, int h,
-                                    const InputUniforms* __restrict__ input, float t) {
-  const int x = blockIdx.x * blockDim.x + threadIdx.x;
-  const int y = blockIdx.y * blockDim.y + threadIdx.y;
-  if (x >= w || y >= h) return;
-
-  InputUniforms in;
-  if (input) {
-    in = *input;
-  } else {
-    in = InputUniforms{};
-    in.camPos[2] = 3.0f;
-    in.camQuat[3] = 1.0f;
-    in.fovYDeg = 50.0f;
-    in.aspect = static_cast<float>(w) / static_cast<float>(h);
+  // Vignette before the transfer function, so it darkens in linear space.
+  {
+    const float u = (x + 0.5f) / static_cast<float>(w) - 0.5f;
+    const float vv = (y + 0.5f) / static_cast<float>(h) - 0.5f;
+    const float r2 = gsClampf((u * u + vv * vv) * 4.0f, 0.0f, 1.0f);
+    color = gsScale(color, 1.0f - 0.24f * r2 * r2);
   }
 
-  const float3 lin = ShadePixel(x, y, w, h, in, t);
-  const float3 srgb = ToSrgb(lin);
+  const float3 srgb = ToSrgb(gsClamp3(color, 0.0f, 1.0f));
 
-  uchar4 out;
-  out.x = gsPackUnorm8(srgb.x);
-  out.y = gsPackUnorm8(srgb.y);
-  out.z = gsPackUnorm8(srgb.z);
-  out.w = 255u;
+  const unsigned char r8 = gsPackUnorm8(srgb.x);
+  const unsigned char g8 = gsPackUnorm8(srgb.y);
+  const unsigned char b8 = gsPackUnorm8(srgb.z);
 
-  // surf2Dwrite takes a BYTE x offset, not a texel index - the classic
-  // interop bug is passing x and getting a frame squashed into the left
-  // quarter of the texture.
-  surf2Dwrite(out, surf, x * static_cast<int>(sizeof(uchar4)), y);
+  if (ToSurface) {
+    uchar4 out;
+    out.x = r8;
+    out.y = g8;
+    out.z = b8;
+    out.w = 255u;
+    // surf2Dwrite takes a BYTE x offset, not a texel index - the classic
+    // interop bug is passing x and getting the frame squashed into the left
+    // quarter of the texture.
+    surf2Dwrite(out, surf, x * static_cast<int>(sizeof(uchar4)), y);
+  } else {
+    unsigned char* p = frame + static_cast<size_t>(y) * pitch +
+                       static_cast<size_t>(x) * GS_RGBA_CHANNELS;
+    p[0] = r8;
+    p[1] = g8;
+    p[2] = b8;
+    p[3] = 255u;
+  }
 }
 
-/** @brief Shared uniform validation for both launchers. */
-__host__ inline bool ValidateRasterDims(int w, int h, const char* who) {
+/* ===================================================================== *
+ *  Host-side raster resources
+ * ===================================================================== */
+
+/** @brief Splat accumulation buffer, grown on demand. */
+struct RasterScratch {
+  float4* accum = nullptr;
+  size_t capacityPixels = 0;
+};
+
+RasterScratch g_raster;
+
+/** @brief Free the accumulation buffer. */
+void FreeRasterScratch() {
+  if (g_raster.accum) cudaFree(g_raster.accum);
+  g_raster = RasterScratch{};
+  cudaGetLastError();  // teardown path
+}
+
+/**
+ * @brief Ensure the accumulation buffer holds at least w*h pixels.
+ *
+ * Grow-only, so a window that shrinks and grows again does not thrash the
+ * allocator. At 4K this is 33 MB, which is nothing against the record buffers.
+ */
+cudaError_t EnsureRasterScratch(int w, int h) {
+  const size_t need = static_cast<size_t>(w) * static_cast<size_t>(h);
+  if (g_raster.accum && g_raster.capacityPixels >= need) return cudaSuccess;
+
+  FreeRasterScratch();
+  CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&g_raster.accum), need * sizeof(float4)));
+  g_raster.capacityPixels = need;
+  return cudaSuccess;
+}
+
+/**
+ * @brief Run the splat passes for whichever entities are currently resident.
+ *
+ * Shared by both entry points. Clears the accumulation buffer, then splats the
+ * swarm and/or the storm depending on what the scene registry reports.
+ */
+cudaError_t RunSplatPasses(int w, int h, const InputUniforms* input, cudaStream_t stream) {
+  const SceneState& st = GetSceneState();
+
+  const int pixels = w * h;
+  const int clearBlocks = gsDivUp(pixels, GS_BLOCK_1D);
+  ClearSplatKernel<<<clearBlocks, GS_BLOCK_1D, 0, stream>>>(g_raster.accum, pixels);
+  CUDA_CHECK(cudaGetLastError());
+
+  const float* swarm = st.swarmRecords.load(std::memory_order_relaxed);
+  const uint32_t swarmCount = st.swarmCount.load(std::memory_order_relaxed);
+  if (swarm && swarmCount > 0) {
+    const int blocks = gsDivUp(static_cast<int>(swarmCount), GS_BLOCK_1D);
+    SplatSwarmKernel<<<blocks, GS_BLOCK_1D, 0, stream>>>(g_raster.accum, w, h, swarm, swarmCount,
+                                                         input);
+    CUDA_CHECK(cudaGetLastError());
+  }
+
+  const float* storm = st.stormRecords.load(std::memory_order_relaxed);
+  const uint32_t stormCount = st.stormCount.load(std::memory_order_relaxed);
+  if (storm && stormCount > 0) {
+    const int blocks = gsDivUp(static_cast<int>(stormCount), GS_BLOCK_1D);
+    SplatStormKernel<<<blocks, GS_BLOCK_1D, 0, stream>>>(
+        g_raster.accum, w, h, reinterpret_cast<const float4*>(storm), stormCount, input);
+    CUDA_CHECK(cudaGetLastError());
+  }
+
+  return cudaSuccess;
+}
+
+/** @brief Assemble the composite arguments from the scene registry. */
+CompositeArgs BuildArgs(float timeSec) {
+  const SceneState& st = GetSceneState();
+
+  CompositeArgs args;
+  args.accum = g_raster.accum;
+  args.volume = st.densityVolume.load(std::memory_order_relaxed);
+  args.earth = static_cast<cudaTextureObject_t>(st.earthTex.load(std::memory_order_relaxed));
+  args.timeSec = timeSec;
+  args.hasVolume = (args.volume != nullptr) ? 1 : 0;
+  return args;
+}
+
+/** @brief Shared dimension validation for both launchers. */
+bool ValidateRasterDims(int w, int h, const char* who) {
   if (w <= 0 || h <= 0) {
     fprintf(stderr, "[cuda_engine] %s: bad dimensions %dx%d.\n", who, w, h);
     return false;
@@ -253,9 +1016,14 @@ cudaError_t LaunchRasterFrame(uint8_t* frame, int w, int h, size_t pitch,
   }
   if (!(timeSec == timeSec)) timeSec = 0.0f;
 
+  CUDA_CHECK(EnsureRasterScratch(w, h));
+  CUDA_CHECK(RunSplatPasses(w, h, input, stream));
+
+  const CompositeArgs args = BuildArgs(timeSec);
+
   const dim3 block(GS_TILE_X, GS_TILE_Y);
   const dim3 grid(gsDivUp(w, GS_TILE_X), gsDivUp(h, GS_TILE_Y));
-  RasterFrameKernel<<<grid, block, 0, stream>>>(frame, w, h, pitch, input, timeSec);
+  CompositeKernel<false><<<grid, block, 0, stream>>>(frame, 0, w, h, pitch, input, args);
   return cudaGetLastError();
 }
 
@@ -268,10 +1036,92 @@ cudaError_t LaunchRasterSurface(cudaSurfaceObject_t surf, int w, int h,
   if (!ValidateRasterDims(w, h, "LaunchRasterSurface")) return cudaErrorInvalidValue;
   if (!(timeSec == timeSec)) timeSec = 0.0f;
 
+  // Exactly the same pipeline as the blit path - only the final store differs.
+  CUDA_CHECK(EnsureRasterScratch(w, h));
+  CUDA_CHECK(RunSplatPasses(w, h, input, stream));
+
+  const CompositeArgs args = BuildArgs(timeSec);
+
   const dim3 block(GS_TILE_X, GS_TILE_Y);
   const dim3 grid(gsDivUp(w, GS_TILE_X), gsDivUp(h, GS_TILE_Y));
-  RasterSurfaceKernel<<<grid, block, 0, stream>>>(surf, w, h, input, timeSec);
+  CompositeKernel<true><<<grid, block, 0, stream>>>(nullptr, surf, w, h, 0, input, args);
   return cudaGetLastError();
+}
+
+/** Owned array backing the earth texture object. Declared at namespace scope
+ *  rather than inside the anonymous namespace above so ReleaseRasterScratch()
+ *  and SetEarthTexture() (both public, declared in engine.h) share it. */
+static cudaArray_t g_earthArray = nullptr;
+static cudaTextureObject_t g_earthTex = 0;
+
+cudaError_t SetEarthTexture(const uint8_t* rgba, int w, int h) {
+  if (!rgba) {
+    fprintf(stderr, "[cuda_engine] SetEarthTexture: null pixel pointer.\n");
+    return cudaErrorInvalidValue;
+  }
+  if (w <= 0 || h <= 0 || w > 16384 || h > 16384) {
+    fprintf(stderr, "[cuda_engine] SetEarthTexture: bad dimensions %dx%d.\n", w, h);
+    return cudaErrorInvalidValue;
+  }
+
+  // Unpublish before destroying, so a render thread mid-frame cannot pick up a
+  // handle that is about to become invalid.
+  GetSceneState().earthTex.store(0, std::memory_order_relaxed);
+  if (g_earthTex) {
+    cudaDestroyTextureObject(g_earthTex);
+    g_earthTex = 0;
+  }
+  if (g_earthArray) {
+    cudaFreeArray(g_earthArray);
+    g_earthArray = nullptr;
+  }
+  cudaGetLastError();
+
+  cudaChannelFormatDesc desc = cudaCreateChannelDesc<uchar4>();
+  CUDA_CHECK(cudaMallocArray(&g_earthArray, &desc, w, h));
+
+  const size_t rowBytes = static_cast<size_t>(w) * GS_RGBA_CHANNELS;
+  CUDA_CHECK(cudaMemcpy2DToArray(g_earthArray, 0, 0, rgba, rowBytes, rowBytes,
+                                 static_cast<size_t>(h), cudaMemcpyHostToDevice));
+
+  cudaResourceDesc resDesc = {};
+  resDesc.resType = cudaResourceTypeArray;
+  resDesc.res.array.array = g_earthArray;
+
+  cudaTextureDesc texDesc = {};
+  // Wrap in u (longitude is periodic), clamp in v (latitude is not) - sampling
+  // past the pole with wrap would fetch the opposite pole and tear the image.
+  texDesc.addressMode[0] = cudaAddressModeWrap;
+  texDesc.addressMode[1] = cudaAddressModeClamp;
+  texDesc.filterMode = cudaFilterModeLinear;
+  // Normalized float reads: the 8-bit texels come back as 0..1 floats through
+  // the texture unit's own conversion hardware, which is free.
+  texDesc.readMode = cudaReadModeNormalizedFloat;
+  texDesc.normalizedCoords = 1;
+
+  CUDA_CHECK(cudaCreateTextureObject(&g_earthTex, &resDesc, &texDesc, nullptr));
+
+  GetSceneState().earthTex.store(static_cast<unsigned long long>(g_earthTex),
+                                 std::memory_order_relaxed);
+  return cudaSuccess;
+}
+
+/**
+ * @brief Release the rasterizer's buffers and the earth texture.
+ *
+ * Called from Engine::Shutdown(). Safe when nothing was ever allocated.
+ */
+void ReleaseRasterScratch() {
+  GetSceneState().earthTex.store(0, std::memory_order_relaxed);
+  if (g_earthTex) {
+    cudaDestroyTextureObject(g_earthTex);
+    g_earthTex = 0;
+  }
+  if (g_earthArray) {
+    cudaFreeArray(g_earthArray);
+    g_earthArray = nullptr;
+  }
+  FreeRasterScratch();
 }
 
 }  // namespace geoswarm

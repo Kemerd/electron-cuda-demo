@@ -13,8 +13,10 @@
 #define GEOSWARM_KERNELS_COMMON_CUH
 
 #include <cuda_runtime.h>
-#include <cstdio>
+
+#include <cmath>   // host-side sqrtf/sinf/cosf - the device pass gets its own
 #include <cstdint>
+#include <cstdio>
 
 /* ====================================================================== *
  *  Error handling
@@ -119,6 +121,8 @@ __host__ __device__ __forceinline__ int gsDivUp(int n, int d) {
  *  POD and layout-stable. Counts say how many array slots are live.
  * ====================================================================== */
 
+namespace geoswarm {
+
 /** @brief One swarm rally point. Mirrors InputState.targets[i]. */
 struct TargetUniform {
   float pos[3];    ///< world-space position (globe = unit sphere at origin)
@@ -167,6 +171,8 @@ struct InputUniforms {
   float timeSec;     ///< monotonic scene clock, seconds
   float _pad;        ///< explicit tail padding so sizeof() is stable
 };
+
+}  // namespace geoswarm
 
 /* ====================================================================== *
  *  Hash-based RNG
@@ -218,6 +224,23 @@ __host__ __device__ __forceinline__ float gsRandRange(unsigned int idx, unsigned
  *  collapse to a handful of FMAs at -O3.
  * ====================================================================== */
 
+/**
+ * @brief Reciprocal square root.
+ *
+ * rsqrtf() is a device intrinsic - the MSVC host compiler has never heard of
+ * it, and this header is included by the plain C++ translation units too
+ * (engine.cc, addon.cc, native_view.cc all need InputUniforms). __CUDA_ARCH__
+ * is only defined while nvcc is compiling the device pass, so this picks the
+ * hardware instruction on the GPU and a portable divide on the host.
+ */
+__host__ __device__ __forceinline__ float gsRsqrt(float x) {
+#ifdef __CUDA_ARCH__
+  return rsqrtf(x);
+#else
+  return 1.0f / sqrtf(x);
+#endif
+}
+
 __host__ __device__ __forceinline__ float3 gsMake(float x, float y, float z) {
   float3 r; r.x = x; r.y = y; r.z = z; return r;
 }
@@ -255,7 +278,7 @@ __host__ __device__ __forceinline__ float gsLength(const float3& a) { return sqr
 __host__ __device__ __forceinline__ float3 gsNormalize(const float3& a) {
   float len2 = gsDot(a, a);
   if (len2 < 1e-20f) return gsMake(0.0f, 1.0f, 0.0f);
-  return gsScale(a, rsqrtf(len2));
+  return gsScale(a, gsRsqrt(len2));
 }
 
 __host__ __device__ __forceinline__ float gsClampf(float v, float lo, float hi) {
