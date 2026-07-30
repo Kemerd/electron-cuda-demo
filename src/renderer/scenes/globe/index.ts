@@ -12,8 +12,10 @@
  * a synthetic orbit ring, so the stage is never a dead panel.
  */
 
-import { createBackdrop, createCaption } from '../placeholder.js';
-import { SWARM_FLOATS, ALTITUDE_MAX } from '../../../shared/protocol.js';
+import { createBackdrop, createCaption } from '../placeholder';
+import type { Backdrop } from '../placeholder';
+import { SWARM_FLOATS, ALTITUDE_MAX } from '../../../shared/protocol';
+import type { FrameState, Scene, SceneMountContext } from '../../types';
 
 /** Upper bound on plotted points. Beyond this the scatter is solid ink anyway,
  *  and 2D canvas fill calls become the bottleneck instead of the transport. */
@@ -22,16 +24,15 @@ const MAX_PLOT_POINTS = 5000;
 /** Synthetic fallback ring size when there is no engine to talk to. */
 const FALLBACK_POINTS = 900;
 
-export default function createScene() {
-  /** @type {HTMLElement|null} */
-  let root = null;
-  let backdrop = null;
-  let caption = null;
+export default function createScene(): Scene {
+  let root: HTMLElement | null = null;
+  let backdrop: Backdrop | null = null;
+  let caption: HTMLElement | null = null;
 
-  /** Latest entity payload handed over by app.js. */
-  let entityView = null; // Float32Array over the transferred buffer
+  /** Latest entity payload handed over by app.ts. */
+  let entityView: Float32Array | null = null; // view over the transferred buffer
   let entityCount = 0;
-  let entityStride = SWARM_FLOATS;
+  let entityStride: number = SWARM_FLOATS;
 
   /** Set once we have plotted at least one real CUDA frame. */
   let sawEngineData = false;
@@ -54,10 +55,7 @@ export default function createScene() {
   let timeSec = 0;
 
   return {
-    /**
-     * @param {{host:HTMLElement, reducedMotion:boolean}} ctx
-     */
-    mount(ctx) {
+    mount(ctx: SceneMountContext) {
       root = document.createElement('div');
       root.className = 'scene-root';
 
@@ -85,39 +83,31 @@ export default function createScene() {
       sawEngineData = false;
     },
 
-    /**
-     * @param {number} w CSS pixels
-     * @param {number} h CSS pixels
-     */
-    resize(w, h) {
+    resize(w: number, h: number) {
       if (backdrop) backdrop.resize(w, h);
     },
 
     /**
-     * Hand this scene the current entity payload. app.js calls this the moment
+     * Hand this scene the current entity payload. app.ts calls this the moment
      * a FRAME lands, before frame() runs, so the plot is never a frame stale.
      *
-     * @param {Float32Array|null} view typed view over the transferred buffer
-     * @param {number} count valid record count
-     * @param {number} stride floats per record
+     * @param view typed view over the transferred buffer
+     * @param count valid record count
+     * @param stride floats per record
      */
-    setEntities(view, count, stride) {
+    setEntities(view: Float32Array | null, count: number, stride: number) {
       entityView = view instanceof Float32Array ? view : null;
       entityCount = Number.isFinite(count) && count > 0 ? count : 0;
       entityStride = Number.isFinite(stride) && stride > 0 ? stride : SWARM_FLOATS;
       if (entityView && entityCount > 0) sawEngineData = true;
     },
 
-    /** @returns {boolean} true once real engine data has been plotted */
-    hasEngineData() {
+    /** @returns true once real engine data has been plotted */
+    hasEngineData(): boolean {
       return sawEngineData;
     },
 
-    /**
-     * @param {number} dt seconds since the previous frame
-     * @param {object} state shared app state
-     */
-    frame(dt, state) {
+    frame(dt: number, state: FrameState) {
       if (!backdrop || !backdrop.ctx) return;
 
       const step = Number.isFinite(dt) ? Math.min(dt, 0.1) : 0;
@@ -154,7 +144,12 @@ export default function createScene() {
    * Reference circle at the globe surface. Gives the scatter something to sit
    * against so the shell structure is legible.
    */
-  function drawHorizon(ctx, cx, cy, scale) {
+  function drawHorizon(
+    ctx: CanvasRenderingContext2D,
+    cx: number,
+    cy: number,
+    scale: number,
+  ): void {
     ctx.beginPath();
     ctx.arc(cx, cy, scale, 0, Math.PI * 2);
     ctx.strokeStyle = 'rgba(255,255,255,0.10)';
@@ -175,12 +170,17 @@ export default function createScene() {
    * density stays constant regardless of preset -- and so a 2M-agent Ultra run
    * costs the same to draw as a 20k Low run.
    *
-   * @param {CanvasRenderingContext2D} ctx
-   * @param {Float32Array} view
-   * @param {number} count
-   * @param {number} stride floats per record
+   * @param stride floats per record
    */
-  function drawEngineScatter(ctx, view, count, stride, cx, cy, scale) {
+  function drawEngineScatter(
+    ctx: CanvasRenderingContext2D,
+    view: Float32Array,
+    count: number,
+    stride: number,
+    cx: number,
+    cy: number,
+    scale: number,
+  ): void {
     const plot = Math.min(count, MAX_PLOT_POINTS);
     if (plot <= 0) return;
 
@@ -199,8 +199,10 @@ export default function createScene() {
       // Guard the tail: a partially-filled buffer must not read past its end.
       if (base + 2 >= view.length) break;
 
-      const x = view[base];
-      const y = view[base + 1];
+      // The ?? 0 is for noUncheckedIndexedAccess -- the bounds check above
+      // already guarantees both reads are in range.
+      const x = view[base] ?? 0;
+      const y = view[base + 1] ?? 0;
       // Reject NaN/Inf rather than handing them to the canvas, where they
       // silently abort the whole subpath.
       if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
@@ -228,7 +230,13 @@ export default function createScene() {
    * No-engine fallback: a slowly rotating Fibonacci sphere. Same projection, so
    * the moment CUDA comes online the visual language does not change.
    */
-  function drawFallbackRing(ctx, cx, cy, scale, t) {
+  function drawFallbackRing(
+    ctx: CanvasRenderingContext2D,
+    cx: number,
+    cy: number,
+    scale: number,
+    t: number,
+  ): void {
     const rot = t * 0.18;
     const cos = Math.cos(rot);
     const sin = Math.sin(rot);
@@ -238,8 +246,8 @@ export default function createScene() {
     ctx.beginPath();
 
     for (let i = 0; i < FALLBACK_POINTS; i++) {
-      const x0 = fallbackX[i];
-      const z0 = fallbackZ[i];
+      const x0 = fallbackX[i] ?? 0;
+      const z0 = fallbackZ[i] ?? 0;
       // Rotate about Y so the sphere turns; z only affects visibility here.
       const x = x0 * cos - z0 * sin;
       const z = x0 * sin + z0 * cos;
@@ -247,7 +255,7 @@ export default function createScene() {
 
       const shell = 1.04;
       const px = cx + x * scale * shell;
-      const py = cy - fallbackY[i] * scale * shell;
+      const py = cy - (fallbackY[i] ?? 0) * scale * shell;
 
       ctx.moveTo(px + dot, py);
       ctx.arc(px, py, dot, 0, Math.PI * 2);

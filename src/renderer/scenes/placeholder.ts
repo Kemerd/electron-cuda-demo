@@ -1,5 +1,5 @@
 /**
- * placeholder.js -- shared canvas backdrop for the phase-1 scene modules.
+ * placeholder.ts -- shared canvas backdrop for the phase-1 scene modules.
  *
  * Every scene gets a real, animated surface rather than an empty panel: a slow
  * gradient wash plus a drifting field of soft blobs, tinted per scene. It is
@@ -17,26 +17,51 @@ const BLOBS = 5;
 /** The wash renders at this fraction of device resolution and is upscaled. */
 const WASH_SCALE = 0.35;
 
+/** Per-scene coloring. Both entries are "r,g,b" triples for rgba() strings. */
+export interface BackdropSpec {
+  /** Base color as "r,g,b". */
+  tint?: string;
+  /** Secondary color as "r,g,b". */
+  accent?: string;
+}
+
+/** Public surface of a mounted backdrop. */
+export interface Backdrop {
+  canvas: HTMLCanvasElement;
+  /** Null when the 2D context could not be acquired -- callers must check. */
+  ctx: CanvasRenderingContext2D | null;
+  /** @param w CSS width @param h CSS height */
+  resize(w: number, h: number): void;
+  /** @param timeSec monotonic scene clock in seconds */
+  drawWash(timeSec: number): void;
+  /** Device-pixel width of the main canvas. */
+  width(): number;
+  /** Device-pixel height of the main canvas. */
+  height(): number;
+  dpr(): number;
+  dispose(): void;
+}
+
+/** One drifting gradient blob. Parameters are fixed per instance. */
+interface Blob {
+  phase: number;
+  speed: number;
+  radius: number;
+  ax: number;
+  ay: number;
+  cx: number;
+  cy: number;
+  useAccent: boolean;
+}
+
 /**
  * Create a backdrop bound to a host element.
  *
- * @param {HTMLElement} host element to append the canvas into
- * @param {object} spec
- * @param {string} spec.tint base color as "r,g,b"
- * @param {string} spec.accent secondary color as "r,g,b"
- * @returns {{
- *   canvas:HTMLCanvasElement,
- *   ctx:CanvasRenderingContext2D|null,
- *   resize:(w:number,h:number)=>void,
- *   drawWash:(timeSec:number)=>void,
- *   width:()=>number,
- *   height:()=>number,
- *   dispose:()=>void
- * }}
+ * @param host element to append the canvas into
  */
-export function createBackdrop(host, spec) {
-  const tint = (spec && spec.tint) || '79,209,255';
-  const accent = (spec && spec.accent) || '118,185,0';
+export function createBackdrop(host: HTMLElement | null, spec?: BackdropSpec | null): Backdrop {
+  const tint = spec?.tint || '79,209,255';
+  const accent = spec?.accent || '118,185,0';
 
   const canvas = document.createElement('canvas');
   canvas.className = 'scene-canvas';
@@ -55,7 +80,7 @@ export function createBackdrop(host, spec) {
 
   // Blob parameters: fixed per instance, so the motion is deterministic and
   // allocation-free at draw time.
-  const blobs = [];
+  const blobs: Blob[] = [];
   for (let i = 0; i < BLOBS; i++) {
     blobs.push({
       // Golden-angle spacing keeps them from clumping without needing RNG.
@@ -73,11 +98,8 @@ export function createBackdrop(host, spec) {
   /**
    * Resize both canvases. `w`/`h` are CSS pixels; the backing stores are set in
    * device pixels and only touched when they actually change.
-   *
-   * @param {number} w CSS width
-   * @param {number} h CSS height
    */
-  function resize(w, h) {
+  function resize(w: number, h: number): void {
     if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return;
 
     dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -102,10 +124,8 @@ export function createBackdrop(host, spec) {
   /**
    * Paint the animated gradient wash into the main canvas. Clears it, so scenes
    * call this first and draw their own content afterwards.
-   *
-   * @param {number} timeSec monotonic scene clock in seconds
    */
-  function drawWash(timeSec) {
+  function drawWash(timeSec: number): void {
     if (!ctx || !washCtx) return;
 
     const t = Number.isFinite(timeSec) ? timeSec : 0;
@@ -121,6 +141,7 @@ export function createBackdrop(host, spec) {
 
     for (let i = 0; i < blobs.length; i++) {
       const b = blobs[i];
+      if (!b) continue;
       const a = t * b.speed + b.phase;
 
       // Lissajous drift: two incommensurate frequencies never repeat visibly.
@@ -163,7 +184,7 @@ export function createBackdrop(host, spec) {
   }
 
   /** Remove the canvas from the DOM and drop the backing stores. */
-  function dispose() {
+  function dispose(): void {
     if (canvas.parentNode) canvas.parentNode.removeChild(canvas);
     // Zeroing the dimensions releases the backing store immediately rather than
     // waiting for the GC to notice the detached canvases.
@@ -185,26 +206,31 @@ export function createBackdrop(host, spec) {
   };
 }
 
+/** Text content of the bottom-left caption block. */
+export interface CaptionSpec {
+  tag?: string;
+  title?: string;
+  body?: string;
+}
+
 /**
  * Build the bottom-left caption block every placeholder scene shares.
  *
- * @param {HTMLElement} host
- * @param {{tag:string, title:string, body:string}} spec
- * @returns {HTMLElement} the caption element (so callers can remove it)
+ * @returns the caption element (so callers can remove it)
  */
-export function createCaption(host, spec) {
+export function createCaption(host: HTMLElement | null, spec?: CaptionSpec | null): HTMLElement {
   const el = document.createElement('div');
   el.className = 'scene-caption';
 
   const tag = document.createElement('span');
   tag.className = 'scene-tag';
-  tag.textContent = (spec && spec.tag) || 'Scene';
+  tag.textContent = spec?.tag || 'Scene';
 
   const h = document.createElement('h2');
-  h.textContent = (spec && spec.title) || '';
+  h.textContent = spec?.title || '';
 
   const p = document.createElement('p');
-  p.textContent = (spec && spec.body) || '';
+  p.textContent = spec?.body || '';
 
   el.append(tag, h, p);
   if (host) host.appendChild(el);

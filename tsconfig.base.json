@@ -1,0 +1,17 @@
+{
+  // Shared strictness baseline. The main-process and renderer configs extend
+  // this; neither relaxes anything below. If a rule hurts, fix the code.
+  "compilerOptions": {
+    "strict": true,
+    "target": "ES2023",
+    "useDefineForClassFields": true,
+    "esModuleInterop": true,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "verbatimModuleSyntax": true
+  }
+}

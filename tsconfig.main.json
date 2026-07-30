@@ -1,0 +1,18 @@
+{
+  // Electron main process: compiled by tsc to real ESM under dist-electron/.
+  // NodeNext resolution means relative imports carry .js extensions in source
+  // (they resolve to the .ts sibling at check time, and to the emitted .js at
+  // run time). preload.cts emits preload.cjs -- the sandboxed preload must be
+  // CommonJS, and .cts is the only input extension tsc maps to a .cjs output.
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "outDir": "dist-electron",
+    "rootDir": "src",
+    "sourceMap": true,
+    "lib": ["ES2023"],
+    "types": ["node"]
+  },
+  "include": ["src/main/**/*", "src/shared/**/*"]
+}

@@ -1,25 +1,27 @@
 /**
- * frame-pump.js -- the MessagePort frame transport between main and renderer.
+ * frame-pump.ts -- the MessagePort frame transport between main and renderer.
  *
  * Why a MessagePort instead of plain ipcMain/ipcRenderer: regular IPC is
  * structured-clone only for large payloads unless you hand-roll transfers, and
  * it routes through the main-process router. A MessageChannelMain pair gives us
  * a direct, transferable-capable channel where an ArrayBuffer moves by pointer
- * handoff instead of a memcpy. At 2M agents * 32 bytes = 64 MB per frame the
- * difference is the whole demo.
+ * handoff instead of a memcpy on the leg that supports it. At 2M agents * 32
+ * bytes = 64 MB per frame the difference is the whole demo.
  *
  * Buffer lifecycle (CONTRACTS section 7):
- *   pool -> [transfer to renderer as FRAME.buf] -> renderer reads it ->
- *   renderer sends it back on the next REQ.buffers (or a RECYCLE msg) -> pool.
+ *   pool -> [clone to renderer as FRAME.buf, ours re-pooled immediately] ->
+ *   renderer reads it -> renderer transfers it back on the next REQ.buffers
+ *   (or a RECYCLE msg) -> pool.
  *
- * Transfer DETACHES the ArrayBuffer on the sending side, so the pump can never
- * hold a usable reference to a buffer it has posted. Three buffers per kind is
+ * The two legs are asymmetric, which is the single most surprising thing about
+ * this file -- see the long note on postFrame(). Three buffers per kind is
  * enough to cover one in flight + one being read + one being refilled, which
  * means steady state has zero allocation. If we ever do allocate after warmup
  * that is a bug worth seeing, so it gets logged.
  */
 
 import { ipcMain, MessageChannelMain, nativeImage } from 'electron';
+import type { MessagePortMain, WebContents } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -37,7 +39,16 @@ import {
   FIELD_CHANNELS,
   RGBA_CHANNELS,
 } from '../shared/protocol.js';
+import type {
+  FrameMsg,
+  OkResult,
+  PayloadKind,
+  ReqMsg,
+  SceneId,
+  SceneParams,
+} from '../shared/protocol.js';
 import { getEngine } from './capabilities.js';
+import type { CudaEngine } from './engine-types.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -52,14 +63,42 @@ const EARTH_ASSET_DIR = path.resolve(here, '../../assets/earth');
 const EARTH_ASSET_CANDIDATES = ['earth.jpg', 'earth.png', 'earth_daymap.jpg', 'earth_daymap.png'];
 
 /* ------------------------------------------------------------------ *
+ *  Local types
+ * ------------------------------------------------------------------ */
+
+/** Everything the pump needs to size its pools for the current scene. */
+interface SceneState {
+  scene: SceneId;
+  params: SceneParams;
+}
+
+/** Snapshot returned by getPumpStats(); the smoke test reports it verbatim. */
+export interface PumpStats {
+  /** True while a renderer holds the other end of the channel. */
+  connected: boolean;
+  /** FRAME messages successfully produced since the last port handshake. */
+  framesServed: number;
+  /** Allocations forced past warmup -- steady state should hold this at 0. */
+  underflowAllocations: number;
+  /** Expected byteLength per payload kind for the active scene/preset. */
+  poolSizes: Record<PayloadKind, number>;
+}
+
+/** Requested raster target size, used to re-point the RGBA pool. */
+interface RasterSize {
+  width: number;
+  height: number;
+}
+
+/* ------------------------------------------------------------------ *
  *  Pump state
  * ------------------------------------------------------------------ */
 
-/** @type {import('electron').MessagePortMain|null} main-side port (we keep port1). */
-let port = null;
+/** Main-side port (we keep port1). */
+let port: MessagePortMain | null = null;
 
 /** Active scene params -- drives every pool size calculation. */
-let sceneState = {
+let sceneState: SceneState = {
   scene: SCENES.SWARM,
   params: { ...PRESETS[DEFAULT_PRESET] },
 };
@@ -67,16 +106,15 @@ let sceneState = {
 /**
  * Free buffers per kind. Values are ArrayBuffers that we currently own (i.e.
  * not detached). Keyed by KIND.*.
- * @type {Record<string, ArrayBuffer[]>}
  */
-const pools = {
+const pools: Record<PayloadKind, ArrayBuffer[]> = {
   [KIND.ENTITIES]: [],
   [KIND.FIELD]: [],
   [KIND.RGBA]: [],
 };
 
 /** Expected byteLength per kind for the current scene/params. */
-const poolSizes = {
+const poolSizes: Record<PayloadKind, number> = {
   [KIND.ENTITIES]: 0,
   [KIND.FIELD]: 0,
   [KIND.RGBA]: 0,
@@ -88,6 +126,22 @@ let underflowAllocations = 0;
 /** Warmup grace -- the first few frames legitimately allocate the pool. */
 let framesServed = 0;
 
+/** Message extraction that survives a thrown non-Error (a string, null, ...). */
+function errText(err: unknown): string {
+  if (err instanceof Error && err.message) return err.message;
+  return String(err);
+}
+
+/** Narrow an unknown to an indexable record; used on data off the wire. */
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === 'object' ? (value as Record<string, unknown>) : null;
+}
+
+/** Read a finite number off an untrusted record, or fall back. */
+function numOr(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
 /* ------------------------------------------------------------------ *
  *  Pool sizing
  * ------------------------------------------------------------------ */
@@ -97,28 +151,28 @@ let framesServed = 0;
  * records (weather drives the same agents with a wind field); storm emits the
  * shorter particle record.
  *
- * @param {string} scene
- * @param {{swarmCount?:number, stormCount?:number}} params
- * @returns {number} bytes
+ * @param scene active scene id
+ * @param params sizing parameters for that scene
+ * @returns bytes
  */
-function entityBytesFor(scene, params) {
+function entityBytesFor(scene: SceneId, params: SceneParams | null | undefined): number {
   if (scene === SCENES.STORM) {
-    const n = clampCount(params && params.stormCount, PRESETS[DEFAULT_PRESET].stormCount);
+    const n = clampCount(params?.stormCount, PRESETS[DEFAULT_PRESET].stormCount);
     return n * STORM_STRIDE_BYTES;
   }
-  const n = clampCount(params && params.swarmCount, PRESETS[DEFAULT_PRESET].swarmCount);
+  const n = clampCount(params?.swarmCount, PRESETS[DEFAULT_PRESET].swarmCount);
   return n * SWARM_STRIDE_BYTES;
 }
 
 /**
  * Weather field size. The grid constant is the equirect WIDTH; height is half
- * of it (W = 2*H per protocol.js).
+ * of it (W = 2*H per protocol.ts).
  *
- * @param {{weatherGrid?:number}} params
- * @returns {number} bytes
+ * @param params sizing parameters for the active scene
+ * @returns bytes
  */
-function fieldBytesFor(params) {
-  const w = clampCount(params && params.weatherGrid, PRESETS[DEFAULT_PRESET].weatherGrid);
+function fieldBytesFor(params: SceneParams | null | undefined): number {
+  const w = clampCount(params?.weatherGrid, PRESETS[DEFAULT_PRESET].weatherGrid);
   const h = Math.max(1, Math.floor(w / 2));
   return w * h * FIELD_CHANNELS;
 }
@@ -127,7 +181,7 @@ function fieldBytesFor(params) {
  * Clamp a user/preset-supplied count into something we are willing to allocate.
  * Anything non-finite or <= 0 falls back to the default preset value.
  */
-function clampCount(value, fallback) {
+function clampCount(value: unknown, fallback: number): number {
   if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return fallback;
   return Math.min(Math.floor(value), 64_000_000);
 }
@@ -136,10 +190,8 @@ function clampCount(value, fallback) {
  * Recompute expected pool sizes and discard any pooled buffer that no longer
  * matches. Called on scene configure and whenever an RGBA request arrives at a
  * new resolution.
- *
- * @param {{width?:number, height?:number}} [rasterSize]
  */
-function resizePools(rasterSize) {
+function resizePools(rasterSize?: RasterSize): void {
   const nextEntities = entityBytesFor(sceneState.scene, sceneState.params);
   const nextField = fieldBytesFor(sceneState.params);
 
@@ -158,7 +210,7 @@ function resizePools(rasterSize) {
  * Dropped buffers are simply released to the GC -- there is no way to resize an
  * ArrayBuffer in place, and holding mismatched memory is worse than a realloc.
  */
-function applyPoolSize(kind, bytes) {
+function applyPoolSize(kind: PayloadKind, bytes: number): void {
   const size = Number.isFinite(bytes) && bytes > 0 ? Math.floor(bytes) : 0;
   if (poolSizes[kind] === size) return;
 
@@ -178,11 +230,10 @@ function applyPoolSize(kind, bytes) {
  * Returns null when the request is nonsensical (zero/oversized) so the caller
  * can reply with an ERROR instead of throwing.
  *
- * @param {string} kind KIND.*
- * @param {number} bytes required byteLength
- * @returns {ArrayBuffer|null}
+ * @param kind KIND.*
+ * @param bytes required byteLength
  */
-function acquire(kind, bytes) {
+function acquire(kind: PayloadKind, bytes: number): ArrayBuffer | null {
   if (!Number.isFinite(bytes) || bytes <= 0) {
     console.warn('[pump] refusing to acquire %s buffer of %s bytes', kind, String(bytes));
     return null;
@@ -222,7 +273,7 @@ function acquire(kind, bytes) {
   try {
     return new ArrayBuffer(bytes);
   } catch (err) {
-    console.warn('[pump] allocation of %d bytes failed: %s', bytes, err && err.message);
+    console.warn('[pump] allocation of %d bytes failed: %s', bytes, errText(err));
     return null;
   }
 }
@@ -230,13 +281,13 @@ function acquire(kind, bytes) {
 /**
  * Return a buffer to its pool. Anything with the wrong byteLength (a leftover
  * from a previous preset) or a detached buffer is dropped on the floor.
- *
- * @param {ArrayBuffer} buf
  */
-function release(buf) {
+function release(buf: ArrayBuffer | null | undefined): void {
   if (!buf || typeof buf.byteLength !== 'number' || buf.byteLength === 0) return;
 
-  for (const kind of Object.keys(poolSizes)) {
+  // Object.keys() widens to string[]; iterating the KIND values keeps the index
+  // type exact so poolSizes/pools stay checked rather than cast.
+  for (const kind of Object.values(KIND)) {
     if (poolSizes[kind] === buf.byteLength) {
       if (pools[kind].length < POOL_DEPTH) pools[kind].push(buf);
       return;
@@ -247,9 +298,8 @@ function release(buf) {
 
 /**
  * Absorb a batch of recycled buffers from the renderer.
- * @param {unknown} list
  */
-function absorbRecycled(list) {
+function absorbRecycled(list: unknown): void {
   if (!Array.isArray(list)) return;
   for (const b of list) {
     // Structured clone gives us real ArrayBuffers; anything else is a renderer bug.
@@ -264,31 +314,30 @@ function absorbRecycled(list) {
 /**
  * Push the per-frame input struct at the engine. Failures here are non-fatal:
  * the sim just runs with the previous input for a frame.
- *
- * @param {object} engine
- * @param {unknown} input
  */
-function applyInput(engine, input) {
+function applyInput(engine: CudaEngine, input: unknown): void {
   if (!input || typeof input !== 'object') return;
   if (typeof engine.setInput !== 'function') return;
   try {
-    engine.setInput(input);
+    // The renderer builds this from protocol.ts's InputState, but it arrives
+    // here as wire data; the shape check above is the only guarantee available
+    // on this side, so the assertion is where trust is handed to the addon --
+    // which validates every field again before touching device memory.
+    engine.setInput(input as Parameters<NonNullable<CudaEngine['setInput']>>[0]);
   } catch (err) {
-    console.warn('[pump] setInput failed: %s', err && err.message ? err.message : String(err));
+    console.warn('[pump] setInput failed: %s', errText(err));
   }
 }
 
 /**
  * Send an ERROR message for a request that could not be served.
- * @param {number} frameId
- * @param {string} reason
  */
-function replyError(frameId, reason) {
+function replyError(frameId: number, reason: string): void {
   if (!port) return;
   try {
     port.postMessage({ t: MSG.ERROR, frameId, reason: String(reason) });
   } catch (err) {
-    console.warn('[pump] failed to post ERROR: %s', err && err.message);
+    console.warn('[pump] failed to post ERROR: %s', errText(err));
   }
 }
 
@@ -308,9 +357,9 @@ function replyError(frameId, reason) {
  * return leg is a DOM MessagePort, which does support ArrayBuffer transfer, so
  * inbound recycling stays a genuine zero-copy handoff.
  *
- * @param {object} msg fully-formed FRAME message with .buf set
+ * @param msg fully-formed FRAME message with .buf set
  */
-function postFrame(msg) {
+function postFrame(msg: FrameMsg): void {
   if (!port) return;
   const buf = msg.buf;
   try {
@@ -319,24 +368,27 @@ function postFrame(msg) {
     // than allocating a replacement next frame.
     release(buf);
   } catch (err) {
-    console.warn('[pump] failed to post FRAME: %s', err && err.message);
+    console.warn('[pump] failed to post FRAME: %s', errText(err));
     // The buffer's fate is ambiguous after a failed post; do not pool it back.
   }
 }
 
 /**
  * Service one REQ. Chooses the engine entry point from the requested payload
- * kind, fills a pooled buffer, and transfers it back.
+ * kind, fills a pooled buffer, and posts it back.
  *
- * @param {object} req REQ message (see protocol.js)
+ * The parameter is typed as a partial REQ rather than ReqMsg: this is wire
+ * data, and every field is re-validated here regardless of what the type says.
+ *
+ * @param req REQ message (see protocol.ts)
  */
-function handleRequest(req) {
+function handleRequest(req: Partial<ReqMsg> & { kind?: unknown }): void {
   if (!req || typeof req !== 'object') {
     console.warn('[pump] ignoring malformed request');
     return;
   }
 
-  const frameId = Number.isFinite(req.frameId) ? req.frameId : 0;
+  const frameId = numOr(req.frameId, 0);
 
   // Buffers riding on the request come back first so they are available to
   // satisfy this very request -- that is what keeps steady state allocation-free.
@@ -348,8 +400,8 @@ function handleRequest(req) {
     return;
   }
 
-  const scene = typeof req.scene === 'string' ? req.scene : sceneState.scene;
-  const dtMs = Number.isFinite(req.dtMs) ? Math.max(0, Math.min(100, req.dtMs)) : 16.7;
+  const scene: SceneId = typeof req.scene === 'string' ? req.scene : sceneState.scene;
+  const dtMs = Number.isFinite(req.dtMs) ? Math.max(0, Math.min(100, req.dtMs as number)) : 16.7;
 
   applyInput(engine, req.input);
 
@@ -371,8 +423,9 @@ function handleRequest(req) {
 /**
  * step() -> interleaved entity records.
  */
-function serveEntities(engine, frameId, scene, dtMs) {
-  if (typeof engine.step !== 'function') {
+function serveEntities(engine: CudaEngine, frameId: number, scene: SceneId, dtMs: number): void {
+  const step = engine.step;
+  if (typeof step !== 'function') {
     replyError(frameId, 'Engine does not export step()');
     return;
   }
@@ -386,16 +439,16 @@ function serveEntities(engine, frameId, scene, dtMs) {
 
   let res;
   try {
-    res = engine.step(scene, dtMs, buf);
+    res = step.call(engine, scene, dtMs, buf);
   } catch (err) {
     release(buf);
-    replyError(frameId, `step() threw: ${err && err.message ? err.message : String(err)}`);
+    replyError(frameId, `step() threw: ${errText(err)}`);
     return;
   }
 
   if (!res || res.ok !== true) {
     release(buf);
-    replyError(frameId, (res && res.reason) || 'step() failed');
+    replyError(frameId, res?.reason || 'step() failed');
     return;
   }
 
@@ -405,10 +458,10 @@ function serveEntities(engine, frameId, scene, dtMs) {
     frameId,
     scene,
     kind: KIND.ENTITIES,
-    count: Number.isFinite(res.count) ? res.count : 0,
+    count: numOr(res.count, 0),
     timings: {
-      simMs: Number.isFinite(res.simMs) ? res.simMs : 0,
-      copyMs: Number.isFinite(res.copyMs) ? res.copyMs : 0,
+      simMs: numOr(res.simMs, 0),
+      copyMs: numOr(res.copyMs, 0),
     },
     buf,
   });
@@ -417,8 +470,9 @@ function serveEntities(engine, frameId, scene, dtMs) {
 /**
  * getWeatherField() -> RGBA8 equirect grid.
  */
-function serveField(engine, frameId, scene) {
-  if (typeof engine.getWeatherField !== 'function') {
+function serveField(engine: CudaEngine, frameId: number, scene: SceneId): void {
+  const getWeatherField = engine.getWeatherField;
+  if (typeof getWeatherField !== 'function') {
     replyError(frameId, 'Engine does not export getWeatherField()');
     return;
   }
@@ -432,16 +486,16 @@ function serveField(engine, frameId, scene) {
 
   let res;
   try {
-    res = engine.getWeatherField(buf);
+    res = getWeatherField.call(engine, buf);
   } catch (err) {
     release(buf);
-    replyError(frameId, `getWeatherField() threw: ${err && err.message ? err.message : String(err)}`);
+    replyError(frameId, `getWeatherField() threw: ${errText(err)}`);
     return;
   }
 
   if (!res || res.ok !== true) {
     release(buf);
-    replyError(frameId, (res && res.reason) || 'getWeatherField() failed');
+    replyError(frameId, res?.reason || 'getWeatherField() failed');
     return;
   }
 
@@ -451,11 +505,11 @@ function serveField(engine, frameId, scene) {
     frameId,
     scene,
     kind: KIND.FIELD,
-    w: Number.isFinite(res.w) ? res.w : 0,
-    h: Number.isFinite(res.h) ? res.h : 0,
+    w: numOr(res.w, 0),
+    h: numOr(res.h, 0),
     timings: {
-      simMs: Number.isFinite(res.simMs) ? res.simMs : 0,
-      copyMs: Number.isFinite(res.copyMs) ? res.copyMs : 0,
+      simMs: numOr(res.simMs, 0),
+      copyMs: numOr(res.copyMs, 0),
     },
     buf,
   });
@@ -464,14 +518,21 @@ function serveField(engine, frameId, scene) {
 /**
  * renderFrame() -> full RGBA8 framebuffer.
  */
-function serveRgba(engine, req, frameId, scene, dtMs) {
-  if (typeof engine.renderFrame !== 'function') {
+function serveRgba(
+  engine: CudaEngine,
+  req: Partial<ReqMsg>,
+  frameId: number,
+  scene: SceneId,
+  dtMs: number,
+): void {
+  const renderFrame = engine.renderFrame;
+  if (typeof renderFrame !== 'function') {
     replyError(frameId, 'Engine does not export renderFrame()');
     return;
   }
 
-  const w = Number.isFinite(req.width) ? Math.max(1, Math.floor(req.width)) : 0;
-  const h = Number.isFinite(req.height) ? Math.max(1, Math.floor(req.height)) : 0;
+  const w = Number.isFinite(req.width) ? Math.max(1, Math.floor(req.width as number)) : 0;
+  const h = Number.isFinite(req.height) ? Math.max(1, Math.floor(req.height as number)) : 0;
   if (w <= 0 || h <= 0) {
     replyError(frameId, 'RGBA request needs positive width and height');
     return;
@@ -489,16 +550,16 @@ function serveRgba(engine, req, frameId, scene, dtMs) {
 
   let res;
   try {
-    res = engine.renderFrame(scene, w, h, dtMs, buf);
+    res = renderFrame.call(engine, scene, w, h, dtMs, buf);
   } catch (err) {
     release(buf);
-    replyError(frameId, `renderFrame() threw: ${err && err.message ? err.message : String(err)}`);
+    replyError(frameId, `renderFrame() threw: ${errText(err)}`);
     return;
   }
 
   if (!res || res.ok !== true) {
     release(buf);
-    replyError(frameId, (res && res.reason) || 'renderFrame() failed');
+    replyError(frameId, res?.reason || 'renderFrame() failed');
     return;
   }
 
@@ -511,9 +572,9 @@ function serveRgba(engine, req, frameId, scene, dtMs) {
     w,
     h,
     timings: {
-      simMs: Number.isFinite(res.simMs) ? res.simMs : 0,
-      copyMs: Number.isFinite(res.copyMs) ? res.copyMs : 0,
-      renderMs: Number.isFinite(res.renderMs) ? res.renderMs : 0,
+      simMs: numOr(res.simMs, 0),
+      copyMs: numOr(res.copyMs, 0),
+      renderMs: numOr(res.renderMs, 0),
     },
     buf,
   });
@@ -525,15 +586,14 @@ function serveRgba(engine, req, frameId, scene, dtMs) {
 
 /**
  * Route an inbound port message. MessagePortMain delivers { data } events.
- * @param {{data:any}} e
  */
-function onPortMessage(e) {
-  const msg = e && e.data;
-  if (!msg || typeof msg !== 'object') return;
+function onPortMessage(e: { data: unknown }): void {
+  const msg = asRecord(e?.data);
+  if (!msg) return;
 
   switch (msg.t) {
     case MSG.REQ:
-      handleRequest(msg);
+      handleRequest(msg as Partial<ReqMsg>);
       break;
     case MSG.RECYCLE:
       absorbRecycled(msg.buffers);
@@ -548,10 +608,8 @@ function onPortMessage(e) {
  * Build a fresh channel and hand port2 to the renderer. Called on every
  * IPC.RENDERER_READY, which also fires after a renderer reload -- the old port
  * is closed first so we do not leak a dangling channel.
- *
- * @param {import('electron').WebContents} webContents
  */
-function establishPort(webContents) {
+function establishPort(webContents: WebContents | null | undefined): void {
   if (!webContents || webContents.isDestroyed()) {
     console.warn('[pump] renderer ready from a destroyed webContents; ignoring');
     return;
@@ -567,7 +625,7 @@ function establishPort(webContents) {
   }
 
   // A reload invalidates every buffer the old renderer held. Start clean.
-  for (const kind of Object.keys(pools)) pools[kind].length = 0;
+  for (const kind of Object.values(KIND)) pools[kind].length = 0;
   framesServed = 0;
   underflowAllocations = 0;
 
@@ -585,13 +643,19 @@ function establishPort(webContents) {
     webContents.postMessage(IPC.ENGINE_PORT, null, [port2]);
     console.log('[pump] engine port delivered to renderer');
   } catch (err) {
-    console.warn('[pump] failed to deliver port: %s', err && err.message);
+    console.warn('[pump] failed to deliver port: %s', errText(err));
   }
 }
 
 /* ------------------------------------------------------------------ *
  *  Earth texture
  * ------------------------------------------------------------------ */
+
+/** Result of the earth-texture upload; adds the decoded dimensions to OkResult. */
+interface EarthUploadResult extends OkResult {
+  w?: number;
+  h?: number;
+}
 
 /**
  * Decode the bundled earth texture with Electron's nativeImage and hand the
@@ -600,17 +664,16 @@ function establishPort(webContents) {
  *
  * The asset is optional -- a fresh clone has no assets/earth, and that returns
  * a clean { ok:false, reason } rather than an error dialog.
- *
- * @returns {{ok:boolean, reason?:string, w?:number, h?:number}}
  */
-function uploadEarthTexture() {
+function uploadEarthTexture(): EarthUploadResult {
   const engine = getEngine();
   if (!engine) return { ok: false, reason: 'CUDA engine unavailable' };
-  if (typeof engine.uploadEarthTexture !== 'function') {
+  const upload = engine.uploadEarthTexture;
+  if (typeof upload !== 'function') {
     return { ok: false, reason: 'Engine does not export uploadEarthTexture()' };
   }
 
-  let assetPath = null;
+  let assetPath: string | null = null;
   for (const name of EARTH_ASSET_CANDIDATES) {
     const candidate = path.join(EARTH_ASSET_DIR, name);
     if (fs.existsSync(candidate)) {
@@ -626,7 +689,7 @@ function uploadEarthTexture() {
   try {
     image = nativeImage.createFromPath(assetPath);
   } catch (err) {
-    return { ok: false, reason: `decode failed: ${err && err.message ? err.message : String(err)}` };
+    return { ok: false, reason: `decode failed: ${errText(err)}` };
   }
   if (!image || image.isEmpty()) {
     return { ok: false, reason: `nativeImage could not decode ${path.basename(assetPath)}` };
@@ -643,7 +706,7 @@ function uploadEarthTexture() {
   try {
     bitmap = image.toBitmap();
   } catch (err) {
-    return { ok: false, reason: `toBitmap failed: ${err && err.message ? err.message : String(err)}` };
+    return { ok: false, reason: `toBitmap failed: ${errText(err)}` };
   }
   if (!bitmap || bitmap.byteLength < size.width * size.height * 4) {
     return { ok: false, reason: 'decoded bitmap smaller than its reported size' };
@@ -652,18 +715,18 @@ function uploadEarthTexture() {
   // Copy out of the Node Buffer's (possibly pooled, oversized) backing store so
   // the engine receives an ArrayBuffer whose length is exactly the pixel data.
   const bytes = size.width * size.height * 4;
-  const ab = bitmap.buffer.slice(bitmap.byteOffset, bitmap.byteOffset + bytes);
+  const ab = bitmap.buffer.slice(bitmap.byteOffset, bitmap.byteOffset + bytes) as ArrayBuffer;
 
   try {
-    const res = engine.uploadEarthTexture(ab, size.width, size.height);
+    const res = upload.call(engine, ab, size.width, size.height);
     if (!res || res.ok !== true) {
-      return { ok: false, reason: (res && res.reason) || 'uploadEarthTexture() failed' };
+      return { ok: false, reason: res?.reason || 'uploadEarthTexture() failed' };
     }
     return { ok: true, w: size.width, h: size.height };
   } catch (err) {
     return {
       ok: false,
-      reason: `uploadEarthTexture() threw: ${err && err.message ? err.message : String(err)}`,
+      reason: `uploadEarthTexture() threw: ${errText(err)}`,
     };
   }
 }
@@ -677,7 +740,7 @@ function uploadEarthTexture() {
  * then every channel answers honestly instead of silently doing nothing, so the
  * UI can grey out the Present column with a real reason string.
  */
-const NVIEW_PENDING = Object.freeze({
+const NVIEW_PENDING: Readonly<OkResult> = Object.freeze({
   ok: false,
   reason: 'native view arrives in a later phase',
 });
@@ -687,7 +750,7 @@ let pumpInstalled = false;
 /**
  * Install every pump-owned IPC handler. Idempotent.
  */
-export function registerFramePump() {
+export function registerFramePump(): void {
   if (pumpInstalled) return;
   pumpInstalled = true;
 
@@ -696,27 +759,32 @@ export function registerFramePump() {
     establishPort(event.sender);
   });
 
-  ipcMain.handle(IPC.CONFIGURE_SCENE, (_event, payload) => {
-    if (!payload || typeof payload !== 'object') {
+  ipcMain.handle(IPC.CONFIGURE_SCENE, (_event, payload: unknown): OkResult => {
+    const body = asRecord(payload);
+    if (!body) {
       return { ok: false, reason: 'configureScene needs { scene, params }' };
     }
 
-    const scene = typeof payload.scene === 'string' ? payload.scene : null;
-    if (!scene || !Object.values(SCENES).includes(scene)) {
-      return { ok: false, reason: `Unknown scene "${String(payload.scene)}"` };
+    const requested = typeof body.scene === 'string' ? body.scene : null;
+    // Object.values(SCENES).includes() does not narrow on its own; the explicit
+    // find keeps `scene` typed as SceneId without an assertion.
+    const scene = Object.values(SCENES).find((s) => s === requested);
+    if (!scene) {
+      return { ok: false, reason: `Unknown scene "${String(body.scene)}"` };
     }
 
-    const params = payload.params && typeof payload.params === 'object' ? payload.params : {};
+    const params = asRecord(body.params) ?? {};
 
     // Sanitize into the shape the pool math expects before anything touches the GPU.
-    const clean = {
+    const clean: Required<SceneParams> = {
       swarmCount: clampCount(params.swarmCount, PRESETS[DEFAULT_PRESET].swarmCount),
       weatherGrid: clampCount(params.weatherGrid, PRESETS[DEFAULT_PRESET].weatherGrid),
       stormCount: clampCount(params.stormCount, PRESETS[DEFAULT_PRESET].stormCount),
     };
 
     const engine = getEngine();
-    if (!engine || typeof engine.configureScene !== 'function') {
+    const configureScene = engine?.configureScene;
+    if (!engine || typeof configureScene !== 'function') {
       // Track the request anyway: pool sizes stay consistent for when CUDA does
       // come online, and the UI gets an honest reason.
       sceneState = { scene, params: clean };
@@ -726,16 +794,16 @@ export function registerFramePump() {
 
     let res;
     try {
-      res = engine.configureScene(scene, clean);
+      res = configureScene.call(engine, scene, clean);
     } catch (err) {
       return {
         ok: false,
-        reason: `configureScene() threw: ${err && err.message ? err.message : String(err)}`,
+        reason: `configureScene() threw: ${errText(err)}`,
       };
     }
 
     if (!res || res.ok !== true) {
-      return { ok: false, reason: (res && res.reason) || 'configureScene() failed' };
+      return { ok: false, reason: res?.reason || 'configureScene() failed' };
     }
 
     sceneState = { scene, params: clean };
@@ -747,16 +815,21 @@ export function registerFramePump() {
       poolSizes[KIND.FIELD],
     );
 
-    return { ok: true, vramUsedMB: Number.isFinite(res.vramUsedMB) ? res.vramUsedMB : undefined };
+    return {
+      ok: true,
+      vramUsedMB: typeof res.vramUsedMB === 'number' && Number.isFinite(res.vramUsedMB)
+        ? res.vramUsedMB
+        : undefined,
+    };
   });
 
-  ipcMain.handle(IPC.UPLOAD_EARTH, () => {
+  ipcMain.handle(IPC.UPLOAD_EARTH, (): EarthUploadResult => {
     try {
       return uploadEarthTexture();
     } catch (err) {
       return {
         ok: false,
-        reason: `earth upload failed: ${err && err.message ? err.message : String(err)}`,
+        reason: `earth upload failed: ${errText(err)}`,
       };
     }
   });
@@ -777,7 +850,7 @@ export function registerFramePump() {
 /**
  * Close the port and drop pooled memory. Called from app teardown.
  */
-export function shutdownFramePump() {
+export function shutdownFramePump(): void {
   if (port) {
     try {
       port.close();
@@ -786,11 +859,11 @@ export function shutdownFramePump() {
     }
     port = null;
   }
-  for (const kind of Object.keys(pools)) pools[kind].length = 0;
+  for (const kind of Object.values(KIND)) pools[kind].length = 0;
 }
 
 /** Diagnostics hook used by the smoke test. */
-export function getPumpStats() {
+export function getPumpStats(): PumpStats {
   return {
     connected: port !== null,
     framesServed,

@@ -1,12 +1,12 @@
 /**
- * matrix.js -- the compute / raster / present backend selector.
+ * matrix.ts -- the compute / raster / present backend selector.
  *
  * Three segmented controls over the COMPUTE, RASTER and PRESENT constants. A
  * cell is enabled only when BOTH gates pass:
  *
  *   1. Capability gate  -- is the backend physically available on this machine?
  *   2. Legality gate    -- would picking it produce a coherent pipeline?
- *      (isLegalMode from protocol.js; the reasons it returns explain real
+ *      (isLegalMode from protocol.ts; the reasons it returns explain real
  *      data-locality constraints, so the tooltip teaches instead of scolding.)
  *
  * Disabled cells get a hover/focus tooltip carrying whichever reason applies.
@@ -14,10 +14,33 @@
  * is more actionable than "that combination is illegal".
  */
 
-import { COMPUTE, RASTER, PRESENT, isLegalMode } from '../../shared/protocol.js';
+import { COMPUTE, RASTER, PRESENT, isLegalMode } from '../../shared/protocol';
+import type { LegalityResult, ModeState } from '../../shared/protocol';
+import type { MergedCaps } from '../types';
+
+/**
+ * Which axis of ModeState a control drives. Typing the key this way is what
+ * lets mode[control.key] read and { ...mode, [key]: value } write without a
+ * cast anywhere in this module.
+ */
+type ControlKey = keyof ModeState;
+
+/** One selectable cell inside a segmented control. */
+interface ControlOption {
+  readonly value: ModeState[ControlKey];
+  readonly label: string;
+  /** Paints the cell with the CUDA accent. */
+  readonly cuda?: boolean;
+}
+
+interface ControlDef {
+  readonly key: ControlKey;
+  readonly label: string;
+  readonly options: readonly ControlOption[];
+}
 
 /** Control definitions, in display order. */
-const CONTROLS = Object.freeze([
+const CONTROLS: readonly ControlDef[] = Object.freeze([
   {
     key: 'compute',
     label: 'Compute',
@@ -45,36 +68,38 @@ const CONTROLS = Object.freeze([
       { value: PRESENT.NATIVE_UNLOCKED, label: 'Native unlocked', cuda: true },
     ],
   },
-]);
+] as const);
 
 /* ------------------------------------------------------------------ *
  *  Shared tooltip
  * ------------------------------------------------------------------ */
 
-let tooltipEl = null;
+let tooltipEl: HTMLElement | null = null;
 
 /** Lazily grab (or synthesize) the shared tooltip node. */
-function getTooltip() {
+function getTooltip(): HTMLElement {
   if (tooltipEl && tooltipEl.isConnected) return tooltipEl;
-  tooltipEl = document.getElementById('tooltip');
-  if (!tooltipEl) {
-    tooltipEl = document.createElement('div');
-    tooltipEl.id = 'tooltip';
-    tooltipEl.className = 'tooltip';
-    tooltipEl.setAttribute('role', 'tooltip');
-    document.body.appendChild(tooltipEl);
+
+  const existing = document.getElementById('tooltip');
+  if (existing) {
+    tooltipEl = existing;
+    return tooltipEl;
   }
-  return tooltipEl;
+
+  const created = document.createElement('div');
+  created.id = 'tooltip';
+  created.className = 'tooltip';
+  created.setAttribute('role', 'tooltip');
+  document.body.appendChild(created);
+  tooltipEl = created;
+  return created;
 }
 
 /**
  * Show the tooltip anchored under an element, clamped inside the viewport so a
  * cell near the right edge does not push it off screen.
- *
- * @param {HTMLElement} anchor
- * @param {string} text
  */
-function showTooltip(anchor, text) {
+function showTooltip(anchor: HTMLElement | null, text: string): void {
   if (!anchor || typeof text !== 'string' || text.length === 0) return;
 
   const tip = getTooltip();
@@ -100,7 +125,7 @@ function showTooltip(anchor, text) {
 }
 
 /** Hide the shared tooltip. */
-function hideTooltip() {
+function hideTooltip(): void {
   const tip = getTooltip();
   tip.classList.remove('visible');
   tip.setAttribute('aria-hidden', 'true');
@@ -110,38 +135,48 @@ function hideTooltip() {
  *  Capability gating
  * ------------------------------------------------------------------ */
 
+/** Same {ok, reason} shape isLegalMode returns, reused for the capability gate. */
+export type GateResult = LegalityResult;
+
 /**
  * Decide whether one option is physically available, and why not when it is not.
  *
- * @param {string} controlKey 'compute' | 'raster' | 'present'
- * @param {string} value option value
- * @param {object} caps merged capability model
- * @returns {{ok:boolean, reason?:string}}
+ * @param controlKey 'compute' | 'raster' | 'present'
+ * @param value option value
+ * @param caps merged capability model
  */
-function capabilityGate(controlKey, value, caps) {
+function capabilityGate(
+  controlKey: ControlKey,
+  value: string,
+  caps: Partial<MergedCaps> | null | undefined,
+): GateResult {
   const model = caps && typeof caps === 'object' ? caps : {};
-  const cuda = model.cuda || {};
-  const webgpu = model.webgpu || {};
-  const nview = model.nativeView || {};
+  const cuda = model.cuda;
+  const webgpu = model.webgpu;
+  const nview = model.nativeView;
 
   const cudaReason =
-    (typeof cuda.reason === 'string' && cuda.reason) || 'CUDA addon not built -- npm run build:native';
+    (typeof cuda?.reason === 'string' && cuda.reason) ||
+    'CUDA addon not built -- npm run build:native';
   const webgpuReason =
-    (typeof webgpu.reason === 'string' && webgpu.reason) || 'WebGPU unavailable in this environment';
+    (typeof webgpu?.reason === 'string' && webgpu.reason) ||
+    'WebGPU unavailable in this environment';
 
   if (value === COMPUTE.CUDA || value === RASTER.CUDA) {
-    return cuda.ok === true ? { ok: true } : { ok: false, reason: cudaReason };
+    return cuda?.ok === true ? { ok: true } : { ok: false, reason: cudaReason };
   }
   if (value === COMPUTE.WEBGPU || value === RASTER.WEBGPU) {
-    return webgpu.ok === true ? { ok: true } : { ok: false, reason: webgpuReason };
+    return webgpu?.ok === true ? { ok: true } : { ok: false, reason: webgpuReason };
   }
   if (value === PRESENT.NATIVE_VSYNC || value === PRESENT.NATIVE_UNLOCKED) {
     // The native surface needs CUDA first, then the native view itself.
-    if (cuda.ok !== true) return { ok: false, reason: cudaReason };
-    if (nview.ok !== true) {
+    if (cuda?.ok !== true) return { ok: false, reason: cudaReason };
+    if (nview?.ok !== true) {
       return {
         ok: false,
-        reason: (typeof nview.reason === 'string' && nview.reason) || 'native view arrives in a later phase',
+        reason:
+          (typeof nview?.reason === 'string' && nview.reason) ||
+          'native view arrives in a later phase',
       };
     }
     return { ok: true };
@@ -156,36 +191,52 @@ function capabilityGate(controlKey, value, caps) {
  *  Control
  * ------------------------------------------------------------------ */
 
+/** Options accepted by createMatrix. */
+export interface MatrixOptions {
+  /** Initial { compute, raster, present }. */
+  mode?: Partial<ModeState>;
+  /** Fired with the full new mode. */
+  onChange?: (mode: ModeState) => void;
+}
+
+/** Public surface of the mounted matrix. */
+export interface MatrixApi {
+  setCaps(caps: Partial<MergedCaps> | null | undefined): void;
+  setMode(mode: Partial<ModeState> | null | undefined): void;
+  getMode(): ModeState;
+}
+
+/** Fill in any axis the caller left out with the always-available fallback. */
+function completeMode(partial: Partial<ModeState> | null | undefined): ModeState {
+  return {
+    compute: partial?.compute ?? COMPUTE.CPU,
+    raster: partial?.raster ?? RASTER.THREE,
+    present: partial?.present ?? PRESENT.COMPOSITE,
+  };
+}
+
 /**
  * Mount the backend matrix.
  *
- * @param {HTMLElement|null} host container (#matrix-panel)
- * @param {object} opts
- * @param {object} opts.mode initial { compute, raster, present }
- * @param {(mode:object)=>void} opts.onChange fired with the full new mode
- * @returns {{setCaps:(caps:object)=>void, setMode:(mode:object)=>void, getMode:()=>object}}
+ * @param host container (#matrix-panel)
  */
-export function createMatrix(host, opts) {
-  const options = opts && typeof opts === 'object' ? opts : {};
+export function createMatrix(host: HTMLElement | null, opts?: MatrixOptions | null): MatrixApi {
+  const options: MatrixOptions = opts && typeof opts === 'object' ? opts : {};
   const onChange = typeof options.onChange === 'function' ? options.onChange : () => {};
 
   if (!host) {
     console.warn('[matrix] host element missing; backend selector disabled');
-    return { setCaps() {}, setMode() {}, getMode: () => ({ ...(options.mode || {}) }) };
+    return { setCaps() {}, setMode() {}, getMode: () => completeMode(options.mode) };
   }
 
   /** Current selection. Copied, never aliased to the caller's object. */
-  let mode = {
-    compute: (options.mode && options.mode.compute) || COMPUTE.CPU,
-    raster: (options.mode && options.mode.raster) || RASTER.THREE,
-    present: (options.mode && options.mode.present) || PRESENT.COMPOSITE,
-  };
+  let mode: ModeState = completeMode(options.mode);
 
   /** Latest capability model; refreshed by setCaps(). */
-  let caps = {};
+  let caps: Partial<MergedCaps> = {};
 
-  /** value -> button, per control key. @type {Map<string, Map<string, HTMLElement>>} */
-  const cells = new Map();
+  /** value -> button, per control key. */
+  const cells = new Map<ControlKey, Map<string, HTMLButtonElement>>();
 
   host.replaceChildren();
 
@@ -198,14 +249,15 @@ export function createMatrix(host, opts) {
    * Attempt a selection. Rejected selections do nothing beyond a log line --
    * the cell was already disabled, so this is a defensive backstop for
    * programmatic callers.
-   *
-   * @param {string} key control key
-   * @param {string} value option value
    */
-  function trySelect(key, value) {
+  function trySelect(key: ControlKey, value: ModeState[ControlKey]): void {
     if (mode[key] === value) return;
 
-    const candidate = { ...mode, [key]: value };
+    // A computed key in a spread widens the whole object to a union of the
+    // three axes' value types, so the assertion re-narrows it. `key` and
+    // `value` are already type-checked against ModeState by the signature --
+    // this is the compiler losing the correlation, not a claim we are making.
+    const candidate = { ...mode, [key]: value } as ModeState;
 
     const cap = capabilityGate(key, value, caps);
     if (!cap.ok) {
@@ -238,7 +290,7 @@ export function createMatrix(host, opts) {
     group.setAttribute('role', 'radiogroup');
     group.setAttribute('aria-label', control.label);
 
-    const map = new Map();
+    const map = new Map<string, HTMLButtonElement>();
 
     for (const option of control.options) {
       const btn = document.createElement('button');
@@ -279,7 +331,7 @@ export function createMatrix(host, opts) {
    * Re-evaluate every cell against the current caps + mode and repaint state.
    * Cheap enough (nine cells) to just run wholesale on any change.
    */
-  function refresh() {
+  function refresh(): void {
     for (const control of CONTROLS) {
       const map = cells.get(control.key);
       if (!map) continue;
@@ -290,14 +342,17 @@ export function createMatrix(host, opts) {
 
         const selected = mode[control.key] === option.value;
         const cap = capabilityGate(control.key, option.value, caps);
-        const legal = cap.ok ? isLegalMode({ ...mode, [control.key]: option.value }) : { ok: false };
+        // Same computed-key widening as in trySelect above.
+        const legal: GateResult = cap.ok
+          ? isLegalMode({ ...mode, [control.key]: option.value } as ModeState)
+          : { ok: false };
 
         // Capability reason first: hardware/build problems outrank pipeline rules.
         const blocked = !cap.ok || !legal.ok;
         const reason = !cap.ok ? cap.reason : !legal.ok ? legal.reason : '';
 
         // The currently-selected cell is never greyed out -- if the mode became
-        // illegal underneath us, app.js repairs it; showing it as both selected
+        // illegal underneath us, app.ts repairs it; showing it as both selected
         // and disabled would just read as a bug.
         btn.classList.toggle('disabled', blocked && !selected);
         btn.classList.toggle('selected', selected);
@@ -319,7 +374,6 @@ export function createMatrix(host, opts) {
   return {
     /**
      * Feed a new capability model in (after the async WebGPU probe resolves).
-     * @param {object} next
      */
     setCaps(next) {
       caps = next && typeof next === 'object' ? next : {};
@@ -327,9 +381,8 @@ export function createMatrix(host, opts) {
     },
 
     /**
-     * Force the selection from outside (app.js does this when it repairs an
+     * Force the selection from outside (app.ts does this when it repairs an
      * illegal mode). Does not re-fire onChange -- the caller already knows.
-     * @param {object} next
      */
     setMode(next) {
       if (!next || typeof next !== 'object') return;

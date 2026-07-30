@@ -59,17 +59,17 @@
           </button>
         </header>
 
-        <!-- Nav items and the sliding active indicator are built by ui/sidebar.js -->
+        <!-- Nav items and the sliding active indicator are built by ui/sidebar.ts -->
         <nav id="sidebar-nav" class="sidebar-nav" aria-label="Scenes"></nav>
 
         <div class="sidebar-scroll">
-          <!-- Backend matrix: three segmented controls (ui/matrix.js) -->
+          <!-- Backend matrix: three segmented controls (ui/matrix.ts) -->
           <section id="matrix-panel" class="panel" aria-label="Backend matrix"></section>
 
-          <!-- Fidelity presets + advanced sliders (ui/presets.js) -->
+          <!-- Fidelity presets + advanced sliders (ui/presets.ts) -->
           <section id="presets-panel" class="panel" aria-label="Fidelity"></section>
 
-          <!-- Capability chips (ui/badges.js) -->
+          <!-- Capability chips (ui/badges.ts) -->
           <section id="badges-panel" class="panel" aria-label="Capabilities"></section>
         </div>
       </aside>
@@ -86,14 +86,14 @@
       </main>
 
       <div id="overlay-layer" class="overlay-layer" aria-live="off">
-        <!-- FPS + frame-time card (ui/fps-overlay.js) -->
+        <!-- FPS + frame-time card (ui/fps-overlay.ts) -->
         <section id="fps-overlay" class="glass-card fps-card" aria-label="Performance"></section>
       </div>
     </div>
 
-    <!-- Shared tooltip element; matrix.js positions it over disabled cells. -->
+    <!-- Shared tooltip element; matrix.ts positions it over disabled cells. -->
     <div id="tooltip" class="tooltip" role="tooltip" aria-hidden="true"></div>
 
-    <script type="module" src="./app.js"></script>
+    <script type="module" src="./app.ts"></script>
   </body>
 </html>

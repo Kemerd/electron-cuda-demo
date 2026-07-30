@@ -1,0 +1,14 @@
+{
+  // Renderer: Vite/esbuild does the transpilation; tsc runs check-only
+  // (noEmit) as the type gate. Bundler resolution means extensionless
+  // relative imports are correct in renderer source.
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "noEmit": true,
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "types": ["vite/client", "@webgpu/types"]
+  },
+  "include": ["src/renderer/**/*", "src/shared/**/*"]
+}

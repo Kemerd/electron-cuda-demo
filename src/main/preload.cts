@@ -1,24 +1,41 @@
 /**
- * preload.cjs -- the only code that sees both worlds.
+ * preload.cts -- the only code that sees both worlds.
  *
  * CommonJS on purpose: sandboxed preloads run in a restricted context that does
- * not support ESM. Everything the renderer can reach goes through contextBridge,
- * and the bridge only ships structured-cloneable values -- which the MessagePort
- * is not. So the port stays here, and the renderer gets callback registrars
- * (onFrame / sendReq / recycle) that close over it.
+ * not support ESM, and .cts is the input extension tsc maps to a .cjs output
+ * (dist-electron/main/preload.cjs). Everything the renderer can reach goes
+ * through contextBridge, and the bridge only ships structured-cloneable values
+ * -- which the MessagePort is not. So the port stays here, and the renderer gets
+ * callback registrars (onFrame / sendReq / recycle) that close over it.
  *
  * The port arrives as a real DOM MessagePort on e.ports[0], so it uses the DOM
  * API (port.start(), port.onmessage). The Node-flavoured .on()/.start() pair
  * belongs to MessagePortMain on the main-process side -- calling .on() here
  * would throw.
+ *
+ * Typing note: the exposed surface is annotated with GeoSwarmBridge from
+ * bridge-types.ts, imported with `import type` so the emitted CJS contains no
+ * require() of an ESM module. That is what keeps this file and the renderer's
+ * window.geoswarm declaration from drifting apart despite never sharing a
+ * module graph at run time.
+ *
+ * The electron import uses `import ... = require()` rather than ESM syntax:
+ * under verbatimModuleSyntax tsc emits import statements exactly as written, so
+ * in a .cts file the CommonJS form is the only one it will accept. Type-only
+ * imports are erased entirely and stay in ESM form.
  */
 
-const { contextBridge, ipcRenderer } = require('electron');
+import electron = require('electron');
+import type { IpcRendererEvent } from 'electron';
+
+const { contextBridge, ipcRenderer } = electron;
+import type { GeoSwarmBridge, NativeViewRect, NativeViewStartArgs, NativeViewStatsResult, Unsubscribe } from './bridge-types.js';
+import type { Capabilities, OkResult, PumpToRendererMsg, SceneParams } from '../shared/protocol.js';
 
 // Channel names are duplicated as literals here rather than imported: a
 // sandboxed CJS preload cannot import the ESM protocol module, and adding a
 // bundling step for eleven strings would be worse. The comment on each line
-// names the protocol.js key it mirrors so drift is easy to spot in review.
+// names the protocol.ts key it mirrors so drift is easy to spot in review.
 const CH = Object.freeze({
   RENDERER_READY: 'renderer:ready', // IPC.RENDERER_READY
   ENGINE_PORT: 'engine:port',       // IPC.ENGINE_PORT
@@ -33,41 +50,54 @@ const CH = Object.freeze({
   NVIEW_STATS: 'nview:stats',       // IPC.NVIEW_STATS
 });
 
-/** @type {MessagePort|null} the engine port, once main hands it over. */
-let enginePort = null;
+/** The engine port, once main hands it over. */
+let enginePort: MessagePort | null = null;
 
 /**
  * Frame subscribers. An array rather than a single slot so the overlay and the
  * active scene can both listen without fighting over one callback.
- * @type {Array<Function>}
  */
-const frameListeners = [];
+const frameListeners: Array<(msg: PumpToRendererMsg) => void> = [];
+
+/** One message queued before the port existed, with its transfer list. */
+interface PendingPost {
+  msg: object;
+  transfer: ArrayBuffer[];
+}
 
 /**
  * Messages the renderer tried to send before the port arrived. The handshake is
  * fast but not instantaneous, and dropping the first request silently would
  * produce a mysterious one-frame stall on boot.
- * @type {Array<{msg:object, transfer:Array}>}
  */
-const pending = [];
+const pending: PendingPost[] = [];
 const PENDING_CAP = 8;
+
+/** Message extraction that survives a thrown non-Error (a string, null, ...). */
+function errText(err: unknown): string {
+  if (err instanceof Error && err.message) return err.message;
+  return String(err);
+}
 
 /**
  * Fan a port message out to every registered listener. Each callback is isolated
  * so one throwing subscriber cannot starve the others or kill the port.
- * @param {MessageEvent} event
  */
-function dispatch(event) {
-  const data = event && event.data;
+function dispatch(event: MessageEvent): void {
+  const data: unknown = event?.data;
   if (!data || typeof data !== 'object') return;
+
+  // The pump only ever posts FRAME or ERROR on this port; listeners narrow on
+  // msg.t themselves, which is why the cast stops at the discriminated union.
+  const msg = data as PumpToRendererMsg;
 
   for (let i = 0; i < frameListeners.length; i++) {
     const fn = frameListeners[i];
     if (typeof fn !== 'function') continue;
     try {
-      fn(data);
+      fn(msg);
     } catch (err) {
-      console.warn('[preload] frame listener threw:', err && err.message ? err.message : err);
+      console.warn('[preload] frame listener threw:', errText(err));
     }
   }
 }
@@ -75,9 +105,8 @@ function dispatch(event) {
 /**
  * Attach the port handed over by main and flush anything that queued up while
  * we were waiting for it.
- * @param {MessagePort} port
  */
-function attachPort(port) {
+function attachPort(port: MessagePort | null | undefined): void {
   if (!port) {
     console.warn('[preload] engine:port arrived without a port');
     return;
@@ -89,7 +118,7 @@ function attachPort(port) {
     try {
       enginePort.close();
     } catch (err) {
-      console.warn('[preload] closing stale port failed:', err && err.message);
+      console.warn('[preload] closing stale port failed:', errText(err));
     }
   }
 
@@ -99,18 +128,19 @@ function attachPort(port) {
 
   while (pending.length > 0) {
     const item = pending.shift();
+    if (!item) break;
     try {
       enginePort.postMessage(item.msg, item.transfer);
     } catch (err) {
-      console.warn('[preload] flushing queued message failed:', err && err.message);
+      console.warn('[preload] flushing queued message failed:', errText(err));
     }
   }
 }
 
 // The port rides on a webContents.postMessage, which surfaces here as a normal
 // ipcRenderer event with a .ports array.
-ipcRenderer.on(CH.ENGINE_PORT, (event) => {
-  const port = event && event.ports && event.ports[0];
+ipcRenderer.on(CH.ENGINE_PORT, (event: IpcRendererEvent) => {
+  const port = event?.ports?.[0];
   attachPort(port);
 });
 
@@ -119,15 +149,12 @@ ipcRenderer.on(CH.ENGINE_PORT, (event) => {
  * transferable. A stray typed-array view in here would throw a DataCloneError
  * and kill the frame; worse, listing a view instead of its buffer silently
  * deep-copies, which is the single most expensive mistake in this codebase.
- *
- * @param {unknown} list
- * @returns {ArrayBuffer[]}
  */
-function sanitizeTransfers(list) {
+function sanitizeTransfers(list: unknown): ArrayBuffer[] {
   if (!Array.isArray(list) || list.length === 0) return [];
-  const out = [];
+  const out: ArrayBuffer[] = [];
   for (let i = 0; i < list.length; i++) {
-    const item = list[i];
+    const item: unknown = list[i];
     if (item instanceof ArrayBuffer) {
       if (item.byteLength > 0) out.push(item);
       continue;
@@ -146,27 +173,26 @@ function sanitizeTransfers(list) {
  * Thin wrapper around ipcRenderer.invoke that turns a rejected main-process
  * handler into the documented { ok:false, reason } shape instead of an unhandled
  * rejection in renderer code.
- *
- * @param {string} channel
- * @param {*} payload
- * @returns {Promise<object>}
  */
-function invokeSafe(channel, payload) {
-  return ipcRenderer.invoke(channel, payload).catch((err) => ({
+function invokeSafe<T extends OkResult = OkResult>(channel: string, payload?: unknown): Promise<T> {
+  // The generic is the caller's claim about what the handler returns; the
+  // rejection path can only produce the OkResult part, hence the cast on it.
+  return ipcRenderer.invoke(channel, payload).catch((err: unknown) => ({
     ok: false,
-    reason: `IPC "${channel}" failed: ${err && err.message ? err.message : String(err)}`,
-  }));
+    reason: `IPC "${channel}" failed: ${errText(err)}`,
+  } as T));
 }
 
-const api = {
+const api: GeoSwarmBridge = {
   /**
-   * @returns {Promise<object>} Capabilities (see protocol.js). Always resolves.
+   * Capabilities (see protocol.ts). Always resolves -- a failed query comes
+   * back as a cuda:{ok:false} model rather than a rejection.
    */
-  getCaps() {
-    return ipcRenderer.invoke(CH.GET_CAPS).catch((err) => ({
+  getCaps(): Promise<Capabilities> {
+    return ipcRenderer.invoke(CH.GET_CAPS).catch((err: unknown) => ({
       cuda: {
         ok: false,
-        reason: `Capability query failed: ${err && err.message ? err.message : String(err)}`,
+        reason: `Capability query failed: ${errText(err)}`,
       },
       versions: { electron: 'unknown', chrome: 'unknown', node: 'unknown' },
     }));
@@ -174,14 +200,14 @@ const api = {
 
   /**
    * (Re)allocate device buffers for a scene.
-   * @param {string} scene one of SCENES.*
-   * @param {object} params { swarmCount, weatherGrid, stormCount }
+   * @param scene one of SCENES.*
+   * @param params { swarmCount, weatherGrid, stormCount }
    */
-  configureScene(scene, params) {
+  configureScene(scene: string, params?: SceneParams | null): Promise<OkResult> {
     if (typeof scene !== 'string' || !scene) {
       return Promise.resolve({ ok: false, reason: 'configureScene needs a scene id' });
     }
-    const clean = params && typeof params === 'object' ? params : {};
+    const clean: SceneParams = params && typeof params === 'object' ? params : {};
     return invokeSafe(CH.CONFIGURE_SCENE, {
       scene,
       params: {
@@ -193,16 +219,15 @@ const api = {
   },
 
   /** Ask main to decode + upload the bundled earth texture. */
-  uploadEarth() {
+  uploadEarth(): Promise<OkResult> {
     return invokeSafe(CH.UPLOAD_EARTH);
   },
 
   /**
    * Subscribe to inbound port messages (FRAME and ERROR).
-   * @param {(msg:object)=>void} cb
-   * @returns {()=>void} unsubscribe
+   * @returns unsubscribe
    */
-  onFrame(cb) {
+  onFrame(cb: (msg: PumpToRendererMsg) => void): Unsubscribe {
     if (typeof cb !== 'function') {
       console.warn('[preload] onFrame called without a function');
       return () => {};
@@ -216,11 +241,11 @@ const api = {
 
   /**
    * Post a REQ (or RECYCLE) on the engine port.
-   * @param {object} req message object
-   * @param {ArrayBuffer[]} [transferList] buffers to hand back to main
-   * @returns {boolean} true when the message went out (or was queued)
+   * @param req message object
+   * @param transferList buffers to hand back to main
+   * @returns true when the message went out (or was queued)
    */
-  sendReq(req, transferList) {
+  sendReq(req: object, transferList?: ArrayBuffer[]): boolean {
     if (!req || typeof req !== 'object') {
       console.warn('[preload] sendReq called without a message object');
       return false;
@@ -241,42 +266,41 @@ const api = {
       enginePort.postMessage(req, transfer);
       return true;
     } catch (err) {
-      console.warn('[preload] postMessage failed:', err && err.message ? err.message : err);
+      console.warn('[preload] postMessage failed:', errText(err));
       return false;
     }
   },
 
   /**
    * Hand consumed buffers back without issuing a new request.
-   * @param {ArrayBuffer[]} buffers
    */
-  recycle(buffers) {
+  recycle(buffers: ArrayBuffer[]): boolean {
     const transfer = sanitizeTransfers(buffers);
     if (transfer.length === 0) return false;
-    // 'recycle' mirrors MSG.RECYCLE in protocol.js -- same reason as the CH table
+    // 'recycle' mirrors MSG.RECYCLE in protocol.ts -- same reason as the CH table
     // above: no ESM import reaches a sandboxed CJS preload.
     return api.sendReq({ t: 'recycle', buffers: transfer }, transfer);
   },
 
   /** Native D3D11 child-window controls. Stubbed main-side until that phase lands. */
   nview: {
-    create(rect) {
+    create(rect?: Partial<NativeViewRect>): Promise<OkResult> {
       return invokeSafe(CH.NVIEW_CREATE, rect || {});
     },
-    setRect(rect) {
+    setRect(rect?: Partial<NativeViewRect>): Promise<OkResult> {
       return invokeSafe(CH.NVIEW_RECT, rect || {});
     },
-    setVisible(visible) {
+    setVisible(visible: boolean): Promise<OkResult> {
       return invokeSafe(CH.NVIEW_VISIBLE, { visible: !!visible });
     },
-    start(opts) {
+    start(opts?: Partial<NativeViewStartArgs>): Promise<OkResult> {
       return invokeSafe(CH.NVIEW_START, opts || {});
     },
-    stop() {
+    stop(): Promise<OkResult> {
       return invokeSafe(CH.NVIEW_STOP);
     },
-    stats() {
-      return invokeSafe(CH.NVIEW_STATS);
+    stats(): Promise<NativeViewStatsResult> {
+      return invokeSafe<NativeViewStatsResult>(CH.NVIEW_STATS);
     },
   },
 };

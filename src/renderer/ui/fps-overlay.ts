@@ -1,5 +1,5 @@
 /**
- * fps-overlay.js -- the performance HUD.
+ * fps-overlay.ts -- the performance HUD.
  *
  * Hard requirement: ZERO allocation per frame. An overlay that measures frame
  * time while generating garbage every frame measures its own GC pauses. So:
@@ -16,6 +16,9 @@
  * itself redraws every frame -- it is 240 lineTo calls into a 34px-tall canvas.
  */
 
+import type { FrameTimings } from '../../shared/protocol';
+import { isFiniteNumber } from '../types';
+
 /** Ring capacity. 240 samples is ~4 s at 60 Hz, ~1 s at 240 Hz. */
 const SAMPLES = 240;
 
@@ -28,19 +31,26 @@ const READOUT_INTERVAL_MS = 160;
 const SPARK_MIN_MS = 8;
 const SPARK_MAX_MS = 50;
 
+/** Public surface of the mounted overlay. */
+export interface FpsOverlayApi {
+  /** Record one frame's wall-clock duration. */
+  pushFrame(frameMs: number): void;
+  /** Feed engine-reported timings from a FRAME message. */
+  setTimings(t: Partial<FrameTimings> | null | undefined): void;
+  /** Renderer-side draw cost, measured around the scene's frame() call. */
+  setDrawMs(value: number): void;
+  /** Record count from the last entity frame. */
+  setCount(n: number): void;
+  /** Per-frame update. @param nowMs performance.now() from the frame loop */
+  tick(nowMs: number): void;
+}
+
 /**
  * Mount the overlay.
  *
- * @param {HTMLElement|null} host container (#fps-overlay)
- * @returns {{
- *   pushFrame:(frameMs:number)=>void,
- *   setTimings:(t:object)=>void,
- *   setDrawMs:(ms:number)=>void,
- *   setCount:(n:number)=>void,
- *   tick:(nowMs:number)=>void
- * }}
+ * @param host container (#fps-overlay)
  */
-export function createFpsOverlay(host) {
+export function createFpsOverlay(host: HTMLElement | null): FpsOverlayApi {
   if (!host) {
     console.warn('[fps-overlay] host element missing; performance HUD disabled');
     // A complete no-op stub so callers never have to null-check the returned API.
@@ -57,8 +67,8 @@ export function createFpsOverlay(host) {
 
   const ring = new Float32Array(SAMPLES);
   const scratch = new Float32Array(SAMPLES);
-  let ringHead = 0;   // next write index
-  let ringCount = 0;  // valid samples, saturating at SAMPLES
+  let ringHead = 0; // next write index
+  let ringCount = 0; // valid samples, saturating at SAMPLES
 
   // Rolling FPS is computed from a windowed mean rather than 1000/lastFrame:
   // instantaneous FPS from a single frame flickers by tens of Hz.
@@ -102,11 +112,9 @@ export function createFpsOverlay(host) {
 
   /**
    * Create one label/value stat cell.
-   * @param {string} label
-   * @param {string} [valueClass]
-   * @returns {HTMLElement} the value span (what we update)
+   * @returns the value span (what we update)
    */
-  function makeStat(label, valueClass) {
+  function makeStat(label: string, valueClass?: string): HTMLElement {
     const row = document.createElement('div');
     row.className = 'stat';
 
@@ -149,7 +157,7 @@ export function createFpsOverlay(host) {
    * touches canvas.width/height when they actually change -- assigning either
    * clears the canvas and reallocates the backing store.
    */
-  function resizeSpark() {
+  function resizeSpark(): void {
     const rect = spark.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) return;
 
@@ -175,10 +183,10 @@ export function createFpsOverlay(host) {
    * scratch array and sorts a subarray view -- TypedArray.prototype.sort is
    * in-place and numeric by default, so this allocates nothing.
    *
-   * @param {number} q 0..1
-   * @returns {number} milliseconds
+   * @param q 0..1
+   * @returns milliseconds
    */
-  function percentile(q) {
+  function percentile(q: number): number {
     if (ringCount === 0) return 0;
 
     scratch.set(ring.subarray(0, ringCount));
@@ -186,21 +194,21 @@ export function createFpsOverlay(host) {
     view.sort();
 
     const idx = Math.min(ringCount - 1, Math.max(0, Math.round(q * (ringCount - 1))));
-    return view[idx];
+    // Indexed reads on a typed array are `number | undefined` under
+    // noUncheckedIndexedAccess; idx is clamped in range, so 0 never happens.
+    return view[idx] ?? 0;
   }
 
   /**
    * Assign textContent only when the value actually differs. Saves a DOM write
    * and a style invalidation on every unchanged cell.
-   * @param {HTMLElement} el
-   * @param {string} text
    */
-  function setText(el, text) {
+  function setText(el: HTMLElement, text: string): void {
     if (el.textContent !== text) el.textContent = text;
   }
 
   /** Fixed-width ms formatting so the columns do not jitter. */
-  function ms(v) {
+  function ms(v: number): string {
     if (!Number.isFinite(v) || v <= 0) return '--';
     return v < 10 ? `${v.toFixed(2)}` : `${v.toFixed(1)}`;
   }
@@ -212,7 +220,7 @@ export function createFpsOverlay(host) {
    * The fill under the line uses the accent at low alpha so the shape reads even
    * where the stroke is thin.
    */
-  function drawSpark() {
+  function drawSpark(): void {
     if (!ctx) return;
 
     ctx.clearRect(0, 0, sparkW, sparkH);
@@ -221,7 +229,7 @@ export function createFpsOverlay(host) {
     // Autoscale to the window's own peak, clamped to a sane band.
     let peak = SPARK_MIN_MS;
     for (let i = 0; i < ringCount; i++) {
-      const v = ring[i];
+      const v = ring[i] ?? 0;
       if (v > peak) peak = v;
     }
     if (peak > SPARK_MAX_MS) peak = SPARK_MAX_MS;
@@ -244,7 +252,7 @@ export function createFpsOverlay(host) {
 
     ctx.beginPath();
     for (let i = 0; i < ringCount; i++) {
-      const v = ring[(start + i) % SAMPLES];
+      const v = ring[(start + i) % SAMPLES] ?? 0;
       const x = i * stepX;
       const y = sparkH - Math.min(sparkH, v * scaleY);
       if (i === 0) ctx.moveTo(x, y);
@@ -267,10 +275,6 @@ export function createFpsOverlay(host) {
   /* ---- public API --------------------------------------------------- */
 
   return {
-    /**
-     * Record one frame's wall-clock duration.
-     * @param {number} frameMs
-     */
     pushFrame(frameMs) {
       if (!Number.isFinite(frameMs) || frameMs <= 0) return;
       // Cap absurd deltas (tab restore, debugger pause) so one outlier does not
@@ -285,38 +289,25 @@ export function createFpsOverlay(host) {
       fpsAccumFrames++;
     },
 
-    /**
-     * Feed engine-reported timings from a FRAME message.
-     * @param {{simMs?:number, copyMs?:number, renderMs?:number}} t
-     */
     setTimings(t) {
       if (!t || typeof t !== 'object') return;
-      if (Number.isFinite(t.simMs)) simMs = t.simMs;
-      if (Number.isFinite(t.copyMs)) copyMs = t.copyMs;
+      if (isFiniteNumber(t.simMs)) simMs = t.simMs;
+      if (isFiniteNumber(t.copyMs)) copyMs = t.copyMs;
       // A CUDA-rastered frame reports renderMs; treat it as the draw cost.
-      if (Number.isFinite(t.renderMs)) drawMs = t.renderMs;
+      if (isFiniteNumber(t.renderMs)) drawMs = t.renderMs;
     },
 
-    /**
-     * Renderer-side draw cost, measured around the scene's frame() call.
-     * @param {number} value
-     */
     setDrawMs(value) {
       if (Number.isFinite(value) && value >= 0) drawMs = value;
     },
 
-    /**
-     * Record count from the last entity frame.
-     * @param {number} n
-     */
     setCount(n) {
       if (Number.isFinite(n) && n >= 0) entityCount = n;
     },
 
     /**
-     * Per-frame update. Draws the sparkline every call; refreshes the text and
-     * percentiles on the slower cadence.
-     * @param {number} nowMs performance.now() from the rAF loop
+     * Draws the sparkline every call; refreshes the text and percentiles on the
+     * slower cadence.
      */
     tick(nowMs) {
       drawSpark();

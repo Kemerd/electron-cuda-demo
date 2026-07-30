@@ -11,7 +11,9 @@
  * sim / copy / draw across CPU, WebGPU and CUDA at each preset.
  */
 
-import { createBackdrop, createCaption } from '../placeholder.js';
+import { createBackdrop, createCaption } from '../placeholder';
+import type { Backdrop } from '../placeholder';
+import type { FrameState, Scene, SceneMountContext } from '../../types';
 
 /** Bars kept in the scrolling history. */
 const HISTORY = 160;
@@ -19,10 +21,10 @@ const HISTORY = 160;
 /** Chart vertical range in ms. */
 const CHART_MAX_MS = 40;
 
-export default function createScene() {
-  let root = null;
-  let backdrop = null;
-  let caption = null;
+export default function createScene(): Scene {
+  let root: HTMLElement | null = null;
+  let backdrop: Backdrop | null = null;
+  let caption: HTMLElement | null = null;
   let timeSec = 0;
 
   // Preallocated history ring -- this scene must not be the thing that causes
@@ -32,7 +34,7 @@ export default function createScene() {
   let filled = 0;
 
   return {
-    mount(ctx) {
+    mount(ctx: SceneMountContext) {
       root = document.createElement('div');
       root.className = 'scene-root';
 
@@ -59,11 +61,11 @@ export default function createScene() {
       filled = 0;
     },
 
-    resize(w, h) {
+    resize(w: number, h: number) {
       if (backdrop) backdrop.resize(w, h);
     },
 
-    frame(dt, state) {
+    frame(dt: number, state: FrameState) {
       if (!backdrop || !backdrop.ctx) return;
 
       const step = Number.isFinite(dt) ? Math.min(dt, 0.1) : 0;
@@ -90,10 +92,14 @@ export default function createScene() {
 
   /**
    * Render the bar chart plus budget guides.
-   * @param {CanvasRenderingContext2D} ctx
-   * @param {object} state shared app state (used for the mode label)
+   * @param state shared app state (used for the mode label)
    */
-  function drawChart(ctx, W, H, state) {
+  function drawChart(
+    ctx: CanvasRenderingContext2D,
+    W: number,
+    H: number,
+    state: FrameState,
+  ): void {
     // Inset so the chart does not collide with the bottom-left caption.
     const padX = W * 0.08;
     const padTop = H * 0.16;
@@ -121,7 +127,8 @@ export default function createScene() {
       const start = filled === HISTORY ? head : 0;
 
       for (let i = 0; i < filled; i++) {
-        const v = history[(start + i) % HISTORY];
+        // ?? 0 for noUncheckedIndexedAccess -- the modulo keeps i in range.
+        const v = history[(start + i) % HISTORY] ?? 0;
         const clamped = Math.min(v, CHART_MAX_MS);
         const barH = Math.max(1, clamped * scaleY);
         const x = padX + i * slot;
@@ -160,7 +167,15 @@ export default function createScene() {
   /**
    * One dashed horizontal guide with a right-aligned label.
    */
-  function drawGuide(ctx, padX, chartW, y, color, label, H) {
+  function drawGuide(
+    ctx: CanvasRenderingContext2D,
+    padX: number,
+    chartW: number,
+    y: number,
+    color: string,
+    label: string,
+    H: number,
+  ): void {
     if (!Number.isFinite(y)) return;
 
     ctx.strokeStyle = color;

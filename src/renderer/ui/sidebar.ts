@@ -1,5 +1,5 @@
 /**
- * sidebar.js -- scene navigation rail.
+ * sidebar.ts -- scene navigation rail.
  *
  * Two things worth noting about the implementation:
  *
@@ -14,7 +14,15 @@
  *     sidebar itself is mid-collapse-animation.
  */
 
-const NAV_ITEMS = Object.freeze([
+/** One entry in the navigation rail. */
+export interface NavItem {
+  readonly id: string;
+  readonly label: string;
+  /** Inner SVG markup for the 24x24 glyph. */
+  readonly glyph: string;
+}
+
+const NAV_ITEMS: readonly NavItem[] = Object.freeze([
   {
     id: 'globe',
     label: 'Globe + Swarm',
@@ -38,14 +46,28 @@ const NAV_ITEMS = Object.freeze([
     label: 'Benchmark',
     glyph: '<path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/>',
   },
-]);
+] as const);
+
+/** Options accepted by createSidebar. */
+export interface SidebarOptions {
+  /** Scene id to select on boot. */
+  initial?: string;
+  /** Fired on every selection change. */
+  onSelect?: (id: string) => void;
+}
+
+/** Public surface of the mounted sidebar. */
+export interface SidebarApi {
+  select(id: string, silent?: boolean): void;
+  getActive(): string;
+  items: readonly NavItem[];
+}
 
 /**
  * Build one SVG glyph node from a path fragment.
- * @param {string} paths inner SVG markup
- * @returns {SVGElement}
+ * @param paths inner SVG markup
  */
-function makeGlyph(paths) {
+function makeGlyph(paths: string): SVGElement {
   const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
   svg.setAttribute('viewBox', '0 0 24 24');
   svg.setAttribute('fill', 'none');
@@ -62,14 +84,9 @@ function makeGlyph(paths) {
 
 /**
  * Mount the sidebar.
- *
- * @param {object} opts
- * @param {string} opts.initial scene id to select on boot
- * @param {(id:string)=>void} opts.onSelect fired on every selection change
- * @returns {{select:(id:string)=>void, getActive:()=>string, items:ReadonlyArray<object>}}
  */
-export function createSidebar(opts) {
-  const options = opts && typeof opts === 'object' ? opts : {};
+export function createSidebar(opts?: SidebarOptions | null): SidebarApi {
+  const options: SidebarOptions = opts && typeof opts === 'object' ? opts : {};
   const onSelect = typeof options.onSelect === 'function' ? options.onSelect : () => {};
 
   const shell = document.getElementById('app-shell');
@@ -86,16 +103,14 @@ export function createSidebar(opts) {
   indicator.className = 'nav-indicator';
   nav.appendChild(indicator);
 
-  /** @type {Map<string, HTMLButtonElement>} */
-  const buttons = new Map();
+  const buttons = new Map<string, HTMLButtonElement>();
   let active = '';
 
   /**
    * Move the indicator to the given item. Called on selection and on resize
    * (item heights are constant, but the rail collapse changes padding).
-   * @param {string} id
    */
-  function positionIndicator(id) {
+  function positionIndicator(id: string): void {
     const el = buttons.get(id);
     if (!el) {
       indicator.classList.remove('visible');
@@ -109,10 +124,10 @@ export function createSidebar(opts) {
   /**
    * Select a scene. Re-selecting the current scene is a no-op so a stray click
    * cannot trigger a scene remount.
-   * @param {string} id
-   * @param {boolean} [silent] skip the onSelect callback (used for boot)
+   *
+   * @param silent skip the onSelect callback (used for boot)
    */
-  function select(id, silent) {
+  function select(id: string, silent?: boolean): void {
     if (typeof id !== 'string' || !buttons.has(id)) {
       console.warn('[sidebar] ignoring selection of unknown item "%s"', String(id));
       return;
@@ -135,10 +150,10 @@ export function createSidebar(opts) {
   /**
    * Arrow-key traversal. Home/End jump to the ends; the pattern matches the
    * ARIA tablist convention, which is what this nav effectively is.
-   * @param {KeyboardEvent} e
-   * @param {number} index position of the focused item
+   *
+   * @param index position of the focused item
    */
-  function onKeyDown(e, index) {
+  function onKeyDown(e: KeyboardEvent, index: number): void {
     let next = -1;
     switch (e.key) {
       case 'ArrowDown':
@@ -220,10 +235,11 @@ export function createSidebar(opts) {
   window.addEventListener('resize', () => positionIndicator(active));
 
   // ---- boot ---------------------------------------------------------
+  // NAV_ITEMS is a non-empty frozen literal, but noUncheckedIndexedAccess does
+  // not know that -- fall back to '' rather than asserting the index.
+  const firstId = NAV_ITEMS[0]?.id ?? '';
   const initial =
-    typeof options.initial === 'string' && buttons.has(options.initial)
-      ? options.initial
-      : NAV_ITEMS[0].id;
+    typeof options.initial === 'string' && buttons.has(options.initial) ? options.initial : firstId;
 
   // Select silently, then place the indicator on the next frame -- on the very
   // first paint offsetTop/offsetHeight are still zero.

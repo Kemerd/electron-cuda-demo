@@ -4,23 +4,29 @@
   "description": "Electron demo pushing native CUDA compute against WebGPU and CPU baselines: a 3D globe with drone swarms, live weather fields, and GPU particle systems.",
   "private": true,
   "type": "module",
-  "main": "src/main/main.js",
+  "main": "dist-electron/main/main.js",
   "scripts": {
-    "start": "npm run build:renderer && electron .",
+    "start": "npm run build:main && npm run build:renderer && electron .",
     "dev": "vite --config vite.config.mjs",
+    "typecheck": "tsc -p tsconfig.main.json --noEmit && tsc -p tsconfig.renderer.json",
+    "build:main": "tsc -p tsconfig.main.json",
     "build:renderer": "vite build --config vite.config.mjs",
     "build:native": "cmake-js compile --runtime=electron --runtime-version=43.2.0 --arch=x64 --directory native --out native/build",
     "rebuild:native": "cmake-js rebuild --runtime=electron --runtime-version=43.2.0 --arch=x64 --directory native --out native/build",
     "clean:native": "node -e \"require('fs').rmSync('native/build',{recursive:true,force:true})\"",
-    "smoke": "npm run build:renderer && electron . --smoke-test"
+    "smoke": "npm run build:main && npm run build:renderer && electron . --smoke-test"
   },
   "dependencies": {
     "node-addon-api": "^8.9.0",
     "three": "^0.185.0"
   },
   "devDependencies": {
+    "@types/node": "^26.1.2",
+    "@types/three": "^0.185.1",
+    "@webgpu/types": "^0.1.71",
     "cmake-js": "^8.0.0",
     "electron": "43.2.0",
+    "typescript": "^7.0.2",
     "vite": "^8.2.0"
   }
 }

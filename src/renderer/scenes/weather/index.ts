@@ -10,7 +10,9 @@
  * on the globe, and the swarm gets advected by the sampled wind vector.
  */
 
-import { createBackdrop, createCaption } from '../placeholder.js';
+import { createBackdrop, createCaption } from '../placeholder';
+import type { Backdrop } from '../placeholder';
+import type { FrameState, Scene, SceneMountContext } from '../../types';
 
 /** Streaklet grid density along the shorter axis. */
 const GRID = 26;
@@ -18,10 +20,10 @@ const GRID = 26;
 /** Streak segment count -- how far each particle's tail is integrated. */
 const TAIL = 5;
 
-export default function createScene() {
-  let root = null;
-  let backdrop = null;
-  let caption = null;
+export default function createScene(): Scene {
+  let root: HTMLElement | null = null;
+  let backdrop: Backdrop | null = null;
+  let caption: HTMLElement | null = null;
   let timeSec = 0;
 
   // Scratch reused across every sample -- the whole field draw allocates nothing.
@@ -31,7 +33,7 @@ export default function createScene() {
   const flow = new Float32Array(2);
 
   return {
-    mount(ctx) {
+    mount(ctx: SceneMountContext) {
       root = document.createElement('div');
       root.className = 'scene-root';
 
@@ -56,11 +58,11 @@ export default function createScene() {
       caption = null;
     },
 
-    resize(w, h) {
+    resize(w: number, h: number) {
       if (backdrop) backdrop.resize(w, h);
     },
 
-    frame(dt, state) {
+    frame(dt: number, state: FrameState) {
       if (!backdrop || !backdrop.ctx) return;
 
       const step = Number.isFinite(dt) ? Math.min(dt, 0.1) : 0;
@@ -82,12 +84,12 @@ export default function createScene() {
    * sines rotated 90 degrees, which is the analytic curl of a scalar potential
    * -- cheap, seamless, and it swirls the way real advection does.
    *
-   * @param {number} x normalized 0..1
-   * @param {number} y normalized 0..1
-   * @param {number} t seconds
-   * @param {Float32Array} out length-2 scratch (caller-owned; no allocation)
+   * @param x normalized 0..1
+   * @param y normalized 0..1
+   * @param t seconds
+   * @param out length-2 scratch (caller-owned; no allocation)
    */
-  function sampleFlow(x, y, t, out) {
+  function sampleFlow(x: number, y: number, t: number, out: Float32Array): void {
     const s = 3.1;
     // Potential field psi(x,y,t); velocity = (dpsi/dy, -dpsi/dx).
     const dpdy =
@@ -106,7 +108,7 @@ export default function createScene() {
    * the geometry into a single stroke() beats ~700 individual strokes by a wide
    * margin.
    */
-  function drawFlowField(ctx, W, H, t) {
+  function drawFlowField(ctx: CanvasRenderingContext2D, W: number, H: number, t: number): void {
     const cols = GRID;
     const rows = Math.max(4, Math.round((GRID * H) / Math.max(1, W)));
     const stepLen = Math.min(W, H) * 0.012;
@@ -121,7 +123,7 @@ export default function createScene() {
         // Stagger odd rows so the grid does not read as a lattice.
         const jitter = (iy % 2) * 0.5;
         let nx = (ix + 0.5 + jitter) / cols;
-        let ny = (iy + 0.5) / rows;
+        const ny = (iy + 0.5) / rows;
 
         // Drift the seed along the field over time so streaks appear to travel.
         const drift = (t * 0.09) % (1 / cols);
@@ -136,11 +138,13 @@ export default function createScene() {
         for (let k = 0; k < TAIL; k++) {
           sampleFlow(px / W, py / H, t, flow);
 
-          const len = Math.hypot(flow[0], flow[1]);
+          const fx = flow[0] ?? 0;
+          const fy = flow[1] ?? 0;
+          const len = Math.hypot(fx, fy);
           if (len < 1e-5) break; // stagnation point; stop rather than divide by ~0
 
-          px += (flow[0] / len) * stepLen;
-          py += (flow[1] / len) * stepLen;
+          px += (fx / len) * stepLen;
+          py += (fy / len) * stepLen;
           ctx.lineTo(px, py);
         }
       }
@@ -161,10 +165,12 @@ export default function createScene() {
 
         for (let k = 0; k < TAIL * 2; k++) {
           sampleFlow(px / W, py / H, t * 0.6, flow);
-          const len = Math.hypot(flow[0], flow[1]);
+          const fx = flow[0] ?? 0;
+          const fy = flow[1] ?? 0;
+          const len = Math.hypot(fx, fy);
           if (len < 1e-5) break;
-          px += (flow[0] / len) * stepLen * 1.4;
-          py += (flow[1] / len) * stepLen * 1.4;
+          px += (fx / len) * stepLen * 1.4;
+          py += (fy / len) * stepLen * 1.4;
           ctx.lineTo(px, py);
         }
       }

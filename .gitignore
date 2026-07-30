@@ -4,6 +4,7 @@ node_modules/
 # Build outputs
 native/build/
 dist/
+dist-electron/
 .vite/
 
 # Logs and OS cruft

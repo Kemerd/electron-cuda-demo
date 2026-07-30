@@ -11,7 +11,9 @@
  * cost is pure arithmetic plus one batched canvas path.
  */
 
-import { createBackdrop, createCaption } from '../placeholder.js';
+import { createBackdrop, createCaption } from '../placeholder';
+import type { Backdrop } from '../placeholder';
+import type { FrameState, Scene, SceneMountContext } from '../../types';
 
 /** CPU particle budget. Chosen so the integrator stays well under 1ms. */
 const COUNT = 4000;
@@ -20,10 +22,10 @@ const COUNT = 4000;
 const LIFE_MIN = 2.2;
 const LIFE_MAX = 6.0;
 
-export default function createScene() {
-  let root = null;
-  let backdrop = null;
-  let caption = null;
+export default function createScene(): Scene {
+  let root: HTMLElement | null = null;
+  let backdrop: Backdrop | null = null;
+  let caption: HTMLElement | null = null;
   let timeSec = 0;
 
   // Flat SoA layout: better cache behavior than an array of objects, and it
@@ -38,10 +40,8 @@ export default function createScene() {
   /**
    * Wang hash -> uniform float in [0,1). Deterministic, allocation-free, and
    * the same generator family the kernels use, so the two look alike.
-   * @param {number} seed
-   * @returns {number}
    */
-  function hash01(seed) {
+  function hash01(seed: number): number {
     let s = seed | 0;
     s = (s ^ 61) ^ (s >>> 16);
     s = (s + (s << 3)) | 0;
@@ -55,9 +55,9 @@ export default function createScene() {
 
   /**
    * (Re)seed one particle onto the outer rim with a tangential kick.
-   * @param {number} i particle index
+   * @param i particle index
    */
-  function respawn(i) {
+  function respawn(i: number): void {
     respawnSeed = (respawnSeed + 0x9e3779b9) | 0;
     const a = hash01(respawnSeed + i) * Math.PI * 2;
     const r = 0.55 + hash01(respawnSeed ^ (i * 2654435761)) * 0.45;
@@ -75,7 +75,7 @@ export default function createScene() {
   }
 
   return {
-    mount(ctx) {
+    mount(ctx: SceneMountContext) {
       root = document.createElement('div');
       root.className = 'scene-root';
 
@@ -106,11 +106,11 @@ export default function createScene() {
       caption = null;
     },
 
-    resize(w, h) {
+    resize(w: number, h: number) {
       if (backdrop) backdrop.resize(w, h);
     },
 
-    frame(dt, state) {
+    frame(dt: number, state: FrameState) {
       if (!backdrop || !backdrop.ctx) return;
 
       // Clamp the step: a long stall must not teleport every particle.
@@ -130,8 +130,8 @@ export default function createScene() {
       const pointer = state && state.pointer;
       const hasPull = !!(pointer && pointer.down);
       // Map pointer into the same [-1,1] space the particles live in.
-      const pullX = hasPull ? pointer.x * 2 - 1 : 0;
-      const pullY = hasPull ? -(pointer.y * 2 - 1) : 0;
+      const pullX = hasPull && pointer ? pointer.x * 2 - 1 : 0;
+      const pullY = hasPull && pointer ? -(pointer.y * 2 - 1) : 0;
 
       integrate(step, timeSec, hasPull, pullX, pullY);
       draw(ctx, W, H);
@@ -142,14 +142,22 @@ export default function createScene() {
    * Advance every particle one step. Vortex + inward pull + optional pointer
    * attractor, semi-implicit Euler with velocity damping.
    */
-  function integrate(dt, t, hasPull, pullX, pullY) {
+  function integrate(
+    dt: number,
+    t: number,
+    hasPull: boolean,
+    pullX: number,
+    pullY: number,
+  ): void {
     // Slow global rotation of the vortex axis keeps the field from settling.
     const swirl = 1.15 + Math.sin(t * 0.23) * 0.35;
     const damp = Math.exp(-1.1 * dt); // frame-rate independent damping
 
     for (let i = 0; i < COUNT; i++) {
-      const x = px[i];
-      const y = py[i];
+      // The ?? 0 fallbacks satisfy noUncheckedIndexedAccess; i is always in
+      // range for arrays allocated at COUNT.
+      const x = px[i] ?? 0;
+      const y = py[i] ?? 0;
 
       const r2 = x * x + y * y;
       // Softening constant avoids the singularity at the origin; without it a
@@ -173,8 +181,8 @@ export default function createScene() {
         ay += dy * g;
       }
 
-      let nvx = (vx[i] + ax * dt) * damp;
-      let nvy = (vy[i] + ay * dt) * damp;
+      let nvx = ((vx[i] ?? 0) + ax * dt) * damp;
+      let nvy = ((vy[i] ?? 0) + ay * dt) * damp;
 
       // Speed clamp: keeps the trail lengths bounded and the motion readable.
       const sp2 = nvx * nvx + nvy * nvy;
@@ -189,18 +197,28 @@ export default function createScene() {
       px[i] = x + nvx * dt;
       py[i] = y + nvy * dt;
 
-      energy[i] -= decay[i] * dt;
+      energy[i] = (energy[i] ?? 0) - (decay[i] ?? 0) * dt;
 
       // Recycle on death or on escaping the visible region.
-      if (energy[i] <= 0 || px[i] * px[i] + py[i] * py[i] > 2.6) respawn(i);
+      const nx = px[i] ?? 0;
+      const ny = py[i] ?? 0;
+      if ((energy[i] ?? 0) <= 0 || nx * nx + ny * ny > 2.6) respawn(i);
     }
+  }
+
+  /** One energy band and the color it paints. */
+  interface Band {
+    lo: number;
+    hi: number;
+    style: string;
+    size: number;
   }
 
   /**
    * Batched draw. Particles are bucketed into three energy bands so we get a
    * color ramp with three fillStyle changes instead of COUNT of them.
    */
-  function draw(ctx, W, H) {
+  function draw(ctx: CanvasRenderingContext2D, W: number, H: number): void {
     const scale = Math.min(W, H) * 0.42;
     const cx = W * 0.5;
     const cy = H * 0.5;
@@ -209,7 +227,7 @@ export default function createScene() {
     ctx.globalCompositeOperation = 'lighter';
 
     // Band edges and their colors, hot core to cool rim.
-    const bands = [
+    const bands: Band[] = [
       { lo: 0.66, hi: 1.01, style: 'rgba(255,190,235,0.55)', size: 1.25 },
       { lo: 0.33, hi: 0.66, style: 'rgba(200,120,255,0.42)', size: 1.0 },
       { lo: 0.0, hi: 0.33, style: 'rgba(120,90,220,0.30)', size: 0.8 },
@@ -217,16 +235,17 @@ export default function createScene() {
 
     for (let b = 0; b < bands.length; b++) {
       const band = bands[b];
+      if (!band) continue;
       ctx.fillStyle = band.style;
       ctx.beginPath();
 
       const r = dot * band.size;
       for (let i = 0; i < COUNT; i++) {
-        const e = energy[i];
+        const e = energy[i] ?? 0;
         if (e < band.lo || e >= band.hi) continue;
 
-        const sx = cx + px[i] * scale;
-        const sy = cy - py[i] * scale;
+        const sx = cx + (px[i] ?? 0) * scale;
+        const sy = cy - (py[i] ?? 0) * scale;
         // Cull offscreen points before paying for the arc.
         if (sx < -8 || sy < -8 || sx > W + 8 || sy > H + 8) continue;
 

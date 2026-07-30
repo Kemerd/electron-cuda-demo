@@ -1,5 +1,5 @@
 /**
- * presets.js -- fidelity picker.
+ * presets.ts -- fidelity picker.
  *
  * Four preset chips plus an "Advanced" disclosure with the three raw knobs.
  * Committing a change means a device reallocation on the native side, so:
@@ -11,7 +11,30 @@
  *    drag feels live.
  */
 
-import { PRESETS, DEFAULT_PRESET } from '../../shared/protocol.js';
+import { PRESETS, DEFAULT_PRESET } from '../../shared/protocol';
+import type { PresetId, SceneParams } from '../../shared/protocol';
+
+/**
+ * The fully-populated params this panel emits. SceneParams has every field
+ * optional (the engine accepts partial reconfigures); the picker always knows
+ * all three, so it works with the required form internally.
+ */
+export type FidelityParams = Required<SceneParams>;
+
+/** Which knob a slider drives. */
+type SliderKey = keyof FidelityParams;
+
+interface SliderSpec {
+  readonly key: SliderKey;
+  readonly label: string;
+  readonly min: number;
+  readonly max: number;
+  readonly step?: number;
+  /** Exponential position mapping. */
+  readonly log?: boolean;
+  /** Snap to powers of two. */
+  readonly pow2?: boolean;
+}
 
 /**
  * Advanced slider definitions. Ranges are expressed as exponent bounds because
@@ -19,20 +42,18 @@ import { PRESETS, DEFAULT_PRESET } from '../../shared/protocol.js';
  * live between 20k and 2M, and a linear slider spends 90% of its travel above
  * 1M where nothing changes.
  */
-const SLIDERS = Object.freeze([
+const SLIDERS: readonly SliderSpec[] = Object.freeze([
   { key: 'swarmCount', label: 'Swarm agents', min: 1_000, max: 4_000_000, step: 1, log: true },
   { key: 'stormCount', label: 'Storm particles', min: 1_000, max: 8_000_000, step: 1, log: true },
   // The weather grid is a power of two by construction (W = 2*H equirect).
   { key: 'weatherGrid', label: 'Weather grid', min: 128, max: 4096, pow2: true },
-]);
+] as const);
 
 /**
  * Compact large integers: 2000000 -> "2.0M". Keeps the readout from reflowing
  * the panel every time a digit is added.
- * @param {number} n
- * @returns {string}
  */
-function formatCount(n) {
+function formatCount(n: number): string {
   if (!Number.isFinite(n)) return '--';
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(n >= 100_000 ? 0 : 1)}k`;
@@ -45,8 +66,8 @@ function formatCount(n) {
  */
 const SLIDER_RESOLUTION = 1000;
 
-/** @param {object} spec @param {number} pos 0..SLIDER_RESOLUTION @returns {number} */
-function posToValue(spec, pos) {
+/** @param pos 0..SLIDER_RESOLUTION */
+function posToValue(spec: SliderSpec, pos: number): number {
   const t = Math.max(0, Math.min(1, pos / SLIDER_RESOLUTION));
 
   if (spec.pow2) {
@@ -65,8 +86,8 @@ function posToValue(spec, pos) {
   return Math.round(spec.min + (spec.max - spec.min) * t);
 }
 
-/** @param {object} spec @param {number} value @returns {number} slider position */
-function valueToPos(spec, value) {
+/** @returns slider position */
+function valueToPos(spec: SliderSpec, value: number): number {
   const v = Math.max(spec.min, Math.min(spec.max, Number.isFinite(value) ? value : spec.min));
 
   if (spec.pow2 || spec.log) {
@@ -79,37 +100,65 @@ function valueToPos(spec, value) {
   return Math.round(((v - spec.min) / (spec.max - spec.min)) * SLIDER_RESOLUTION);
 }
 
+/** Options accepted by createPresets. */
+export interface PresetsOptions {
+  /** Preset key to start on. */
+  initial?: string;
+  onChange?: (params: FidelityParams, presetKey: PresetId | null) => void;
+}
+
+/** Public surface of the mounted picker. */
+export interface PresetsApi {
+  getParams(): FidelityParams;
+  getPreset(): PresetId | null;
+  setPreset(key: string): void;
+}
+
+/**
+ * Preset keys in declaration order (ultra / high / medium / low).
+ * Object.keys is typed string[] by design (an object can carry extra keys at
+ * runtime); PRESETS is a frozen literal in protocol.ts, so its key set is
+ * exactly PresetId and the narrowing is safe.
+ */
+const PRESET_KEYS = Object.keys(PRESETS) as PresetId[];
+
+/** Narrow an arbitrary string to a PresetId without a cast at the call site. */
+function asPresetId(key: string | undefined | null): PresetId | null {
+  if (typeof key !== 'string') return null;
+  return Object.prototype.hasOwnProperty.call(PRESETS, key) ? (key as PresetId) : null;
+}
+
+/** Pull the three numeric knobs out of a preset definition. */
+function paramsFromPreset(key: PresetId): FidelityParams {
+  const preset = PRESETS[key];
+  return {
+    swarmCount: preset.swarmCount,
+    weatherGrid: preset.weatherGrid,
+    stormCount: preset.stormCount,
+  };
+}
+
 /**
  * Mount the preset picker.
  *
- * @param {HTMLElement|null} host container (#presets-panel)
- * @param {object} opts
- * @param {string} [opts.initial] preset key
- * @param {(params:object, presetKey:string|null)=>void} opts.onChange
- * @returns {{getParams:()=>object, getPreset:()=>string|null, setPreset:(key:string)=>void}}
+ * @param host container (#presets-panel)
  */
-export function createPresets(host, opts) {
-  const options = opts && typeof opts === 'object' ? opts : {};
+export function createPresets(host: HTMLElement | null, opts?: PresetsOptions | null): PresetsApi {
+  const options: PresetsOptions = opts && typeof opts === 'object' ? opts : {};
   const onChange = typeof options.onChange === 'function' ? options.onChange : () => {};
 
   if (!host) {
     console.warn('[presets] host element missing; fidelity picker disabled');
-    const fallback = { ...PRESETS[DEFAULT_PRESET] };
+    const fallback = paramsFromPreset(DEFAULT_PRESET);
     return { getParams: () => ({ ...fallback }), getPreset: () => DEFAULT_PRESET, setPreset() {} };
   }
 
-  const initialKey =
-    typeof options.initial === 'string' && PRESETS[options.initial] ? options.initial : DEFAULT_PRESET;
+  const initialKey = asPresetId(options.initial) ?? DEFAULT_PRESET;
 
   /** Active numeric params. Diverging from a preset sets activePreset to null. */
-  let params = {
-    swarmCount: PRESETS[initialKey].swarmCount,
-    weatherGrid: PRESETS[initialKey].weatherGrid,
-    stormCount: PRESETS[initialKey].stormCount,
-  };
+  let params: FidelityParams = paramsFromPreset(initialKey);
 
-  /** @type {string|null} */
-  let activePreset = initialKey;
+  let activePreset: PresetId | null = initialKey;
 
   host.replaceChildren();
 
@@ -122,12 +171,11 @@ export function createPresets(host, opts) {
   const grid = document.createElement('div');
   grid.className = 'preset-grid';
 
-  /** @type {Map<string, HTMLButtonElement>} */
-  const chips = new Map();
+  const chips = new Map<PresetId, HTMLButtonElement>();
 
-  // Object.keys order on PRESETS is ultra/high/medium/low as declared, which is
-  // the order we want to display.
-  for (const key of Object.keys(PRESETS)) {
+  // PRESET_KEYS order is ultra/high/medium/low as declared, which is the order
+  // we want to display.
+  for (const key of PRESET_KEYS) {
     const preset = PRESETS[key];
     const chip = document.createElement('button');
     chip.type = 'button';
@@ -174,8 +222,14 @@ export function createPresets(host, opts) {
     head.setAttribute('aria-expanded', open ? 'true' : 'false');
   });
 
-  /** @type {Array<{spec:object, input:HTMLInputElement, value:HTMLElement}>} */
-  const sliderRefs = [];
+  /** One mounted slider and the elements it drives. */
+  interface SliderRef {
+    spec: SliderSpec;
+    input: HTMLInputElement;
+    value: HTMLElement;
+  }
+
+  const sliderRefs: SliderRef[] = [];
 
   for (const spec of SLIDERS) {
     const field = document.createElement('div');
@@ -229,11 +283,9 @@ export function createPresets(host, opts) {
   /**
    * Find the preset key whose values exactly match the current params, or null
    * when the user has gone off-preset.
-   * @param {object} p
-   * @returns {string|null}
    */
-  function matchPreset(p) {
-    for (const key of Object.keys(PRESETS)) {
+  function matchPreset(p: FidelityParams): PresetId | null {
+    for (const key of PRESET_KEYS) {
       const preset = PRESETS[key];
       if (
         preset.swarmCount === p.swarmCount &&
@@ -247,7 +299,7 @@ export function createPresets(host, opts) {
   }
 
   /** Repaint chip pressed-state from activePreset. */
-  function syncChips() {
+  function syncChips(): void {
     for (const [key, chip] of chips) {
       const on = key === activePreset;
       chip.classList.toggle('selected', on);
@@ -256,7 +308,7 @@ export function createPresets(host, opts) {
   }
 
   /** Push current params back into the slider positions and labels. */
-  function syncSliders() {
+  function syncSliders(): void {
     for (const ref of sliderRefs) {
       const v = params[ref.spec.key];
       ref.input.value = String(valueToPos(ref.spec, v));
@@ -267,22 +319,16 @@ export function createPresets(host, opts) {
 
   /**
    * Apply a named preset and notify.
-   * @param {string} key
    */
-  function applyPreset(key) {
-    const preset = PRESETS[key];
-    if (!preset) {
+  function applyPreset(key: PresetId): void {
+    if (!PRESETS[key]) {
       console.warn('[presets] unknown preset "%s"', String(key));
       return;
     }
     if (activePreset === key) return;
 
     activePreset = key;
-    params = {
-      swarmCount: preset.swarmCount,
-      weatherGrid: preset.weatherGrid,
-      stormCount: preset.stormCount,
-    };
+    params = paramsFromPreset(key);
 
     syncChips();
     syncSliders();
@@ -297,19 +343,14 @@ export function createPresets(host, opts) {
     getPreset: () => activePreset,
 
     /**
-     * Select a preset without firing onChange -- used when app.js needs to drop
+     * Select a preset without firing onChange -- used when app.ts needs to drop
      * to a safer preset (e.g. limited VRAM) without echoing back into itself.
-     * @param {string} key
      */
     setPreset(key) {
-      const preset = PRESETS[key];
-      if (!preset) return;
-      activePreset = key;
-      params = {
-        swarmCount: preset.swarmCount,
-        weatherGrid: preset.weatherGrid,
-        stormCount: preset.stormCount,
-      };
+      const id = asPresetId(key);
+      if (!id) return;
+      activePreset = id;
+      params = paramsFromPreset(id);
       syncChips();
       syncSliders();
     },

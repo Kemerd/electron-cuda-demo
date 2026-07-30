@@ -1,7 +1,8 @@
 /**
- * protocol.js — single source of truth for every constant shared between the
- * Electron main process, the renderer, and (by mirrored #defines) the native
- * engine. If a number or a message shape lives in two places, it lives here.
+ * protocol.ts — single source of truth for every constant, type, and message
+ * shape shared between the Electron main process, the renderer, and (by
+ * mirrored #defines) the native engine. If a number or a shape lives in two
+ * places, it lives here.
  *
  * Coordinate system
  * -----------------
@@ -14,6 +15,16 @@
  */
 
 /* ------------------------------------------------------------------ *
+ *  Small shared aliases
+ * ------------------------------------------------------------------ */
+
+/** World-space position/direction triple. */
+export type Vec3 = [number, number, number];
+
+/** Quaternion, xyzw order — matches three.js Quaternion serialization. */
+export type Vec4 = [number, number, number, number];
+
+/* ------------------------------------------------------------------ *
  *  Scenes and backend matrix
  * ------------------------------------------------------------------ */
 
@@ -22,38 +33,51 @@ export const SCENES = Object.freeze({
   SWARM: 'swarm',      // globe + drone swarm + targets
   WEATHER: 'weather',  // globe + weather field + wind-driven swarm
   STORM: 'storm',      // free-space particle storm, mouse-driven
-});
+} as const);
+export type SceneId = (typeof SCENES)[keyof typeof SCENES];
 
 /** Who runs the simulation step. */
 export const COMPUTE = Object.freeze({
   CPU: 'cpu',
   WEBGPU: 'webgpu',
   CUDA: 'cuda',
-});
+} as const);
+export type ComputeBackend = (typeof COMPUTE)[keyof typeof COMPUTE];
 
 /** Who turns state into pixels. */
 export const RASTER = Object.freeze({
   THREE: 'three',    // three.js WebGLRenderer
   WEBGPU: 'webgpu',  // raw WebGPU render pass
   CUDA: 'cuda',      // CUDA kernels rasterize the full frame
-});
+} as const);
+export type RasterBackend = (typeof RASTER)[keyof typeof RASTER];
 
 /** How pixels reach the screen. */
 export const PRESENT = Object.freeze({
-  COMPOSITE: 'composite',          // normal Chromium compositing
-  NATIVE_VSYNC: 'nativeVsync',     // D3D11 child window, vsync on
+  COMPOSITE: 'composite',            // normal Chromium compositing
+  NATIVE_VSYNC: 'nativeVsync',       // D3D11 child window, vsync on
   NATIVE_UNLOCKED: 'nativeUnlocked', // D3D11 child window, tearing allowed
-});
+} as const);
+export type PresentPath = (typeof PRESENT)[keyof typeof PRESENT];
+
+/** One cell of the backend matrix. */
+export interface ModeState {
+  compute: ComputeBackend;
+  raster: RasterBackend;
+  present: PresentPath;
+}
+
+export interface LegalityResult {
+  ok: boolean;
+  reason?: string;
+}
 
 /**
  * Matrix legality. The rules encode real data-locality constraints, not
  * arbitrary product choices — the tooltip strings say why so the UI can
  * teach instead of just greying things out.
- *
- * @param {{compute:string, raster:string, present:string}} mode
- * @returns {{ok:boolean, reason?:string}}
  */
-export function isLegalMode(mode) {
+export function isLegalMode(mode: Partial<ModeState> | null | undefined): LegalityResult {
   if (!mode || !mode.compute || !mode.raster || !mode.present) {
     return { ok: false, reason: 'Incomplete mode selection.' };
   }
@@ -80,13 +104,28 @@ export function isLegalMode(mode) {
  *  presets on modest hardware — the UI exposes all of them)
  * ------------------------------------------------------------------ */
 
+export interface PresetDef {
+  readonly label: string;
+  readonly swarmCount: number;
+  readonly weatherGrid: number; // equirect field HEIGHT; width is 2x this
+  readonly stormCount: number;
+}
+
 export const PRESETS = Object.freeze({
   ultra:  Object.freeze({ label: 'Ultra',  swarmCount: 2_000_000, weatherGrid: 2048, stormCount: 4_000_000 }),
   high:   Object.freeze({ label: 'High',   swarmCount:   500_000, weatherGrid: 1024, stormCount: 1_000_000 }),
   medium: Object.freeze({ label: 'Medium', swarmCount:   100_000, weatherGrid:  512, stormCount:   250_000 }),
   low:    Object.freeze({ label: 'Low',    swarmCount:    20_000, weatherGrid:  256, stormCount:    50_000 }),
-});
-export const DEFAULT_PRESET = 'ultra';
+} as const) satisfies Readonly<Record<string, PresetDef>>;
+export type PresetId = keyof typeof PRESETS;
+export const DEFAULT_PRESET: PresetId = 'ultra';
+
+/** Scene sizing parameters accepted by configureScene(). */
+export interface SceneParams {
+  swarmCount?: number;
+  weatherGrid?: number;
+  stormCount?: number;
+}
 
 /** Native-side 3D density grid used by the volumetric ray-marcher. */
 export const VOLUME_GRID = 256;
@@ -105,12 +144,11 @@ export const ALTITUDE_MAX = 1.10;  // swarm shell outer radius
 
 /**
  * Convert geographic coordinates to world-space position.
- * @param {number} latDeg latitude in degrees, +N
- * @param {number} lonDeg longitude in degrees, +E
- * @param {number} [radius=GLOBE_RADIUS] distance from globe center
- * @returns {[number, number, number]} [x, y, z]
+ * @param latDeg latitude in degrees, +N
+ * @param lonDeg longitude in degrees, +E
+ * @param radius distance from globe center (defaults to the surface)
  */
-export function latLonToXyz(latDeg, lonDeg, radius = GLOBE_RADIUS) {
+export function latLonToXyz(latDeg: number, lonDeg: number, radius: number = GLOBE_RADIUS): Vec3 {
   const lat = (latDeg * Math.PI) / 180;
   const lon = (lonDeg * Math.PI) / 180;
   const c = Math.cos(lat);
@@ -138,7 +176,7 @@ export const STORM_FLOATS = 4;
 export const STORM_STRIDE_BYTES = STORM_FLOATS * 4;
 
 /**
- * Weather field texel — RGBA8, equirectangular grid (W = 2*H = weatherGrid):
+ * Weather field texel — RGBA8, equirectangular grid (W = 2*H = weatherGrid*2):
  *   R = wind u  (-1..1 mapped to 0..255)
  *   G = wind v  (-1..1 mapped to 0..255)
  *   B = density (0..1)
@@ -148,6 +186,47 @@ export const FIELD_CHANNELS = 4;
 
 /** Blit-path framebuffer format: tightly packed RGBA8, w*h*4 bytes. */
 export const RGBA_CHANNELS = 4;
+
+/* ------------------------------------------------------------------ *
+ *  Input state (renderer -> kernels, a few bytes of uniforms per frame)
+ * ------------------------------------------------------------------ */
+
+/** Pointer force behavior in the storm scene. */
+export type MouseForceMode = 1 | 2 | 3; // 1 attract, 2 repel, 3 vortex
+
+export interface MouseState {
+  x: number;            // normalized 0..1 canvas space
+  y: number;            // normalized 0..1 canvas space
+  down: boolean;
+  mode: MouseForceMode;
+}
+
+export interface TargetPoint {
+  pos: Vec3;
+  strength: number;
+  ttl: number;          // seconds remaining
+}
+
+export interface Shockwave {
+  pos: Vec3;
+  age: number;          // seconds since the click
+}
+
+export interface CameraState {
+  pos: Vec3;
+  quat: Vec4;           // xyzw
+  fovYDeg: number;
+  aspect: number;
+}
+
+export interface InputState {
+  mouse: MouseState;
+  pointerWorld: Vec3 | null;  // globe raycast hit, world units
+  targets: TargetPoint[];     // <= MAX_TARGETS
+  shockwaves: Shockwave[];    // <= MAX_SHOCKWAVES
+  camera: CameraState;
+  timeSec: number;            // monotonic scene clock
+}
 
 /* ------------------------------------------------------------------ *
  *  Frame transport (MessagePort main <-> renderer)
@@ -167,51 +246,75 @@ export const RGBA_CHANNELS = 4;
  *  byteLength no longer matches the active preset.
  * ------------------------------------------------------------------ */
 
-/** Message `t` field values. */
+/** Message discriminants for port traffic. */
 export const MSG = Object.freeze({
   REQ: 'req',         // renderer -> main: please produce a frame
   FRAME: 'frame',     // main -> renderer: one payload (entities|field|rgba)
   RECYCLE: 'recycle', // renderer -> main: returning consumed buffers
   ERROR: 'error',     // main -> renderer: engine failure for a request
-});
+} as const);
+export type MsgType = (typeof MSG)[keyof typeof MSG];
 
 /** FRAME payload kinds. */
 export const KIND = Object.freeze({
   ENTITIES: 'entities', // swarm or storm interleaved records
   FIELD: 'field',       // weather RGBA8 grid
   RGBA: 'rgba',         // full raster frame
-});
+} as const);
+export type PayloadKind = (typeof KIND)[keyof typeof KIND];
 
-/*
- * REQ shape (renderer -> main):
- * {
- *   t: MSG.REQ, frameId: number, scene, compute, raster,
- *   dtMs: number,                    // clamped 0..100 engine-side
- *   width, height,                   // raster target size (rgba requests only)
- *   wantField: boolean,              // weather scene, non-CUDA raster paths
- *   input: InputState,               // see below
- *   buffers: ArrayBuffer[],         // recycled buffers riding along (transferred)
- * }
- *
- * FRAME shape (main -> renderer):
- * {
- *   t: MSG.FRAME, frameId, scene, kind: KIND.*,
- *   count?,                          // entities: record count
- *   w?, h?,                          // field/rgba dimensions
- *   timings: { simMs, copyMs, renderMs? },
- *   buf: ArrayBuffer,                // transferred payload
- * }
- *
- * InputState:
- * {
- *   mouse: { x, y, down, mode },     // x,y normalized 0..1 canvas space; mode: 1=attract 2=repel 3=vortex
- *   pointerWorld: [x,y,z] | null,    // globe raycast hit, world units
- *   targets: [{ pos:[x,y,z], strength, ttl }],   // <= MAX_TARGETS
- *   shockwaves: [{ pos:[x,y,z], age }],          // <= MAX_SHOCKWAVES
- *   camera: { pos:[3], quat:[4] /* xyzw *\/, fovYDeg, aspect },
- *   timeSec: number,                 // monotonic scene clock
- * }
- */
+/** renderer -> main: produce a frame. */
+export interface ReqMsg {
+  t: typeof MSG.REQ;
+  frameId: number;
+  scene: SceneId;
+  compute: ComputeBackend;
+  raster: RasterBackend;
+  dtMs: number;               // clamped 0..100 engine-side
+  width?: number;             // raster target size (rgba requests only)
+  height?: number;
+  wantField?: boolean;        // weather scene, non-CUDA raster paths
+  input: InputState;
+  buffers: ArrayBuffer[];     // recycled buffers riding along (transferred)
+}
+
+export interface FrameTimings {
+  simMs: number;
+  copyMs: number;
+  renderMs?: number;
+}
+
+/** main -> renderer: one payload. A request may produce several FRAMEs
+ *  (entities + field share a frameId). */
+export interface FrameMsg {
+  t: typeof MSG.FRAME;
+  frameId: number;
+  scene: SceneId;
+  kind: PayloadKind;
+  count?: number;             // entities: record count
+  w?: number;                 // field/rgba dimensions
+  h?: number;
+  timings: FrameTimings;
+  buf: ArrayBuffer;
+}
+
+/** renderer -> main: buffers coming home outside a REQ. */
+export interface RecycleMsg {
+  t: typeof MSG.RECYCLE;
+  buffers: ArrayBuffer[];
+}
+
+/** main -> renderer: the engine could not serve a request. */
+export interface ErrorMsg {
+  t: typeof MSG.ERROR;
+  frameId: number;
+  reason: string;
+}
+
+/** Everything the renderer can receive on the port. */
+export type PumpToRendererMsg = FrameMsg | ErrorMsg;
+/** Everything main can receive on the port. */
+export type RendererToPumpMsg = ReqMsg | RecycleMsg;
 
 /* ------------------------------------------------------------------ *
  *  IPC channel names (ipcMain.handle / ipcRenderer.invoke unless noted)
@@ -220,23 +323,47 @@ export const KIND = Object.freeze({
 export const IPC = Object.freeze({
   RENDERER_READY: 'renderer:ready',     // send (one-shot handshake)
   ENGINE_PORT: 'engine:port',           // webContents.postMessage carrying the port
-  GET_CAPS: 'caps:get',                 // -> Capabilities (see below)
-  CONFIGURE_SCENE: 'scene:configure',   // {scene, params} -> {ok, vramUsedMB, reason?}
+  GET_CAPS: 'caps:get',                 // -> Capabilities
+  CONFIGURE_SCENE: 'scene:configure',   // {scene, params} -> ConfigureResult
   UPLOAD_EARTH: 'texture:earth',        // -> {ok} (main decodes + uploads to engine)
-  NVIEW_CREATE: 'nview:create',         // {x,y,w,h} css px + dpr -> {ok, reason?}
+  NVIEW_CREATE: 'nview:create',         // {x,y,w,h,dpr} css px -> {ok, reason?}
   NVIEW_RECT: 'nview:rect',             // {x,y,w,h,dpr}
   NVIEW_VISIBLE: 'nview:visible',       // {visible}
   NVIEW_START: 'nview:start',           // {scene, vsync} -> {ok}
   NVIEW_STOP: 'nview:stop',
   NVIEW_STATS: 'nview:stats',           // -> {fps, frameMs, simMs}
-});
+} as const);
+export type IpcChannel = (typeof IPC)[keyof typeof IPC];
+
+/* ------------------------------------------------------------------ *
+ *  Capability model (served over IPC.GET_CAPS)
+ * ------------------------------------------------------------------ */
+
+export interface CudaCaps {
+  ok: boolean;
+  name?: string | null;
+  ccMajor?: number;
+  ccMinor?: number;
+  vramMB?: number;
+  driverVersion?: number | string;
+  reason?: string | null;
+}
+
+export interface Capabilities {
+  cuda: CudaCaps;
+  versions: { electron: string; chrome: string; node: string };
+  /** Present-column availability; populated once the native view lands. */
+  nativeView?: { ok: boolean; reason?: string };
+}
+
+/** Result shape for configureScene / other {ok, reason} engine calls. */
+export interface OkResult {
+  ok: boolean;
+  reason?: string | null;
+  vramUsedMB?: number;
+}
 
 /*
- * Capabilities shape (returned by IPC.GET_CAPS):
- * {
- *   cuda: { ok, name?, ccMajor?, ccMinor?, vramMB?, driverVersion?, reason? },
- *   versions: { electron, chrome, node },
- * }
  * WebGPU capability is probed renderer-side (navigator.gpu.requestAdapter()
  * returns null — not an exception — when unavailable), then merged into the
  * same capability model the UI consumes.

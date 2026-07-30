@@ -1,5 +1,5 @@
 /**
- * capabilities.js -- one-shot native addon probe + capability reporting.
+ * capabilities.ts -- one-shot native addon probe + capability reporting.
  *
  * The whole point of this module is that a missing, stale, or outright broken
  * cuda_engine.node must never take the app down. Everything below is wrapped so
@@ -17,6 +17,8 @@ import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 
 import { IPC } from '../shared/protocol.js';
+import type { Capabilities, CudaCaps } from '../shared/protocol.js';
+import type { CudaEngine } from './engine-types.js';
 
 // ESM has no require(); createRequire gives us one bound to this file's URL so
 // the relative addon path below resolves the same way a CJS require would.
@@ -24,17 +26,22 @@ const require = createRequire(import.meta.url);
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
-/** Fixed addon location per CONTRACTS section 1. */
+/**
+ * Fixed addon location per CONTRACTS section 1. Resolved relative to this
+ * module, and the compiled layout preserves the source's depth
+ * (src/main -> dist-electron/main, both two levels under the repo root), so the
+ * path string is identical in source and in build output.
+ */
 const ADDON_PATH = path.resolve(here, '../../native/build/Release/cuda_engine.node');
 
 /**
  * Loaded addon handle, or null when unavailable. Other main-process modules
  * (frame-pump) read this through getEngine() rather than re-requiring.
  */
-let engine = null;
+let engine: CudaEngine | null = null;
 
 /** Cached Capabilities object; built by probeCapabilities(). */
-let caps = null;
+let caps: Capabilities | null = null;
 
 /** True once init() reported ok -- shutdown() is only worth calling then. */
 let engineInitialized = false;
@@ -44,8 +51,12 @@ let engineInitialized = false;
  * anyway because this file also has to survive being imported under bare node
  * during tooling experiments.
  */
-function collectVersions() {
-  const v = (typeof process !== 'undefined' && process.versions) || {};
+function collectVersions(): Capabilities['versions'] {
+  // process.versions types `electron` and `chrome` as required, but this module
+  // must survive being imported under bare node, where neither key exists.
+  // Partial<> models that honestly and keeps the || fallbacks meaningful.
+  const v: Partial<NodeJS.ProcessVersions> =
+    typeof process !== 'undefined' && process.versions ? process.versions : {};
   return {
     electron: v.electron || 'unknown',
     chrome: v.chrome || 'unknown',
@@ -54,40 +65,56 @@ function collectVersions() {
 }
 
 /**
+ * Narrow an unknown value to an indexable record without reaching for `any`.
+ * Used on values that just crossed the native boundary, where the declared
+ * return type is a promise the addon makes rather than one the compiler checked.
+ */
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === 'object' ? (value as Record<string, unknown>) : null;
+}
+
+/** Message extraction that survives a thrown non-Error (a string, null, ...). */
+function errText(err: unknown): string {
+  if (err instanceof Error && err.message) return err.message;
+  return String(err);
+}
+
+/**
  * Normalize whatever getDeviceInfo() handed back into the documented cuda
  * capability shape. The addon is contractually well-behaved, but this is the
  * trust boundary between JS and a freshly compiled .node file -- treat every
  * field as suspect.
  *
- * @param {unknown} info raw return value from engine.getDeviceInfo()
- * @returns {{ok:boolean, name?:string, ccMajor?:number, ccMinor?:number, vramMB?:number, driverVersion?:string, reason?:string}}
+ * @param info raw return value from engine.getDeviceInfo()
  */
-function normalizeDeviceInfo(info) {
-  if (!info || typeof info !== 'object') {
+function normalizeDeviceInfo(info: unknown): CudaCaps {
+  const raw = asRecord(info);
+  if (!raw) {
     return { ok: false, reason: 'Addon getDeviceInfo() returned no data.' };
   }
-  if (info.ok !== true) {
+  if (raw.ok !== true) {
     return {
       ok: false,
-      reason: typeof info.reason === 'string' && info.reason.length
-        ? info.reason
+      reason: typeof raw.reason === 'string' && raw.reason.length
+        ? raw.reason
         : 'No NVIDIA GPU detected',
     };
   }
 
-  const num = (x) => (typeof x === 'number' && Number.isFinite(x) ? x : undefined);
+  const num = (x: unknown): number | undefined =>
+    typeof x === 'number' && Number.isFinite(x) ? x : undefined;
 
   return {
     ok: true,
-    name: typeof info.name === 'string' && info.name.length ? info.name : 'NVIDIA GPU',
-    ccMajor: num(info.ccMajor),
-    ccMinor: num(info.ccMinor),
-    vramMB: num(info.vramMB),
+    name: typeof raw.name === 'string' && raw.name.length ? raw.name : 'NVIDIA GPU',
+    ccMajor: num(raw.ccMajor),
+    ccMinor: num(raw.ccMinor),
+    vramMB: num(raw.vramMB),
     driverVersion:
-      typeof info.driverVersion === 'string'
-        ? info.driverVersion
-        : num(info.driverVersion) !== undefined
-          ? String(info.driverVersion)
+      typeof raw.driverVersion === 'string'
+        ? raw.driverVersion
+        : num(raw.driverVersion) !== undefined
+          ? String(raw.driverVersion)
           : undefined,
   };
 }
@@ -95,10 +122,8 @@ function normalizeDeviceInfo(info) {
 /**
  * Probe the native addon exactly once and cache the resulting capability model.
  * Never throws.
- *
- * @returns {{cuda:object, versions:{electron:string,chrome:string,node:string}}}
  */
-export function probeCapabilities() {
+export function probeCapabilities(): Capabilities {
   if (caps) return caps;
 
   const versions = collectVersions();
@@ -115,13 +140,17 @@ export function probeCapabilities() {
     return caps;
   }
 
-  let loaded = null;
+  let loaded: CudaEngine | null = null;
   try {
-    loaded = require(ADDON_PATH);
+    // The cast is the trust boundary: require() of a .node yields `any`-shaped
+    // data, and CudaEngine is our declaration of what it is contracted to be.
+    // Every method on that interface is optional precisely so this cast cannot
+    // paper over a stale build missing an export.
+    loaded = require(ADDON_PATH) as CudaEngine;
   } catch (err) {
     // Typical causes: ABI mismatch (built against system node instead of the
     // Electron headers), missing CUDA runtime DLL, or a corrupt .node.
-    const reason = `CUDA addon failed to load: ${err && err.message ? err.message : String(err)}`;
+    const reason = `CUDA addon failed to load: ${errText(err)}`;
     console.warn('[caps] %s', reason);
     caps = { cuda: { ok: false, reason }, versions };
     return caps;
@@ -136,11 +165,11 @@ export function probeCapabilities() {
 
   // Device query. Contractually this returns { ok:false, reason } on a machine
   // with no NVIDIA hardware -- but a throw here still must not be fatal.
-  let device;
+  let device: CudaCaps;
   try {
     device = normalizeDeviceInfo(loaded.getDeviceInfo());
   } catch (err) {
-    const reason = `getDeviceInfo() threw: ${err && err.message ? err.message : String(err)}`;
+    const reason = `getDeviceInfo() threw: ${errText(err)}`;
     console.warn('[caps] %s', reason);
     caps = { cuda: { ok: false, reason }, versions };
     return caps;
@@ -155,7 +184,7 @@ export function probeCapabilities() {
   // Context + stream creation. Separate from the device query so we can report
   // "GPU present, but init failed" distinctly -- that distinction matters when
   // debugging driver/toolkit mismatches.
-  let initResult = null;
+  let initResult: { ok?: unknown; reason?: unknown } | null = null;
   try {
     if (typeof loaded.init === 'function') {
       initResult = loaded.init();
@@ -165,7 +194,7 @@ export function probeCapabilities() {
   } catch (err) {
     initResult = {
       ok: false,
-      reason: `init() threw: ${err && err.message ? err.message : String(err)}`,
+      reason: `init() threw: ${errText(err)}`,
     };
   }
 
@@ -195,15 +224,15 @@ export function probeCapabilities() {
 }
 
 /**
- * @returns {object|null} the live addon handle, or null when CUDA is unavailable.
- * frame-pump.js uses this instead of requiring the addon a second time.
+ * The live addon handle, or null when CUDA is unavailable. frame-pump.ts uses
+ * this instead of requiring the addon a second time.
  */
-export function getEngine() {
+export function getEngine(): CudaEngine | null {
   return engine;
 }
 
-/** @returns {object} the cached capability model (probing on first call). */
-export function getCapabilities() {
+/** The cached capability model (probing on first call). */
+export function getCapabilities(): Capabilities {
   return probeCapabilities();
 }
 
@@ -212,14 +241,14 @@ export function getCapabilities() {
  * call twice -- the native side documents shutdown() as idempotent, and the
  * local guard means we do not even reach it a second time.
  */
-export function shutdownEngine() {
+export function shutdownEngine(): void {
   if (!engine || !engineInitialized) return;
   engineInitialized = false;
   try {
     if (typeof engine.shutdown === 'function') engine.shutdown();
     console.log('[caps] engine shutdown complete');
   } catch (err) {
-    console.warn('[caps] shutdown() threw: %s', err && err.message ? err.message : String(err));
+    console.warn('[caps] shutdown() threw: %s', errText(err));
   }
 }
 
@@ -229,16 +258,16 @@ export function shutdownEngine() {
  * "second handler for channel" error Electron raises.
  */
 let capsHandlerInstalled = false;
-export function registerCapabilityIpc() {
+export function registerCapabilityIpc(): void {
   if (capsHandlerInstalled) return;
   capsHandlerInstalled = true;
 
-  ipcMain.handle(IPC.GET_CAPS, () => {
+  ipcMain.handle(IPC.GET_CAPS, (): Capabilities => {
     try {
       return getCapabilities();
     } catch (err) {
       // Absolute backstop: the renderer must always get a usable object back.
-      console.warn('[caps] GET_CAPS failed: %s', err && err.message ? err.message : String(err));
+      console.warn('[caps] GET_CAPS failed: %s', errText(err));
       return {
         cuda: { ok: false, reason: 'Capability probe failed unexpectedly.' },
         versions: collectVersions(),
