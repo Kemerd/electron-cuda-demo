@@ -253,6 +253,8 @@ const api = {
   recycle(buffers) {
     const transfer = sanitizeTransfers(buffers);
     if (transfer.length === 0) return false;
+    // 'recycle' mirrors MSG.RECYCLE in protocol.js -- same reason as the CH table
+    // above: no ESM import reaches a sandboxed CJS preload.
     return api.sendReq({ t: 'recycle', buffers: transfer }, transfer);
   },
 

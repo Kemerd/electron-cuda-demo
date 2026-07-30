@@ -98,7 +98,7 @@ Test rig for all published numbers:
 | CPU | Intel Core i9-14900K |
 | OS | Windows 11 Pro |
 
-> **TODO:** full sweep results from the Benchmark tab land here — every legal matrix cell across the entity-count ladder, captured on the rig above.
+> **Pending:** full sweep results from the Benchmark tab land here — every legal matrix cell across the entity-count ladder, captured on the rig above.
 
 | Scene | Mode | Entities | Avg FPS | p99 frame ms | Sim ms | Transport ms |
 |-------|------|----------|---------|--------------|--------|--------------|

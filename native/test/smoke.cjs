@@ -111,6 +111,279 @@ function checksum(arr) {
   return { sum, hash: hash >>> 0, nonFinite };
 }
 
+/* ================================================================== *
+ *  Benchmark harness (--bench)
+ * ================================================================== */
+
+/**
+ * Reduce a sample array to the statistics the table reports.
+ *
+ * p50/p99 come from the sorted samples by nearest-rank, which is the right
+ * choice for a small n: interpolating percentiles invents values that were
+ * never measured, and at n=90 the difference is larger than the thing being
+ * measured.
+ *
+ * @param {number[]} samples millisecond timings
+ * @returns {{avg:number, p50:number, p99:number, min:number, max:number, n:number}}
+ */
+function stats(samples) {
+  if (!Array.isArray(samples) || samples.length === 0) {
+    return { avg: 0, p50: 0, p99: 0, min: 0, max: 0, n: 0 };
+  }
+
+  // Copy before sorting - the caller may still want insertion order.
+  const sorted = samples.slice().sort((a, b) => a - b);
+  const n = sorted.length;
+
+  let sum = 0;
+  for (let i = 0; i < n; i++) sum += sorted[i];
+
+  const rank = (p) => sorted[Math.min(n - 1, Math.max(0, Math.ceil(p * n) - 1))];
+
+  return {
+    avg: sum / n,
+    p50: rank(0.5),
+    p99: rank(0.99),
+    min: sorted[0],
+    max: sorted[n - 1],
+    n,
+  };
+}
+
+/**
+ * Print an ASCII table of benchmark rows.
+ *
+ * Columns are padded to fixed widths rather than measured, so the table lines
+ * up in any console that renders a monospace font. ASCII box characters only -
+ * Windows consoles in a non-UTF8 code page mangle anything else.
+ *
+ * @param {Array<{label:string, stats:object}>} rows
+ */
+function printTable(rows) {
+  // Measure the label column instead of guessing it. A fixed width that a
+  // single row overflows breaks the alignment for the whole table, and these
+  // labels grow every time an operation is added.
+  const W_LABEL = Math.max(9, ...rows.map((r) => String(r.label).length));
+  const W_NUM = 10;
+
+  const pad = (s, n) => String(s).padEnd(n);
+  const padL = (s, n) => String(s).padStart(n);
+  const num = (v) => padL(v.toFixed(3), W_NUM);
+
+  const bar = '+' + '-'.repeat(W_LABEL + 2) + '+' +
+    ('-'.repeat(W_NUM + 2) + '+').repeat(6);
+
+  process.stdout.write(bar + '\n');
+  process.stdout.write(
+    '| ' + pad('operation', W_LABEL) + ' | ' + padL('avg ms', W_NUM) +
+    ' | ' + padL('p50 ms', W_NUM) + ' | ' + padL('p99 ms', W_NUM) +
+    ' | ' + padL('min ms', W_NUM) + ' | ' + padL('max ms', W_NUM) +
+    ' | ' + padL('frames', W_NUM) + ' |\n'
+  );
+  process.stdout.write(bar + '\n');
+
+  for (const row of rows) {
+    const s = row.stats;
+    process.stdout.write(
+      '| ' + pad(row.label, W_LABEL) + ' |' + num(s.avg) + ' |' + num(s.p50) +
+      ' |' + num(s.p99) + ' |' + num(s.min) + ' |' + num(s.max) +
+      ' |' + padL(s.n, W_NUM) + ' |\n'
+    );
+  }
+  process.stdout.write(bar + '\n');
+}
+
+/**
+ * Build the InputState the benchmark drives the engine with.
+ *
+ * Deliberately exercises the expensive paths: a live target (so the swarm's
+ * target loop runs), a held pointer with a valid world hit and a live shockwave
+ * (so the storm's interaction and shockwave loops run). Benchmarking with an
+ * empty input would measure a code path the app never actually takes.
+ *
+ * @param {number} frame frame index, drives the clock
+ * @returns {object} InputState per protocol.js
+ */
+function benchInput(frame) {
+  const t = frame * (1 / 60);
+  const ang = t * 0.35;
+
+  return {
+    mouse: { x: 0.5, y: 0.5, down: true, mode: 3 },
+    pointerWorld: [Math.cos(ang) * 0.8, 0.3, Math.sin(ang) * 0.8],
+    targets: [
+      { pos: [Math.cos(ang), 0.2, Math.sin(ang)], strength: 1.0, ttl: 60.0 },
+      { pos: [-Math.sin(ang), -0.4, Math.cos(ang)], strength: 0.7, ttl: 60.0 },
+    ],
+    shockwaves: [{ pos: [0, 0, 1.2], age: (t % 2.0) }],
+    camera: {
+      pos: [Math.sin(t * 0.1) * 3.2, 0.9, Math.cos(t * 0.1) * 3.2],
+      quat: [0, 0, 0, 1],
+      fovYDeg: 50,
+      aspect: BENCH_W / BENCH_H,
+    },
+    timeSec: t,
+  };
+}
+
+/**
+ * Run one timed loop, collecting the timings the engine reports.
+ *
+ * The engine's numbers come from cudaEvents bracketing the real work, so they
+ * measure GPU time and not the host-side call overhead - which is exactly what
+ * a kernel benchmark should report.
+ *
+ * @param {object} engine   loaded addon
+ * @param {string} label    row label for the table
+ * @param {function} runOne called with the frame index; returns the result object
+ * @param {string[]} fields which result fields to collect, e.g. ['simMs','copyMs']
+ * @returns {{rows:Array, error:string|null}}
+ */
+function benchLoop(engine, label, runOne, fields) {
+  const collected = {};
+  for (const f of fields) collected[f] = [];
+
+  for (let i = 0; i < BENCH_FRAMES; i++) {
+    engine.setInput(benchInput(i));
+
+    const res = runOne(i);
+    if (!res || res.ok !== true) {
+      return { rows: [], error: res && res.reason ? res.reason : `${label} frame ${i} failed` };
+    }
+
+    // Discard the warmup frames: lazy scratch allocation and the first-launch
+    // module load land here and are not representative of steady state.
+    if (i < BENCH_WARMUP) continue;
+
+    for (const f of fields) {
+      const v = res[f];
+      if (typeof v === 'number' && Number.isFinite(v)) collected[f].push(v);
+    }
+  }
+
+  const rows = [];
+  let total = null;
+  for (const f of fields) {
+    rows.push({ label: `${label} ${f}`, stats: stats(collected[f]) });
+  }
+
+  // Sum the per-field timings frame by frame so the total row is a real p99 of
+  // the whole operation, not the sum of three independent p99s (which would
+  // overstate it - the three peaks do not coincide).
+  const n = collected[fields[0]].length;
+  if (fields.length > 1 && n > 0) {
+    total = [];
+    for (let i = 0; i < n; i++) {
+      let s = 0;
+      for (const f of fields) s += collected[f][i] || 0;
+      total.push(s);
+    }
+    rows.push({ label: `${label} TOTAL`, stats: stats(total) });
+  }
+
+  return { rows, error: null };
+}
+
+/**
+ * Run the whole benchmark sweep at the ultra preset.
+ *
+ * Each scene is configured, warmed and timed independently, and the scene's
+ * buffers are released by the next configureScene - so the peak VRAM is one
+ * scene's worth, not all three.
+ *
+ * @param {object} engine loaded addon
+ * @returns {string|null} an error reason, or null on success
+ */
+function runBench(engine) {
+  process.stdout.write('\n[bench] ultra preset, ' + BENCH_FRAMES + ' frames per loop (' +
+    BENCH_WARMUP + ' warmup discarded)\n');
+  process.stdout.write('[bench] swarm=' + ULTRA.swarmCount + ' storm=' + ULTRA.stormCount +
+    ' weatherGrid=' + ULTRA.weatherGrid + ' raster=' + BENCH_W + 'x' + BENCH_H + '\n\n');
+
+  const rows = [];
+
+  /* --- swarm: 2M agents, step() ------------------------------------- */
+  {
+    const cfg = engine.configureScene('swarm', { swarmCount: ULTRA.swarmCount });
+    if (!cfg || cfg.ok !== true) {
+      return 'bench swarm configure: ' + (cfg && cfg.reason ? cfg.reason : 'no reason');
+    }
+    process.stdout.write('[bench] swarm scene: ' + Number(cfg.vramUsedMB).toFixed(1) + ' MB VRAM\n');
+
+    // One buffer, reused for every frame. Allocating per frame would have the
+    // GC dominating the measurement.
+    const out = new ArrayBuffer(ULTRA.swarmCount * SWARM_FLOATS * 4);
+    const r = benchLoop(engine, 'swarm 2M step()', () => engine.step('swarm', 16.667, out),
+      ['simMs', 'copyMs']);
+    if (r.error) return r.error;
+    rows.push(...r.rows);
+  }
+
+  /* --- swarm: 1080p renderFrame() ------------------------------------ */
+  {
+    const frame = new ArrayBuffer(BENCH_W * BENCH_H * 4);
+    const r = benchLoop(engine, 'swarm 2M renderFrame 1080p',
+      () => engine.renderFrame('swarm', BENCH_W, BENCH_H, 16.667, frame),
+      ['simMs', 'renderMs', 'copyMs']);
+    if (r.error) return r.error;
+    rows.push(...r.rows);
+  }
+
+  /* --- weather: 4096x2048 field + 2M wind-driven agents --------------- */
+  {
+    const cfg = engine.configureScene('weather', {
+      swarmCount: ULTRA.swarmCount,
+      weatherGrid: ULTRA.weatherGrid,
+    });
+    if (!cfg || cfg.ok !== true) {
+      return 'bench weather configure: ' + (cfg && cfg.reason ? cfg.reason : 'no reason');
+    }
+    process.stdout.write('[bench] weather scene: ' + Number(cfg.vramUsedMB).toFixed(1) +
+      ' MB VRAM\n');
+
+    const out = new ArrayBuffer(ULTRA.swarmCount * SWARM_FLOATS * 4);
+    const r = benchLoop(engine, 'weather 4096x2048 step()',
+      () => engine.step('weather', 16.667, out), ['simMs', 'copyMs']);
+    if (r.error) return r.error;
+    rows.push(...r.rows);
+
+    const frame = new ArrayBuffer(BENCH_W * BENCH_H * 4);
+    const r2 = benchLoop(engine, 'weather renderFrame 1080p',
+      () => engine.renderFrame('weather', BENCH_W, BENCH_H, 16.667, frame),
+      ['simMs', 'renderMs', 'copyMs']);
+    if (r2.error) return r2.error;
+    rows.push(...r2.rows);
+  }
+
+  /* --- storm: 4M particles ------------------------------------------- */
+  {
+    const cfg = engine.configureScene('storm', { stormCount: ULTRA.stormCount });
+    if (!cfg || cfg.ok !== true) {
+      return 'bench storm configure: ' + (cfg && cfg.reason ? cfg.reason : 'no reason');
+    }
+    process.stdout.write('[bench] storm scene: ' + Number(cfg.vramUsedMB).toFixed(1) + ' MB VRAM\n');
+
+    const out = new ArrayBuffer(ULTRA.stormCount * STORM_FLOATS * 4);
+    const r = benchLoop(engine, 'storm 4M step()', () => engine.step('storm', 16.667, out),
+      ['simMs', 'copyMs']);
+    if (r.error) return r.error;
+    rows.push(...r.rows);
+
+    const frame = new ArrayBuffer(BENCH_W * BENCH_H * 4);
+    const r2 = benchLoop(engine, 'storm 4M renderFrame 1080p',
+      () => engine.renderFrame('storm', BENCH_W, BENCH_H, 16.667, frame),
+      ['simMs', 'renderMs', 'copyMs']);
+    if (r2.error) return r2.error;
+    rows.push(...r2.rows);
+  }
+
+  process.stdout.write('\n');
+  printTable(rows);
+  process.stdout.write('\n[bench] simMs/renderMs/copyMs are GPU times from cudaEvents.\n');
+
+  return null;
+}
+
 /**
  * Run the whole check. Returns nothing - it exits the process either way.
  */
@@ -349,12 +622,26 @@ function runSmoke() {
   );
 
   /* --- native view stats (view not created - must not crash) --------- */
-  const stats = engine.nativeViewStats();
-  if (!stats || typeof stats.fps !== 'number') {
+  // Named nvStats, not stats - there is a stats() helper at module scope and
+  // shadowing it here would break the benchmark path below.
+  const nvStats = engine.nativeViewStats();
+  if (!nvStats || typeof nvStats.fps !== 'number') {
     fail('nativeViewStats', 'stats did not return numeric fields.');
     return;
   }
-  process.stdout.write(`[smoke] nativeViewStats (idle): fps=${stats.fps} frameMs=${stats.frameMs}\n`);
+  process.stdout.write(`[smoke] nativeViewStats (idle): fps=${nvStats.fps} frameMs=${nvStats.frameMs}\n`);
+
+  /* --- benchmark sweep (--bench only) --------------------------------- */
+  // Runs after every correctness check has passed, so a bench failure can never
+  // be confused with a broken addon. Shutdown still happens either way.
+  if (BENCH_MODE) {
+    const benchErr = runBench(engine);
+    if (benchErr) {
+      engine.shutdown();
+      fail('bench', benchErr);
+      return;
+    }
+  }
 
   /* --- shutdown ------------------------------------------------------ */
   engine.shutdown();

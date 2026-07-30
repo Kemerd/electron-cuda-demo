@@ -28,6 +28,7 @@ import {
   IPC,
   MSG,
   KIND,
+  RASTER,
   SCENES,
   PRESETS,
   DEFAULT_PRESET,
@@ -338,7 +339,7 @@ function handleRequest(req) {
   applyInput(engine, req.input);
 
   // Full CUDA raster path: one call does sim + rasterize into an RGBA8 frame.
-  if (req.raster === 'cuda' || req.kind === KIND.RGBA) {
+  if (req.raster === RASTER.CUDA || req.kind === KIND.RGBA) {
     serveRgba(engine, req, frameId, scene, dtMs);
     return;
   }
