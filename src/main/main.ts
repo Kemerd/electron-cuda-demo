@@ -21,7 +21,6 @@ import { fileURLToPath } from 'node:url';
 import { probeCapabilities, registerCapabilityIpc, shutdownEngine } from './capabilities.js';
 import { registerFramePump, shutdownFramePump, getPumpStats } from './frame-pump.js';
 import type { PumpStats } from './frame-pump.js';
-import { MSG } from '../shared/protocol.js';
 import type { Capabilities } from '../shared/protocol.js';
 
 /**
@@ -193,18 +192,31 @@ function wireSmokeConsoleTap(wc: WebContents): void {
     const line = typeof details?.message === 'string' ? details.message : '';
     if (!line) return;
 
-    // The renderer logs engine failures verbatim, including the MSG.ERROR
-    // discriminant, so this catches them without a bespoke protocol.
-    if (!smokeEngineError && line.includes(`[engine ${MSG.ERROR}]`)) {
+    // Engine failures. app.ts logs every MSG.ERROR it receives through
+    // onSourceError() as "[app] engine error: <reason>" -- these two patterns
+    // are the renderer's actual output and are matched literally.
+    //
+    // These strings are a real coupling between app.ts's log lines and this
+    // tap, and they have silently broken once already: the tap used to look for
+    // "[engine error]" and "[engine] first frame: N records", which were the
+    // strings the phase-1 inline pump client in app.ts emitted. When the CUDA
+    // transport moved out to cuda-source.ts the log lines were renamed and
+    // nothing updated the patterns, so BOTH consumers went dead -- the verdict
+    // reported firstFrameCount:null forever and, far worse, the section-10
+    // "any MSG.ERROR during the drive is a FAIL" condition stopped being armed
+    // at all. Changing either log line means changing the pattern below.
+    if (!smokeEngineError && line.includes('[app] engine error:')) {
       smokeEngineError = line.slice(0, 300);
       return;
     }
 
-    // First-frame record count: the renderer prints one line on its first
-    // entity frame. Absent (null) is not itself a failure -- framesServed is
-    // the authoritative gate; this is diagnostic colour for the verdict.
+    // First-frame record count: app.ts prints this from markLinkVerified() the
+    // moment real records arrive on the CUDA path. Absent (null) is not itself
+    // a failure -- framesServed is the authoritative gate; this is diagnostic
+    // colour for the verdict. Both the initial and the post-failure recovery
+    // wording are accepted, since either one is a genuine first frame.
     if (smokeFirstFrameCount === null) {
-      const m = /\[engine\] first frame: (\d+) records/.exec(line);
+      const m = /\[app\] CUDA link (?:verified|recovered) -- (\d+) records/.exec(line);
       const digits = m?.[1];
       if (digits) {
         const n = Number.parseInt(digits, 10);

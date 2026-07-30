@@ -19,3 +19,7 @@ bench-results/
 # Internal build-coordination docs (machine-specific paths and pins;
 # everything public-facing lives in the README)
 docs/CONTRACTS.md
+.wrun2-out.txt
+.wrun2-err.txt
+.wrun-out.txt
+.wrun-err.txt

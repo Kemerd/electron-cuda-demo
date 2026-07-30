@@ -43,11 +43,9 @@ import {
   SWARM_FLOATS,
 } from '../shared/protocol';
 import type {
-  ComputeBackend,
   InputState,
   OkResult,
   PumpToRendererMsg,
-  RasterBackend,
   ReqMsg,
   SceneId,
   SceneParams,
