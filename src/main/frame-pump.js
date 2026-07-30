@@ -293,16 +293,31 @@ function replyError(frameId, reason) {
 }
 
 /**
- * Post a FRAME. The transfer list carries the ArrayBuffer itself -- listing a
- * typed-array view here would silently deep-copy the payload, which is exactly
- * the failure mode this whole transport exists to avoid.
+ * Post a FRAME.
+ *
+ * NOTE ON THE TRANSFER LIST -- this is the one place the main->renderer leg
+ * cannot honour the "always transfer the ArrayBuffer" rule. Electron types
+ * MessagePortMain.postMessage as (message, transfer?: MessagePortMain[]): the
+ * main-side transfer list accepts ports and nothing else. Passing an
+ * ArrayBuffer there throws "Port at index 0 is not a valid port" and the frame
+ * is lost outright, so the payload rides as a structured clone instead.
+ *
+ * Consequence: the outbound copy is real, and because a clone does not detach,
+ * the buffer we just sent is still ours. We put it straight back in the pool --
+ * that is what keeps this path allocation-free despite the copy. The renderer's
+ * return leg is a DOM MessagePort, which does support ArrayBuffer transfer, so
+ * inbound recycling stays a genuine zero-copy handoff.
  *
  * @param {object} msg fully-formed FRAME message with .buf set
  */
 function postFrame(msg) {
   if (!port) return;
+  const buf = msg.buf;
   try {
-    port.postMessage(msg, [msg.buf]);
+    port.postMessage(msg);
+    // Structured clone left our copy intact and undetached -- reuse it rather
+    // than allocating a replacement next frame.
+    release(buf);
   } catch (err) {
     console.warn('[pump] failed to post FRAME: %s', err && err.message);
     // The buffer's fate is ambiguous after a failed post; do not pool it back.

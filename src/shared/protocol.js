@@ -156,11 +156,15 @@ export const RGBA_CHANNELS = 4;
  *  installed; main replies with webContents.postMessage(IPC.ENGINE_PORT,
  *  null, [port]). All per-frame traffic then rides that port.
  *
- *  Buffers are TRANSFERRED (always list view.buffer in the transfer
- *  array — transferring the view itself silently deep-copies). Transfer
- *  detaches, so both sides run a recycle loop; the pump keeps a small
- *  pool per payload kind and drops returned buffers whose byteLength no
- *  longer matches the active preset.
+ *  The two legs are asymmetric (empirical Electron behavior, not choice):
+ *  main -> renderer payloads ride as STRUCTURED CLONES, because
+ *  MessagePortMain.postMessage only accepts ports in its transfer list —
+ *  the clone leaves the sender's buffer intact, so the pump immediately
+ *  re-pools it. renderer -> main buffers ARE transferred (always list
+ *  view.buffer in the transfer array — transferring the view itself
+ *  silently deep-copies; transfer detaches). The pump keeps a small pool
+ *  per payload kind, caps it at depth 3, and drops returned buffers whose
+ *  byteLength no longer matches the active preset.
  * ------------------------------------------------------------------ */
 
 /** Message `t` field values. */

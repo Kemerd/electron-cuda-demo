@@ -24,6 +24,12 @@ export default function createScene() {
   let caption = null;
   let timeSec = 0;
 
+  // Scratch reused across every sample -- the whole field draw allocates nothing.
+  // Declared before the object literal is returned: the `return` below ends this
+  // function's execution, so a `const` placed after it would never initialize and
+  // every drawFlowField() call would hit its temporal dead zone.
+  const flow = new Float32Array(2);
+
   return {
     mount(ctx) {
       root = document.createElement('div');
@@ -94,9 +100,6 @@ export default function createScene() {
     out[0] = dpdy;
     out[1] = -dpdx;
   }
-
-  // Scratch reused across every sample -- the whole field draw allocates nothing.
-  const flow = new Float32Array(2);
 
   /**
    * Integrate and stroke the streaklets. One path for the whole grid: batching

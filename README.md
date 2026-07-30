@@ -59,7 +59,7 @@ Design decisions worth stealing:
 
 - **Node-API, not raw V8** — one binary, ABI-stable across Electron versions. No `electron-rebuild` treadmill.
 - **Static CUDA runtime + hash-based RNG** — the built `.node` ships zero CUDA DLLs.
-- **MessagePort transport** — buffers are *transferred* (never structured-cloned), detached buffers recycle through a 3-deep pool, and the renderer returns them each frame. No per-frame allocation, no GC spikes polluting the numbers.
+- **MessagePort transport, honestly accounted** — Electron only supports true ArrayBuffer transfer on the renderer→main leg (main-side `postMessage` accepts ports alone in its transfer list), so outbound frames are structured clones. The pump re-pools its undetached buffer immediately — zero main-side allocation — and the renderer transfers consumed buffers back for deterministic disposal. That outbound copy is real, measured, and reported in the transport column; it's also exactly why the zero-copy present modes exist.
 - **Zero-copy present** — a Win32 child window with a flip-model DXGI swapchain; CUDA writes an intermediate D3D11 texture via `cudaGraphicsD3D11RegisterResource`, one VRAM→VRAM copy to the backbuffer, `Present`. Chromium never touches the pixels.
 - **Raw WGSL for the WebGPU path** — no framework transpiler between the benchmark and the shader, so the comparison stays defensible. Sim storage buffers bind directly as vertex buffers for the draw.
 
