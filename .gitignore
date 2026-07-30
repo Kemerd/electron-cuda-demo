@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+native/build/
+dist/
+.vite/
+
+# Logs and OS cruft
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+
+# Local benchmark exports
+bench-results/
