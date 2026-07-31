@@ -123,8 +123,10 @@ const BEHAVIOR_ABSENT = BEHAVIOR_CODE[TARGET_BEHAVIOR.RALLY];
  */
 const BEHAVIOR_UNKNOWN = BEHAVIOR_CODE[TARGET_BEHAVIOR.MARKER];
 
-/** StormUniforms: counts+timing+pointer+cam (4 * 16) + 8 * Shockwave(16) = 192. */
-const STORM_UNIFORM_BYTES = 16 * 4 + MAX_SHOCKWAVES * 16;
+/** StormUniforms: counts+timing+pointer+cam (4 * 16) + 8 * Shockwave(32) = 320.
+ *  Each Shockwave is TWO vec4s: posAge, then dirPad (x = +1 blast / -1
+ *  implosion, protocol.ts Shockwave.dir; yzw padding). */
+const STORM_UNIFORM_BYTES = 16 * 4 + MAX_SHOCKWAVES * 32;
 
 /** WeatherUniforms: dims(vec4u) + timing(vec4f) = 32. */
 const WEATHER_UNIFORM_BYTES = 32;
@@ -1311,9 +1313,10 @@ export class WebGpuDataSource implements DataSource {
     f32[14] = Array.isArray(cam) && isFiniteNumber(cam[2]) ? cam[2] : 3.2;
     f32[15] = 0;
 
-    // shockwaves : array<Shockwave, 8> at byte 64 (float index 16)
+    // shockwaves : array<Shockwave, 8> at byte 64 (float index 16), two vec4s
+    // per slot: posAge then dirPad (x = polarity, +1 blast / -1 implosion).
     for (let i = 0; i < MAX_SHOCKWAVES; i++) {
-      const base = 16 + i * 4;
+      const base = 16 + i * 8;
       const wv = i < nWaves ? waves[i] : undefined;
       if (wv && Array.isArray(wv.pos)) {
         f32[base + 0] = isFiniteNumber(wv.pos[0]) ? wv.pos[0] : 0;
@@ -1321,12 +1324,18 @@ export class WebGpuDataSource implements DataSource {
         f32[base + 2] = isFiniteNumber(wv.pos[2]) ? wv.pos[2] : 0;
         // A negative age is the shader's "ignore" sentinel.
         f32[base + 3] = isFiniteNumber(wv.age) ? wv.age : -1;
+        // Only an explicit -1 flips the pulse into an implosion.
+        f32[base + 4] = wv.dir === -1 ? -1 : 1;
       } else {
         f32[base + 0] = 0;
         f32[base + 1] = 0;
         f32[base + 2] = 0;
         f32[base + 3] = -1;
+        f32[base + 4] = 1;
       }
+      f32[base + 5] = 0;
+      f32[base + 6] = 0;
+      f32[base + 7] = 0;
     }
 
     return buf;

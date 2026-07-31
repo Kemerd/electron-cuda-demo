@@ -330,7 +330,11 @@ function isTargetBehavior(value: unknown): value is TargetBehavior {
  * @param input shared input struct, mutated in place
  * @returns the shockwave that was stored, or null when the input was unusable
  */
-export function spawnShockwave(input: InputState, pos: Vec3 | null | undefined): Shockwave | null {
+export function spawnShockwave(
+  input: InputState,
+  pos: Vec3 | null | undefined,
+  dir: 1 | -1 = 1,
+): Shockwave | null {
   if (!input || !Array.isArray(input.shockwaves)) return null;
   if (!pos || pos.length !== 3) return null;
 
@@ -340,7 +344,10 @@ export function spawnShockwave(input: InputState, pos: Vec3 | null | undefined):
     return null;
   }
 
-  const entry: Shockwave = { pos: [x, y, z], age: 0 };
+  // dir:+1 is the outward blast, dir:-1 the implosion (protocol.ts). Anything
+  // that is not exactly -1 lands as +1 -- a garbled polarity must never turn
+  // into a surprise suction field.
+  const entry: Shockwave = { pos: [x, y, z], age: 0, dir: dir === -1 ? -1 : 1 };
 
   if (input.shockwaves.length < MAX_SHOCKWAVES) {
     input.shockwaves.push(entry);

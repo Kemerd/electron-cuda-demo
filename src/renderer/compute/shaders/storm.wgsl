@@ -26,6 +26,7 @@
 // One expanding click shockwave. Mirrors ShockwaveUniform / Shockwave.
 struct Shockwave {
   posAge : vec4<f32>,   // xyz = world origin, w = seconds since the click
+  dirPad : vec4<f32>,   // x = polarity (+1 blast, -1 implosion), yzw unused
 };
 
 struct StormUniforms {
@@ -361,7 +362,11 @@ fn step(@builtin(global_invocation_id) gid : vec3<u32>) {
     let spread = 1.0 / (1.0 + shellRadius * shellRadius * 0.6);
     let dir = away / dist;
 
-    vel = vel + dir * (kShockForce * shellFalloff * ageFade * spread);
+    // Polarity: +1 pushes the shell outward (blast), -1 pulls it inward
+    // (implosion). Same shell, same falloff, one sign. Anything that is not
+    // an explicit negative reads as +1.
+    let polarity = select(1.0, -1.0, wave.dirPad.x < 0.0);
+    vel = vel + dir * (polarity * kShockForce * shellFalloff * ageFade * spread);
     energy = min(1.0, energy + shellFalloff * ageFade * 0.9);
   }
 

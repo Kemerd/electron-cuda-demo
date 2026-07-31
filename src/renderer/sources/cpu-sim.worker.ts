@@ -1711,7 +1711,9 @@ function stepStorm(dt: number, input: InputState): void {
       const shape = 1 - band / SHOCK_THICKNESS;
       // Fade the impulse over the wave's life so it dies out smoothly.
       const fade2 = 1 - sw.age / SHOCK_LIFETIME;
-      const k2 = (shape * fade2 * SHOCK_FORCE) / d;
+      // Polarity: +1 blast, -1 implosion. Only an explicit -1 flips the sign.
+      const pol = sw.dir === -1 ? -1 : 1;
+      const k2 = (pol * shape * fade2 * SHOCK_FORCE) / d;
 
       vx += dx * k2;
       vy += dy * k2;

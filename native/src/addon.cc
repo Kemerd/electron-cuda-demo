@@ -307,6 +307,10 @@ void ParseInputState(const Napi::Object& obj, InputUniforms* out) {
 
         CopyFloatArray(e.Get("pos"), out->shockwaves[written].pos, 3);
         out->shockwaves[written].age = static_cast<float>(GetNumberOr(e, "age", 0.0));
+        // Polarity: only an explicit negative reads as the implosion. A missing
+        // or garbled dir must never flip a blast into a suction field.
+        out->shockwaves[written].dir =
+            (GetNumberOr(e, "dir", 1.0) < 0.0) ? -1.0f : 1.0f;
         ++written;
       }
       out->shockwaveCount = static_cast<int>(written);

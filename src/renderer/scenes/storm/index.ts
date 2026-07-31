@@ -9,10 +9,13 @@
  * point size is distance-attenuated, which is what gives the cloud depth: near
  * particles are large and bright, far ones fade into a haze.
  *
- * Interaction (CONTRACTS section 8):
+ * Interaction (CONTRACTS section 8, "storm mouse triad"):
  *   cursor        a force whose mode is 1 attract / 2 repel / 3 vortex
  *   keys 1 2 3    select that mode
- *   click         a shockwave at the cursor's world position
+ *   LEFT click    outward shockwave at the cursor's world position
+ *   RIGHT click   implosion -- the same pulse with its force sign flipped
+ *   MIDDLE click  cycle the force mode (a toast names the new mode)
+ *   wheel         dolly the camera along its fixed view ray, clamped + eased
  *
  * The cursor has no globe to raycast against here, so pointerWorld comes from
  * unprojecting the cursor onto a plane through the origin facing the camera --
@@ -55,6 +58,26 @@ export default function createScene(): Scene {
   let viewW = 1;
   let viewH = 1;
   let timeSec = 0;
+
+  /** Pointer button of the active press (-1 when none). The triad gives every
+   *  button a click action, so the up handler needs to know which one it is
+   *  finishing. */
+  let downButton = -1;
+
+  /** One reused toast element naming the force mode after a middle-click. */
+  let modeToast: HTMLDivElement | null = null;
+  let toastTimer = 0;
+
+  // Scroll zoom: the camera never orbits in this scene, so distance along its
+  // fixed view ray is the only degree of freedom. The wheel moves a target and
+  // frame() eases the real distance toward it so a flick glides.
+  const ZOOM_MIN = 1.6;
+  const ZOOM_MAX = 14;
+  const ZOOM_STEP = 1.12; // per wheel notch
+  const ZOOM_EASE = 9; // 1/s approach rate
+  const zoomDir = new THREE.Vector3(0, 0, 1);
+  let zoomDist = 5;
+  let zoomTarget = 5;
 
   /** Uniform handles kept directly (see the globe scene's note on this). */
   let uPixelRatio: { value: number } | null = null;
@@ -284,7 +307,12 @@ export default function createScene(): Scene {
     downX = e.clientX;
     downY = e.clientY;
     downTime = performance.now();
-    pressActive = e.button === 0;
+    downButton = e.button;
+    // Every button carries a click action here (the storm mouse triad):
+    // left = shockwave, right = implosion, middle = cycle the force mode.
+    // Drags still win -- the move handler kills the press past 5 px, so the
+    // right-hold force behavior and any future drag gesture stay untouched.
+    pressActive = e.button === 0 || e.button === 1 || e.button === 2;
   }
 
   function onPointerMove(e: PointerEvent): void {
@@ -294,13 +322,24 @@ export default function createScene(): Scene {
     if (dx * dx + dy * dy > CLICK_MAX_PX * CLICK_MAX_PX) pressActive = false;
   }
 
-  /** A click (not a drag) spawns a shockwave where the cursor is. */
+  /** A click (not a drag) fires that button's triad action at the cursor. */
   function onPointerUp(e: PointerEvent): void {
     const wasActive = pressActive;
+    const button = downButton;
     pressActive = false;
-    if (!wasActive) return;
+    downButton = -1;
+    if (!wasActive || e.button !== button) return;
     if (performance.now() - downTime > CLICK_MAX_MS) return;
     if (!renderer || !lastState) return;
+
+    // Middle click needs no world position: it changes what the cursor IS.
+    // Same state the 1/2/3 keys drive, so the two inputs can never disagree.
+    if (button === 1) {
+      forceMode = forceMode === 1 ? 2 : forceMode === 2 ? 3 : 1;
+      console.log(`[storm] force mode -> ${forceMode}`);
+      showModeToast(e.clientX, e.clientY);
+      return;
+    }
 
     const rect = renderer.domElement.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) return;
@@ -309,8 +348,55 @@ export default function createScene(): Scene {
     const ny = -(((e.clientY - rect.top) / rect.height) * 2 - 1);
 
     if (cursorToWorld(nx, ny, cursorHit)) {
-      spawnShockwave(lastState.input, [cursorHit.x, cursorHit.y, cursorHit.z]);
+      // Left blasts outward, right implodes: identical pulse, flipped sign.
+      spawnShockwave(
+        lastState.input,
+        [cursorHit.x, cursorHit.y, cursorHit.z],
+        button === 2 ? -1 : 1,
+      );
     }
+  }
+
+  /**
+   * Dolly along the fixed view ray. Wheel notches move the target
+   * exponentially (each notch is the same *relative* step, which is how zoom
+   * feels linear to a human) and frame() eases toward it.
+   */
+  function onWheel(e: WheelEvent): void {
+    e.preventDefault();
+    const dirStep = e.deltaY > 0 ? 1 : e.deltaY < 0 ? -1 : 0;
+    if (dirStep === 0) return;
+    zoomTarget = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, zoomTarget * Math.pow(ZOOM_STEP, dirStep)));
+  }
+
+  /** Force-mode names for the middle-click toast, indexed by MouseForceMode. */
+  const MODE_LABELS: Record<number, string> = { 1: 'Attract', 2: 'Repel', 3: 'Vortex' };
+
+  /**
+   * Show (or retrigger) the mode toast near the cursor. One element, reused
+   * for the scene's lifetime -- zero steady-state allocation.
+   */
+  function showModeToast(clientX: number, clientY: number): void {
+    if (!root) return;
+    if (!modeToast) {
+      modeToast = document.createElement('div');
+      modeToast.className = 'storm-mode-toast';
+      root.appendChild(modeToast);
+    }
+    const rect = root.getBoundingClientRect();
+    modeToast.textContent = MODE_LABELS[forceMode] ?? String(forceMode);
+    modeToast.style.left = `${clientX - rect.left + 14}px`;
+    modeToast.style.top = `${clientY - rect.top - 10}px`;
+    // Retrigger the entrance: drop the class, force a reflow, re-add. Without
+    // the reflow two quick clicks would merge into one animation.
+    modeToast.classList.remove('is-live');
+    void modeToast.offsetWidth;
+    modeToast.classList.add('is-live');
+    if (toastTimer !== 0) window.clearTimeout(toastTimer);
+    toastTimer = window.setTimeout(() => {
+      toastTimer = 0;
+      if (modeToast) modeToast.classList.remove('is-live');
+    }, 1000);
   }
 
   function onContextMenu(e: Event): void {
@@ -364,6 +450,12 @@ export default function createScene(): Scene {
       camera.position.set(0, 0.6, 5.0);
       camera.lookAt(0, 0, 0);
 
+      // Zoom state anchors to wherever the camera starts: the wheel scales the
+      // distance, never the direction, so the framing tilt is preserved.
+      zoomDist = camera.position.length();
+      zoomTarget = zoomDist;
+      zoomDir.copy(camera.position).normalize();
+
       scene = new THREE.Scene();
       points = buildPoints();
       scene.add(points);
@@ -374,6 +466,9 @@ export default function createScene(): Scene {
       canvas.addEventListener('pointerdown', onPointerDown);
       canvas.addEventListener('pointermove', onPointerMove);
       canvas.addEventListener('pointerup', onPointerUp);
+      // passive:false because the handler preventDefaults -- the wheel must
+      // zoom the storm, not scroll whatever container the stage sits in.
+      canvas.addEventListener('wheel', onWheel, { passive: false });
       // Keys are global: the canvas is not focusable and requiring a click to
       // arm the shortcuts is a worse experience than a window listener.
       window.addEventListener('keydown', onKeyDown);
@@ -388,8 +483,18 @@ export default function createScene(): Scene {
         canvas.removeEventListener('pointerdown', onPointerDown);
         canvas.removeEventListener('pointermove', onPointerMove);
         canvas.removeEventListener('pointerup', onPointerUp);
+        canvas.removeEventListener('wheel', onWheel);
       }
       window.removeEventListener('keydown', onKeyDown);
+
+      // The toast node dies with root below; just drop the handle and any
+      // pending hide timer so nothing fires into a torn-down scene.
+      if (toastTimer !== 0) {
+        window.clearTimeout(toastTimer);
+        toastTimer = 0;
+      }
+      modeToast = null;
+      downButton = -1;
 
       if (scene) {
         scene.traverse((obj) => {
@@ -498,6 +603,14 @@ export default function createScene(): Scene {
 
       const step = Number.isFinite(dt) ? Math.min(Math.max(dt, 0), 0.1) : 0;
       timeSec += state && state.reducedMotion ? step * 0.35 : step;
+
+      // Wheel-zoom ease: exponential approach toward the wheel's target. The
+      // cursor unprojection reads the camera live, so the force field stays
+      // glued to the pointer at every distance.
+      if (Math.abs(zoomTarget - zoomDist) > 1e-4) {
+        zoomDist += (zoomTarget - zoomDist) * Math.min(1, step * ZOOM_EASE);
+        camera.position.copy(zoomDir).multiplyScalar(zoomDist);
+      }
       if (uTime) uTime.value = timeSec;
 
       // Serialize the camera so the CUDA path renders the identical view.

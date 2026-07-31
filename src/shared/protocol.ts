@@ -245,6 +245,12 @@ export interface TargetPoint {
 export interface Shockwave {
   pos: Vec3;
   age: number;          // seconds since the click
+  /**
+   * Pulse polarity: +1 (default when absent) is the outward blast; -1 is the
+   * implosion — the same expanding shell with its force vector flipped, so
+   * particles collapse toward the center and bloom back out.
+   */
+  dir?: 1 | -1;
 }
 
 export interface CameraState {

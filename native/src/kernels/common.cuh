@@ -210,6 +210,8 @@ struct TargetUniform {
 struct ShockwaveUniform {
   float pos[3];  ///< world-space origin of the wave
   float age;     ///< seconds since spawn; the kernel derives radius from this
+  float dir;     ///< +1 outward blast, -1 implosion (protocol.ts Shockwave.dir)
+  float _pad[3]; ///< keep the 16-byte slot alignment the array had before
 };
 
 /**

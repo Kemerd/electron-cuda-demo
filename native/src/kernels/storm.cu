@@ -255,7 +255,10 @@ void StormStepKernel(float4* __restrict__ records, unsigned int count, float dtS
       const float spread = 1.0f / (1.0f + shellRadius * shellRadius * 0.6f);
       const float3 dir = gsScale(away, 1.0f / dist);
 
-      vel = gsAdd(vel, gsScale(dir, kShockForce * shellFalloff * ageFade * spread));
+      // Polarity: +1 pushes the shell outward (blast), -1 pulls it inward
+      // (implosion). Same shell, same falloff, one sign.
+      const float polarity = (wave.dir < 0.0f) ? -1.0f : 1.0f;
+      vel = gsAdd(vel, gsScale(dir, polarity * kShockForce * shellFalloff * ageFade * spread));
       energy = fminf(1.0f, energy + shellFalloff * ageFade * 0.9f);
     }
   }
