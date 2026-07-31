@@ -84,8 +84,20 @@ import { createCudaBlit } from './present/cuda-blit';
 import type { CudaBlitApi } from './present/cuda-blit';
 import { createNativeView } from './present/native-view';
 import type { NativeViewApi } from './present/native-view';
-import type { OverlayInputEvent } from '../main/overlay-types';
+import type {
+  HudAction,
+  HudChip,
+  HudNote,
+  HudUiState,
+  OverlayInputEvent,
+  OverlayInputKind,
+} from '../main/overlay-types';
 import type { CudaSourceApi, RgbaFrame } from './cuda-source';
+
+// The two window-role skins for the cutout overlay (.hud-mode / .hud-under).
+// Bundled unconditionally; every rule is class-gated so it is inert until one
+// of the windows opts in.
+import './overlay/hud.css';
 
 import { createBenchController } from './bench/index';
 import type {
@@ -108,6 +120,32 @@ import type { FidelityParams, PresetsApi } from './ui/presets';
 import type { BadgesApi } from './ui/badges';
 import type { FpsOverlayApi } from './ui/fps-overlay';
 import type { SidebarApi } from './ui/sidebar';
+
+/* ------------------------------------------------------------------ *
+ *  Window role (CONTRACTS section 6, cutout design)
+ *
+ *  The HUD overlay window loads THIS bundle with ?hud=1 and boots a
+ *  chrome-only mirror: full UI at the composite positions, transparent stage
+ *  cutout, no scene canvas, no engine drive. Everything else in this file is
+ *  the main-window path; the flag gates the handful of places where the two
+ *  roles diverge (boot, and the scene-control callbacks that ship intents
+ *  instead of committing locally).
+ * ------------------------------------------------------------------ */
+
+/** True when this page is the HUD overlay window rather than the main app. */
+const HUD_MODE: boolean = (() => {
+  try {
+    return new URLSearchParams(window.location.search).get('hud') === '1';
+  } catch (err) {
+    console.warn('[app] could not read location.search for hud flag:', String(err));
+    return false;
+  }
+})();
+
+// Applied before first paint (module evaluation precedes layout): the class is
+// what makes the stage transparent, and a frame of opaque background over the
+// native surface reads as a flash on every mode entry.
+if (HUD_MODE) document.documentElement.classList.add('hud-mode');
 
 /* ------------------------------------------------------------------ *
  *  Scene registry
@@ -273,6 +311,15 @@ const ui: UiHandles = {
 
 /** Status chips currently shown, keyed by id so we do not duplicate them. */
 const statusChips = new Map<string, HTMLElement>();
+
+/**
+ * Serializable mirror of the chip set, maintained in lockstep with statusChips
+ * by setChip/clearChip. The HUD overlay window rebuilds the same chips from
+ * this data (a DOM element cannot cross IPC), and keeping the mirror at the
+ * write site rather than scraping the DOM on demand means the snapshot builder
+ * never reads back what it just wrote.
+ */
+const chipData = new Map<string, { text: string; variant?: ChipVariant; tooltip?: string }>();
 
 /* ------------------------------------------------------------------ *
  *  CUDA link verdict
@@ -466,9 +513,47 @@ async function probeWebGpu(): Promise<WebGpuCaps> {
 }
 
 /**
+ * True when this bundle was produced by the web build (vite.config.web.mjs).
+ *
+ * This source tree has two deployment targets: the desktop app, and the hosted
+ * browser demo. Both run the same code; what differs is that the browser has no
+ * preload, so window.geoswarm is simply absent -- and an absent bridge means
+ * two completely different things in the two targets. In Electron it is a
+ * malfunction ("the preload failed to run"); on the web it is the expected
+ * state, and telling a browser visitor to go build a native addon would be
+ * nonsense.
+ *
+ * The flag is a BUILD-time define, not a runtime sniff, and that distinction is
+ * load-bearing. Which artifact this is happens to be knowable at compile time,
+ * so it should be decided there: the alternative (checking navigator.userAgent
+ * for an "Electron/" token) answers a subtly different question and gets it
+ * wrong whenever the two diverge -- notably when the web bundle is served over
+ * http:// into an Electron shell, which is exactly how this build is verified.
+ * The define also lets the minifier fold the dead branch away entirely.
+ *
+ * vite.config.mjs leaves it undefined, so the desktop build sees the `typeof`
+ * guard fail and falls through to false without needing its own define.
+ */
+declare const __GEOSWARM_WEB_BUILD__: boolean | undefined;
+const IS_BROWSER_BUILD: boolean =
+  typeof __GEOSWARM_WEB_BUILD__ !== 'undefined' && __GEOSWARM_WEB_BUILD__ === true;
+
+/**
+ * Reason shown against every CUDA-dependent cell when the bridge is missing.
+ *
+ * CONTRACTS section 9 requires an unavailable backend to carry a one-line
+ * reason the reader can act on. On the web the action is "get the desktop
+ * build" -- there is no addon to compile in a browser tab.
+ */
+const NO_BRIDGE_REASON: string = IS_BROWSER_BUILD
+  ? 'CUDA requires the desktop build -- this is the browser demo.'
+  : 'Preload bridge unavailable -- main process API not exposed.';
+
+/**
  * Ask main for the native capability block. The preload wrapper already turns
  * a rejected invoke into a well-formed object, but the bridge itself might be
- * missing entirely if the preload failed to run.
+ * missing entirely -- because the preload failed to run (desktop) or because
+ * there is no main process at all (the hosted web build).
  */
 async function probeNative(): Promise<Capabilities> {
   const bridge = window.geoswarm;
@@ -476,7 +561,11 @@ async function probeNative(): Promise<Capabilities> {
 
   if (!bridge || typeof bridge.getCaps !== 'function') {
     return {
-      cuda: { ok: false, reason: 'Preload bridge unavailable -- main process API not exposed.' },
+      cuda: { ok: false, reason: NO_BRIDGE_REASON },
+      // Native present is gated on CUDA first (matrix.ts orders the two gates
+      // that way deliberately), but spell it out anyway so nothing downstream
+      // has to fall back to the desktop-flavoured default text.
+      nativeView: { ok: false, reason: NO_BRIDGE_REASON },
       versions: emptyVersions,
     };
   }
@@ -540,6 +629,15 @@ function setChip(id: string, text: string, variant?: ChipVariant, tooltip?: stri
   } else if (chip.hasAttribute('title')) {
     chip.removeAttribute('title');
   }
+
+  // Keep the serializable mirror in lockstep and let the HUD know. The push is
+  // gated inside pushHudUiState (no overlay, no send), so composite-mode chips
+  // cost one Map.set and a bailed-out call.
+  const entry: { text: string; variant?: ChipVariant; tooltip?: string } = { text };
+  if (variant) entry.variant = variant;
+  if (tip) entry.tooltip = tip;
+  chipData.set(id, entry);
+  pushHudUiState();
 }
 
 /** Remove a chip by id. */
@@ -547,6 +645,7 @@ function clearChip(id: string): void {
   const chip = statusChips.get(id);
   if (chip && chip.parentNode) chip.parentNode.removeChild(chip);
   statusChips.delete(id);
+  if (chipData.delete(id)) pushHudUiState();
 }
 
 /* ------------------------------------------------------------------ *
@@ -711,6 +810,9 @@ function applyMode(next: Partial<ModeState> | null | undefined): void {
   if (computeChanged) {
     void ensureSource(activeEngineScene());
   }
+
+  // Keep the HUD mirror's matrix honest (no-op unless the overlay is up).
+  pushHudUiState();
 }
 
 /* ------------------------------------------------------------------ *
@@ -1020,8 +1122,10 @@ async function configureSource(
 
     // A refused configure (the VRAM guard is the usual cause) must never be
     // silent: the slider moved and nothing happened, so say why right next to
-    // the slider that did it.
+    // the slider that did it. Mirrored to the HUD strip for the same reason.
     if (sceneControls) sceneControls.setNote(`Refused: ${why}`, 'warn');
+    hudControlNote = { text: `Refused: ${why}`, variant: 'warn' };
+    pushHudUiState();
 
     // A refused configure is one of the concrete link-failure causes, so record
     // it: if the deadline later expires the chip tooltip says "configureScene
@@ -1141,6 +1245,8 @@ function updateControlNote(source: DataSource): void {
 
   if (typeof capped.wasCapped !== 'function' || !capped.wasCapped()) {
     sceneControls.setNote('');
+    hudControlNote = null;
+    pushHudUiState();
     return;
   }
 
@@ -1152,11 +1258,12 @@ function updateControlNote(source: DataSource): void {
   sceneControls.setCount('swarm', active);
   sceneControls.setCount('storm', active);
 
-  sceneControls.setNote(
+  const capText =
     `CPU baseline capped to ${fmtCount(active)} of ${fmtCount(asked)} -- ` +
-      `switch to a GPU backend for the full count.`,
-    'warn',
-  );
+    `switch to a GPU backend for the full count.`;
+  sceneControls.setNote(capText, 'warn');
+  hudControlNote = { text: capText, variant: 'warn' };
+  pushHudUiState();
 }
 
 /** Compact count formatting shared by the chip and the overlay. */
@@ -1467,22 +1574,32 @@ function syncNativeView(): void {
 }
 
 /* ------------------------------------------------------------------ *
- *  HUD overlay window (CONTRACTS section 6)
+ *  HUD overlay window (CONTRACTS section 6, cutout design)
  *
  *  In the native present modes the picture comes out of a Win32 child HWND
- *  that Chromium neither composites nor can draw over -- so the in-page HUD is
- *  invisible in exactly the modes whose numbers are most worth reading. The
- *  fix is a second, transparent BrowserWindow tracking the native rect, owned
- *  by main (src/main/overlay-window.ts) and driven from here.
+ *  that Chromium neither composites nor can draw over -- so the in-page UI is
+ *  unreachable in exactly the modes it matters most. The fix is a second,
+ *  transparent BrowserWindow covering the WHOLE content area, loading this
+ *  same bundle with ?hud=1: full chrome at the composite positions, with a
+ *  transparent cutout over the stage where the native surface shows through.
  *
- *  This side owns two things and nothing else: WHEN the window should exist
- *  (only the mode router knows a native mode is genuinely engaged and started),
- *  and hiding the in-page card while it does. The contract is explicit that the
- *  two must never show at once.
+ *  This side owns three things: WHEN the window should exist (only the mode
+ *  router knows a native mode is genuinely engaged and started), the UI-state
+ *  snapshot the HUD mirrors (pushed on every visible change), and applying
+ *  the intents the HUD ships back. State never forks: the HUD is a mirror,
+ *  this renderer stays the single source of truth, and that is what makes
+ *  switching back to composite restore an identical view.
  * ------------------------------------------------------------------ */
 
 /** True while the window overlay is up, so a repeat sync is a no-op. */
 let overlayWindowActive = false;
+
+/**
+ * Mirror of the scene-controls note line for the HUD snapshot. Written at
+ * every setNote call site (the CPU cap and the VRAM refusal are states the
+ * HUD's strip must show too, or a refused preset would look accepted there).
+ */
+let hudControlNote: HudNote | null = null;
 
 /** The preload's overlay surface, or null when the bridge predates it. */
 function overlayBridge(): NonNullable<Window['geoswarm']>['overlay'] | null {
@@ -1491,36 +1608,230 @@ function overlayBridge(): NonNullable<Window['geoswarm']>['overlay'] | null {
   return bridge.overlay;
 }
 
-/** Title/description for the mounted scene, as the HUD chip shows them. */
-function currentSceneInfo(): { scene: string; title: string; subtitle: string } {
-  const entry = SCENE_REGISTRY[activeSceneId];
-  return {
-    scene: activeEngineScene(),
-    title: entry?.title ?? 'GeoSwarm',
-    subtitle: entry?.subtitle ?? '',
-  };
-}
-
 /**
- * Show or hide the in-page perf card and title.
+ * Hide the in-page chrome while the HUD window owns the presentation.
  *
- * visibility rather than display: the card's layout box is what the
- * .native-present gutter is sized around, and collapsing it would let the
- * reserved rect expand under a window overlay that is still sized to the old
- * box -- a one-frame mismatch on every mode toggle. Hidden-but-laid-out keeps
- * the geometry stable while guaranteeing only one HUD is legible at a time.
+ * One class, styled in overlay/hud.css (.hud-under): topbar, perf card and
+ * scene controls go visibility:hidden -- laid out but not painted, so the
+ * geometry the two windows must agree on never moves -- and the stage-surface
+ * hairline yields to the HUD's copy. The stage BACKGROUND deliberately stays:
+ * the HUD's transparent margins show it through, which is how the cutout
+ * window reproduces the composite look without repainting the gradient.
  *
  * @param hidden true while the window overlay owns the HUD
  */
 function setInPageHudHidden(hidden: boolean): void {
-  const card = document.getElementById('fps-overlay');
-  if (card) card.style.visibility = hidden ? 'hidden' : '';
+  const shell = document.getElementById('app-shell');
+  if (shell) shell.classList.toggle('hud-under', hidden);
+}
 
-  // The stage topbar carries the same title/description the overlay chip does.
-  // Leaving it visible would show the scene name twice, once through the glass
-  // of a window that is drawing its own copy a few hundred pixels away.
-  const topbar = document.querySelector<HTMLElement>('.stage-topbar');
-  if (topbar) topbar.style.visibility = hidden ? 'hidden' : '';
+/**
+ * Push the current UI state to the HUD mirror.
+ *
+ * Called from every site that changes something the chrome shows -- mode
+ * commits, fidelity commits, chip writes, scene mounts. Cheap by design: it
+ * bails immediately unless the overlay window is actually up, and the payload
+ * is a couple hundred bytes of plain data when it is.
+ */
+function pushHudUiState(): void {
+  // The HUD is the mirror; only the main renderer ever pushes state.
+  if (HUD_MODE || !overlayWindowActive) return;
+
+  const api = overlayBridge();
+  if (!api || typeof api.pushUiState !== 'function') return;
+
+  const chips: HudChip[] = [];
+  for (const [id, data] of chipData) {
+    const chip: HudChip = { id, text: data.text };
+    if (data.variant) chip.variant = data.variant;
+    if (data.tooltip) chip.tooltip = data.tooltip;
+    chips.push(chip);
+  }
+
+  const state: HudUiState = {
+    sceneId: activeSceneId,
+    mode: { ...mode },
+    presetKey: ui.presets ? ui.presets.getPreset() : null,
+    params: { ...sceneParams },
+    stormPointScale,
+    weatherCoverage,
+    chips,
+    note: hudControlNote,
+  };
+
+  try {
+    api.pushUiState(state);
+  } catch (err) {
+    console.warn('[app] hud ui push failed: %s', errText(err));
+  }
+}
+
+/**
+ * Commit a fidelity change (params + optional preset identity).
+ *
+ * This is the body the presets panel's onChange used to carry inline, factored
+ * out because the HUD's preset/params actions must take the IDENTICAL route --
+ * two slightly different commit sequences is how the two windows would drift.
+ *
+ * The three effects are deliberately ordered: baseline first (so the resync
+ * below has the new number to publish), then the visible controls, then the
+ * backend. Painting the requested values first and letting the configure
+ * outcome correct them (the CPU cap, the VRAM guard -- both write the strip
+ * afterwards) keeps the controls honest at every instant.
+ */
+function commitFidelity(params: FidelityParams, presetKey: PresetId | null): void {
+  sceneParams = params;
+
+  rebaselineStormPointScale(presetKey);
+  applyStormPointScale();
+  resyncSceneControls();
+
+  // Reconfigure whichever backend is live. It reallocates for the new counts
+  // and does not remount the scene, because geometry sizes are a backend
+  // concern and the scene draws whatever batch it is handed.
+  void ensureSource(activeEngineScene());
+
+  pushHudUiState();
+}
+
+/**
+ * Apply one user intent shipped over from the HUD chrome.
+ *
+ * Every branch funnels into the exact code path the equivalent in-page
+ * gesture takes -- applyMode validates legality, mountScene validates the
+ * registry, the presets panel validates its keys -- so a malformed or hostile
+ * action can do nothing an in-page click could not.
+ */
+function applyHudAction(action: HudAction): void {
+  if (!action || typeof action !== 'object') return;
+
+  switch (action.kind) {
+    case 'scene': {
+      if (!SCENE_REGISTRY[action.id]) {
+        console.warn('[app] hud action: unknown scene "%s"', String(action.id));
+        return;
+      }
+      // Non-silent select fires onSelect -> mountScene, exactly like a click
+      // on the in-page rail; re-selecting the current scene is a no-op there.
+      if (ui.sidebar) ui.sidebar.select(action.id);
+      else void mountScene(action.id);
+      break;
+    }
+
+    case 'mode':
+      // applyMode refuses illegal triples and repaints the matrix either way.
+      applyMode(action.mode);
+      break;
+
+    case 'preset': {
+      if (!ui.presets) return;
+      // Silent select (no onChange echo), then the same commit the in-page
+      // onChange performs -- one pipeline, both windows.
+      ui.presets.setPreset(action.presetKey);
+      commitFidelity(ui.presets.getParams(), ui.presets.getPreset());
+      break;
+    }
+
+    case 'params': {
+      if (ui.presets) {
+        ui.presets.setParams(action.params);
+        commitFidelity(ui.presets.getParams(), ui.presets.getPreset());
+      } else {
+        commitFidelity({ ...action.params }, null);
+      }
+      break;
+    }
+
+    case 'count': {
+      const value = Math.round(action.value);
+      if (!Number.isFinite(value) || value <= 0) return;
+      // Same effect as the in-page scene-controls commit: params move, the
+      // backend reconfigures, the fidelity panel is deliberately untouched
+      // (that is what the composite gesture does too).
+      sceneParams =
+        action.target === 'swarm'
+          ? { ...sceneParams, swarmCount: value }
+          : { ...sceneParams, stormCount: value };
+      if (sceneControls) sceneControls.setCount(action.target, value);
+      void ensureSource(activeEngineScene());
+      break;
+    }
+
+    case 'coverage': {
+      const v = Math.min(1, Math.max(0, action.value));
+      if (!Number.isFinite(v)) return;
+      weatherCoverage = v;
+      // Straight into the shared InputState -- the native-mode input sender
+      // ships it to the kernels on the next frame, no reconfiguration at all.
+      inputState.weatherCoverage = v;
+      if (sceneControls) sceneControls.setRange('coverage', v);
+      break;
+    }
+
+    case 'pointScale': {
+      const v = Math.min(STORM_SIZE_MAX, Math.max(STORM_SIZE_MIN, action.value));
+      if (!Number.isFinite(v)) return;
+      stormPointScale = v;
+      stormPointAdjust = stormPointBaseline > 0 ? v / stormPointBaseline : 1;
+      applyStormPointScale();
+      if (sceneControls) sceneControls.setRange('size', v);
+      break;
+    }
+
+    default:
+      return;
+  }
+
+  // Echo the resulting state back so the HUD's controls settle on what
+  // actually happened rather than what was asked for (an illegal mode, a
+  // clamped value). commitFidelity pushes again after its async configure
+  // lands; this one covers every branch that does not go through it.
+  pushHudUiState();
+}
+
+/** Unhook for the action subscription, so a re-install cannot stack listeners. */
+let overlayActionUnsub: (() => void) | null = null;
+
+/**
+ * Subscribe to user intents relayed from the HUD window. Installed once during
+ * boot, inert until a native mode actually puts a HUD up.
+ */
+function installOverlayActionRelay(): void {
+  if (overlayActionUnsub) return;
+
+  const api = overlayBridge();
+  if (!api || typeof api.onAction !== 'function') {
+    console.warn('[app] preload has no overlay action relay; HUD controls will not work');
+    return;
+  }
+
+  overlayActionUnsub = api.onAction((action) => {
+    try {
+      applyHudAction(action);
+    } catch (err) {
+      console.warn('[app] hud action failed: %s', errText(err));
+    }
+  });
+}
+
+/**
+ * Ship one user intent to the main renderer. HUD side only.
+ *
+ * Fire-and-forget: the authoritative answer comes back as a UI snapshot, and
+ * the control that sent the intent repaints from that rather than trusting
+ * its own optimistic state.
+ */
+function sendHudAction(action: HudAction): void {
+  const api = overlayBridge();
+  if (!api || typeof api.sendAction !== 'function') {
+    console.warn('[app] hud bridge missing sendAction; control change dropped');
+    return;
+  }
+  try {
+    api.sendAction(action);
+  } catch (err) {
+    console.warn('[app] hud action send failed: %s', errText(err));
+  }
 }
 
 /**
@@ -1541,15 +1852,15 @@ function syncOverlayWindow(): void {
 
   if (wanted === overlayWindowActive) {
     // Already in the right state, but a scene change while it is up still has
-    // to reach the title chip.
-    if (wanted && typeof api.setScene === 'function') api.setScene(currentSceneInfo());
+    // to reach the mirror -- title, controls, the lot ride the snapshot.
+    if (wanted) pushHudUiState();
     return;
   }
 
   overlayWindowActive = wanted;
 
   try {
-    api.setActive(wanted, wanted ? currentSceneInfo() : null);
+    api.setActive(wanted);
   } catch (err) {
     console.warn('[app] overlay window sync failed: %s', errText(err));
     overlayWindowActive = false;
@@ -1559,6 +1870,10 @@ function syncOverlayWindow(): void {
   // Only ever hidden while the replacement is genuinely up -- never both, and
   // never neither.
   setInPageHudHidden(wanted);
+
+  // Seed the mirror immediately so the HUD boots into the right state (main
+  // stores the snapshot and replays it when the page announces overlay:ready).
+  if (wanted) pushHudUiState();
 
   console.log(`[app] HUD overlay window ${wanted ? 'active' : 'dismissed'}`);
 }
@@ -1699,6 +2014,9 @@ function mountSceneControls(id: string): void {
   const layer = document.getElementById('stage-surface');
   if (!layer) return;
 
+  // A freshly built strip has an empty note line; keep the HUD mirror honest.
+  hudControlNote = null;
+
   if (id === 'globe') {
     sceneControls = createSceneControls({
       swarm: {
@@ -1707,8 +2025,15 @@ function mountSceneControls(id: string): void {
         max: 5_000_000,
         value: sceneParams.swarmCount,
         onCommit: (value) => {
+          // In the HUD window the strip is a mirror: ship the intent and let
+          // the snapshot echo settle the slider on what actually happened.
+          if (HUD_MODE) {
+            sendHudAction({ kind: 'count', target: 'swarm', value });
+            return;
+          }
           sceneParams = { ...sceneParams, swarmCount: value };
           void ensureSource(activeEngineScene());
+          pushHudUiState();
         },
       },
     });
@@ -1733,8 +2058,12 @@ function mountSceneControls(id: string): void {
             weatherCoverage = Math.min(1, Math.max(0, value));
             // Straight into the shared InputState -- every backend picks it up
             // on its next frame with no reconfiguration at all. That IS the
-            // "live on input, uniform only" requirement.
+            // "live on input, uniform only" requirement. In the HUD window the
+            // local write only keeps the chip live; the real sim state is the
+            // main renderer's, so the intent crosses too (uniform-cheap, so
+            // live-on-input survives the relay).
             inputState.weatherCoverage = weatherCoverage;
+            if (HUD_MODE) sendHudAction({ kind: 'coverage', value: weatherCoverage });
           },
         },
       },
@@ -1748,8 +2077,14 @@ function mountSceneControls(id: string): void {
           max: 8_000_000,
           value: sceneParams.stormCount,
           onCommit: (value) => {
+            // Same mirror discipline as the swarm slider above.
+            if (HUD_MODE) {
+              sendHudAction({ kind: 'count', target: 'storm', value });
+              return;
+            }
             sceneParams = { ...sceneParams, stormCount: value };
             void ensureSource(activeEngineScene());
+            pushHudUiState();
           },
         },
       },
@@ -1771,6 +2106,12 @@ function mountSceneControls(id: string): void {
           onInput: (value) => {
             stormPointScale = value;
             stormPointAdjust = stormPointBaseline > 0 ? value / stormPointBaseline : 1;
+            // A uniform write in-page; an intent from the HUD (applyStormPointScale
+            // is a no-op there anyway -- no scene is ever mounted in hud mode).
+            if (HUD_MODE) {
+              sendHudAction({ kind: 'pointScale', value });
+              return;
+            }
             applyStormPointScale();
           },
         },
@@ -2552,6 +2893,40 @@ function syncBenchTab(navId: string): void {
   controller.setTabActive(navId === 'benchmark');
 }
 
+/**
+ * Refuse a scene change while a sweep is running.
+ *
+ * Found by the windowed verification run, and it is worth writing down because
+ * the failure was total rather than cosmetic: clicking a nav item mid-sweep
+ * called mountScene(), which bumps BOTH sceneLoadToken and sourceToken. The
+ * harness was sitting inside its own awaited mountScene() at the time, so its
+ * configure resolved as "superseded by a newer configure", the cell failed, and
+ * the machine spent the rest of the run configuring cells whose scene the user
+ * had moved out from under it. Six cells produced zero rows.
+ *
+ * The sweep OWNS the stage while it runs -- it is the thing that put the globe
+ * or the storm there. So navigation during a sweep changes nothing but is not
+ * silent either: the sidebar snaps back to the scene actually being measured,
+ * and the panel is already visible over it. Cancel is one click away and is the
+ * honest way to take the app back.
+ *
+ * @returns true when the navigation was refused
+ */
+function benchBlocksNavigation(navId: string): boolean {
+  if (!bench || !bench.isRunning()) return false;
+
+  const measuring = navIdForScene(activeEngineScene());
+  console.log(
+    `[app] navigation to "${navId}" refused: a benchmark sweep is driving the ` +
+      `stage (currently measuring "${measuring}"). Cancel the sweep to navigate.`,
+  );
+
+  // Snap the rail back, silently -- a non-silent select would re-enter this
+  // same handler and recurse.
+  if (ui.sidebar) ui.sidebar.select(measuring, true);
+  return true;
+}
+
 /* ------------------------------------------------------------------ *
  *  Main loop
  * ------------------------------------------------------------------ */
@@ -2878,7 +3253,456 @@ async function uploadEarthTexture(): Promise<void> {
   }
 }
 
+/* ------------------------------------------------------------------ *
+ *  HUD boot path (?hud=1 -- the cutout overlay window)
+ *
+ *  The mirror image of boot(): same probes, same UI modules mounted into the
+ *  same markup at the same positions -- and none of the machinery that owns
+ *  real state. No scene ever mounts (the stage stays transparent, which IS
+ *  the cutout), no data source is built, no nview call is ever made, and the
+ *  engine port handshake was already suppressed in the preload. The chrome
+ *  mirrors snapshots from the main renderer and ships intents back.
+ * ------------------------------------------------------------------ */
+
+/** Cadence for the HUD's native-stats poll; matches the in-page 2 Hz poll. */
+const HUD_STATS_INTERVAL_MS = 500;
+
+/**
+ * Apply one UI snapshot from the main renderer to the HUD chrome.
+ *
+ * Everything is applied through the modules' silent setters (setMode,
+ * setPreset/setParams, select(id, true), setCount/setRange), so mirroring
+ * never echoes an action back -- the send sites are exclusively real user
+ * gestures inside this window.
+ */
+function applyHudUiState(state: HudUiState): void {
+  if (!state || typeof state !== 'object') return;
+
+  // Mode. Re-validated even though main sanitized the shape: an illegal
+  // triple would paint a matrix state the real app can never be in.
+  if (state.mode && isLegalMode(state.mode).ok) {
+    mode = { ...state.mode };
+    frameState.mode = mode;
+    if (ui.matrix) ui.matrix.setMode(mode);
+  }
+
+  // Fidelity params + preset identity. setParams re-derives the pressed chip
+  // from whether the values match a named preset, exactly like the source
+  // panel does after an advanced-slider commit.
+  if (state.params && ui.presets) {
+    ui.presets.setParams(state.params);
+    sceneParams = ui.presets.getParams();
+  }
+
+  if (isFiniteNumber(state.stormPointScale)) {
+    stormPointScale = Math.min(
+      STORM_SIZE_MAX,
+      Math.max(STORM_SIZE_MIN, state.stormPointScale),
+    );
+  }
+
+  if (isFiniteNumber(state.weatherCoverage)) {
+    weatherCoverage = Math.min(1, Math.max(0, state.weatherCoverage));
+    inputState.weatherCoverage = weatherCoverage;
+  }
+
+  // Scene tab: title, nav highlight and the per-scene control strip. Only on
+  // a real change -- remounting the strip on every push would interrupt a
+  // slider drag in progress.
+  const sceneId = typeof state.sceneId === 'string' ? state.sceneId : '';
+  if (sceneId && SCENE_REGISTRY[sceneId] && sceneId !== activeSceneId) {
+    activeSceneId = sceneId;
+    const entry = SCENE_REGISTRY[sceneId];
+    if (entry) setStageText(entry.title, entry.subtitle);
+    if (ui.sidebar) ui.sidebar.select(sceneId, true);
+    mountSceneControls(sceneId);
+  }
+
+  resyncSceneControls();
+
+  // The perf card's record count: in native modes no entities cross the
+  // boundary, so the configured count for the active scene is the honest
+  // figure (it is what the engine is simulating device-side).
+  if (ui.overlay) {
+    const engineScene = SCENE_REGISTRY[activeSceneId]?.engineScene;
+    if (engineScene === SCENES.SWARM) ui.overlay.setCount(sceneParams.swarmCount);
+    else if (engineScene === SCENES.STORM) ui.overlay.setCount(sceneParams.stormCount);
+  }
+
+  // Status chips: additive diff against the mirror. setChip/clearChip keep
+  // their own bookkeeping consistent (their pushHudUiState calls bail in
+  // HUD_MODE, so no echo loop is possible).
+  const chips = Array.isArray(state.chips) ? state.chips : [];
+  const seen = new Set<string>();
+  for (const chip of chips) {
+    if (!chip || typeof chip.id !== 'string' || typeof chip.text !== 'string') continue;
+    seen.add(chip.id);
+    setChip(chip.id, chip.text, chip.variant, chip.tooltip);
+  }
+  for (const id of Array.from(statusChips.keys())) {
+    if (!seen.has(id)) clearChip(id);
+  }
+
+  // Scene-controls note (CPU cap / VRAM refusal).
+  if (sceneControls) {
+    if (state.note && typeof state.note.text === 'string' && state.note.text.length > 0) {
+      sceneControls.setNote(state.note.text, state.note.variant);
+    } else {
+      sceneControls.setNote('');
+    }
+  }
+}
+
+/**
+ * Capture pointer/wheel/key input over the cutout and relay it to the main
+ * renderer's camera rig -- the wave-4 relay, re-anchored on the full stage.
+ *
+ * The listeners live on #stage-surface, which in this window is exactly the
+ * rect the native surface fills underneath (the cutout IS the stage). Events
+ * that originate on the scene-controls strip are excluded: those are real
+ * controls in this window, and a slider drag must not also orbit the globe
+ * beneath it. The perf card lives outside the stage entirely, so it never
+ * reaches these listeners.
+ */
+function installHudCutoutInput(): void {
+  const stage = document.getElementById('stage-surface');
+  if (!stage) {
+    console.warn('[hud] #stage-surface missing; camera relay disabled');
+    return;
+  }
+
+  const api = overlayBridge();
+  if (!api || typeof api.sendInput !== 'function') {
+    console.warn('[hud] bridge missing sendInput; camera relay disabled');
+    return;
+  }
+
+  /**
+   * One reusable payload. A pointermove during a drag fires at the device's
+   * full report rate, and allocating per event would make the relay itself a
+   * garbage source on the interaction path. IPC structured-clones it on send,
+   * so the receiver never sees this instance.
+   */
+  const payload: OverlayInputEvent = { kind: 'move' };
+
+  /** True when the event started on an interactive HUD control, not the stage. */
+  const overControl = (e: Event): boolean =>
+    e.target instanceof Element && e.target.closest('.scene-controls') !== null;
+
+  /** Clear the fields the current event kind does not own. */
+  const resetExtras = (): void => {
+    payload.nx = undefined;
+    payload.ny = undefined;
+    payload.button = undefined;
+    payload.buttons = undefined;
+    payload.deltaX = undefined;
+    payload.deltaY = undefined;
+    payload.deltaMode = undefined;
+    payload.key = undefined;
+    payload.pointerId = undefined;
+    payload.shiftKey = undefined;
+    payload.ctrlKey = undefined;
+    payload.altKey = undefined;
+    payload.metaKey = undefined;
+  };
+
+  const send = (): void => {
+    try {
+      api.sendInput(payload);
+    } catch (err) {
+      console.warn('[hud] input relay failed: %s', errText(err));
+    }
+  };
+
+  /** Fill the shared payload from a pointer event; false when unmeasurable. */
+  const fillPointer = (kind: OverlayInputKind, e: PointerEvent): boolean => {
+    const rect = stage.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return false;
+
+    resetExtras();
+    payload.kind = kind;
+    payload.nx = (e.clientX - rect.left) / rect.width;
+    payload.ny = (e.clientY - rect.top) / rect.height;
+    payload.button = e.button;
+    payload.buttons = e.buttons;
+    payload.shiftKey = e.shiftKey;
+    payload.ctrlKey = e.ctrlKey;
+    payload.altKey = e.altKey;
+    payload.metaKey = e.metaKey;
+    payload.pointerId = e.pointerId;
+    return true;
+  };
+
+  stage.addEventListener('pointerdown', (e) => {
+    if (overControl(e)) return;
+    // Nothing here should start a selection drag over the chrome.
+    e.preventDefault();
+
+    // Capture so an orbit that leaves the stage keeps delivering moves and the
+    // release is never lost -- same reason the in-page rig captures.
+    if (typeof stage.setPointerCapture === 'function' && Number.isFinite(e.pointerId)) {
+      try {
+        stage.setPointerCapture(e.pointerId);
+      } catch {
+        /* capture is a nicety, not a requirement */
+      }
+    }
+    if (fillPointer('down', e)) send();
+  });
+
+  stage.addEventListener('pointermove', (e) => {
+    if (overControl(e)) return;
+    if (fillPointer('move', e)) send();
+  });
+
+  stage.addEventListener('pointerup', (e) => {
+    if (typeof stage.releasePointerCapture === 'function' && Number.isFinite(e.pointerId)) {
+      try {
+        stage.releasePointerCapture(e.pointerId);
+      } catch {
+        /* the capture may already be gone; releasing twice is harmless */
+      }
+    }
+    if (overControl(e)) return;
+    if (fillPointer('up', e)) send();
+  });
+
+  stage.addEventListener('pointercancel', (e) => {
+    if (fillPointer('cancel', e)) send();
+  });
+
+  // A pointer leaving with no button held ends any hover state cleanly; with a
+  // button held the capture above keeps the gesture alive instead.
+  stage.addEventListener('pointerleave', (e) => {
+    if (e.buttons === 0 && fillPointer('cancel', e)) send();
+  });
+
+  // passive:false because the relay is the whole point -- the page has nothing
+  // to scroll and the wheel IS the camera dolly.
+  stage.addEventListener(
+    'wheel',
+    (e) => {
+      if (overControl(e)) return;
+      e.preventDefault();
+
+      const rect = stage.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return;
+
+      resetExtras();
+      payload.kind = 'wheel';
+      payload.nx = (e.clientX - rect.left) / rect.width;
+      payload.ny = (e.clientY - rect.top) / rect.height;
+      payload.deltaX = e.deltaX;
+      payload.deltaY = e.deltaY;
+      payload.deltaMode = e.deltaMode;
+      payload.shiftKey = e.shiftKey;
+      payload.ctrlKey = e.ctrlKey;
+      payload.altKey = e.altKey;
+      payload.metaKey = e.metaKey;
+      send();
+    },
+    { passive: false },
+  );
+
+  // Right-drag is the pan gesture (CONTRACTS section 8); no menu over the stage.
+  stage.addEventListener('contextmenu', (e) => e.preventDefault());
+
+  // Storm force keys, best-effort: this window is focusable:false so the OS
+  // rarely routes keys here (the main window keeps focus and its own handlers
+  // fire directly), but an OS-level focus quirk should not orphan the keys.
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== '1' && e.key !== '2' && e.key !== '3') return;
+    resetExtras();
+    payload.kind = 'key';
+    payload.key = e.key;
+    send();
+  });
+}
+
+/**
+ * Feed the HUD's perf card from the native render thread and the GPU poll.
+ *
+ * The same two read-only IPC surfaces the in-page card uses in native modes
+ * (nview:stats at 2 Hz, gpu:stats at 1 Hz via startGpuStatsPoll), driving the
+ * same fps-overlay module -- which is what makes the two cards byte-identical
+ * in structure and headline semantics.
+ */
+function startHudStatsFeeds(): void {
+  const bridge = window.geoswarm;
+  if (!bridge || !bridge.nview || typeof bridge.nview.stats !== 'function') {
+    console.warn('[hud] bridge missing nview.stats; perf card will show no native rate');
+    return;
+  }
+  const nview = bridge.nview;
+
+  let inFlight = false;
+
+  const poll = async (): Promise<void> => {
+    if (inFlight) return;
+    inFlight = true;
+    try {
+      const res = await nview.stats();
+      if (
+        res &&
+        res.ok === true &&
+        res.running !== false &&
+        isFiniteNumber(res.fps) &&
+        res.fps > 0
+      ) {
+        if (ui.overlay) {
+          ui.overlay.setNativeFps(res.fps, isFiniteNumber(res.frameMs) ? res.frameMs : 0);
+          if (isFiniteNumber(res.simMs)) ui.overlay.setTimings({ simMs: res.simMs });
+        }
+      } else if (ui.overlay) {
+        // A stopped thread shows dashes, never a frozen number.
+        ui.overlay.setNativeFps(null);
+      }
+    } catch (err) {
+      console.warn('[hud] native stats poll failed: %s', errText(err));
+      if (ui.overlay) ui.overlay.setNativeFps(null);
+    } finally {
+      inFlight = false;
+    }
+  };
+
+  void poll();
+  window.setInterval(() => {
+    void poll();
+  }, HUD_STATS_INTERVAL_MS);
+}
+
+/**
+ * Minimal frame loop for the HUD window: it drives the perf card's readout
+ * cadence and its display-rate line, exactly as the main page's loop does in
+ * a native mode (ticks are never marked fresh -- the native thread owns the
+ * headline through setNativeFps, same division of authority as in-page).
+ */
+function startHudTickLoop(): void {
+  let last = 0;
+  const step = (now: number): void => {
+    requestAnimationFrame(step);
+    if (!ui.overlay) return;
+    if (last > 0) ui.overlay.pushFrame(now - last, false);
+    last = now;
+    ui.overlay.tick(now);
+  };
+  requestAnimationFrame(step);
+}
+
+/**
+ * Boot the chrome-only HUD mirror (?hud=1).
+ *
+ * Reuses boot()'s probes and UI construction so the two windows can never
+ * disagree about layout -- same modules, same hosts, same initial values. The
+ * differences are all omissions: no scene mount, no data source, no nview
+ * controller, no engine port. The first UI snapshot lands via overlay:ready
+ * and snaps everything to the main renderer's live state.
+ */
+async function bootHud(): Promise<void> {
+  console.log('[hud] booting the cutout HUD mirror');
+
+  // Probes are KICKED here but not awaited yet -- and that ordering is a
+  // verified fix, not a micro-optimization. requestAdapter() takes multiple
+  // SECONDS while the native render thread has the GPU pegged, and this window
+  // is created mid-session (mode entry, minimize-restore) with the app already
+  // on screen: chrome that waits on the probe shows a skeleton page over the
+  // running surface for that whole stall. Build everything first, then let the
+  // capability answers grey the matrix cells when they land -- the exact same
+  // progressive paint the main window shows during its own boot.
+  const probes = Promise.all([probeNative(), probeWebGpu()]);
+
+  ui.overlay = createFpsOverlay(document.getElementById('fps-overlay'));
+  ui.badges = createBadges(document.getElementById('badges-panel'));
+  ui.badges.render(caps);
+
+  ui.matrix = createMatrix(document.getElementById('matrix-panel'), {
+    mode,
+    onChange: (next) => {
+      // Intent only -- the snapshot echo repaints the matrix with whatever
+      // the main renderer actually committed (or refused).
+      sendHudAction({ kind: 'mode', mode: { ...next } });
+    },
+  });
+  ui.matrix.setCaps(caps);
+
+  ui.presets = createPresets(document.getElementById('presets-panel'), {
+    // The stored snapshot (replayed on hudReady) is what really seeds the
+    // panel; the default here only covers the frames before it arrives.
+    initial: DEFAULT_PRESET,
+    onChange: (params, presetKey) => {
+      if (presetKey) sendHudAction({ kind: 'preset', presetKey });
+      else sendHudAction({ kind: 'params', params: { ...params } });
+    },
+  });
+  sceneParams = ui.presets.getParams();
+  rebaselineStormPointScale(ui.presets.getPreset());
+
+  ui.sidebar = createSidebar({
+    initial: 'globe',
+    onSelect: (id) => {
+      sendHudAction({ kind: 'scene', id });
+    },
+  });
+
+  installHudCutoutInput();
+
+  const api = overlayBridge();
+  if (api && typeof api.onUiState === 'function') {
+    api.onUiState((state) => {
+      try {
+        applyHudUiState(state);
+      } catch (err) {
+        console.warn('[hud] ui snapshot apply failed: %s', errText(err));
+      }
+    });
+  } else {
+    console.warn('[hud] bridge missing onUiState; chrome will not mirror app state');
+  }
+
+  startHudStatsFeeds();
+  startHudTickLoop();
+
+  // Handshake as soon as the listeners are armed: main replays the stored
+  // snapshot the moment this lands, so the chrome mirrors live state well
+  // before the capability probes below resolve.
+  if (api && typeof api.hudReady === 'function') api.hudReady();
+
+  console.log('[hud] chrome ready');
+
+  // Capability answers land whenever they land; the matrix must grey the same
+  // cells with the same reasons as the main window, or the two chromes stop
+  // being twins.
+  const [native, webgpu] = await probes;
+
+  caps = {
+    cuda: native?.cuda ?? { ok: false, reason: 'No CUDA capability reported.' },
+    webgpu,
+    nativeView: native?.nativeView ?? {
+      ok: false,
+      reason: 'Main process reported no native view capability',
+    },
+    versions: native?.versions ?? {},
+  };
+  frameState.caps = caps;
+
+  if (ui.badges) ui.badges.render(caps);
+  if (ui.matrix) ui.matrix.setCaps(caps);
+
+  // The GPU line poll gates itself on caps.cuda.ok, so it starts after the
+  // probe rather than testing a pessimistic default once a second forever.
+  startGpuStatsPoll();
+
+  console.log('[hud] capability probes applied');
+}
+
 async function boot(): Promise<void> {
+  // The HUD overlay window loads this same bundle with ?hud=1 and boots the
+  // chrome-only mirror instead (CONTRACTS section 6, cutout design).
+  if (HUD_MODE) {
+    await bootHud();
+    return;
+  }
+
   // Reduced motion is a live query -- respond if the user flips it mid-session.
   const motionQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
   frameState.reducedMotion = motionQuery.matches;
@@ -2935,29 +3759,11 @@ async function boot(): Promise<void> {
     // Without CUDA the three.js/CPU baselines carry the scene alone, and Low is
     // still the only honest opening count there.
     initial: caps.cuda.ok ? DEFAULT_PRESET : 'low',
-    onChange: (params, presetKey) => {
-      sceneParams = params;
-
-      // ONE knob moves everything (CONTRACTS section 8). The three effects are
-      // deliberately ordered: baseline first (so the resync below has the new
-      // number to publish), then the visible controls, then the backend.
-      //
-      // Doing the resync before ensureSource matters more than it looks. The
-      // configure round trip is async and can be refused (the VRAM guard) or
-      // capped (the CPU baseline), and BOTH of those paths write the strip
-      // themselves afterwards -- updateControlNote snaps the count slider to
-      // what is really running. Painting the requested values first and letting
-      // the outcome correct them keeps the control honest at every instant
-      // rather than only at the end.
-      rebaselineStormPointScale(presetKey);
-      applyStormPointScale();
-      resyncSceneControls();
-
-      // Reconfigure whichever backend is live. It reallocates for the new counts
-      // and does not remount the scene, because geometry sizes are a backend
-      // concern and the scene draws whatever batch it is handed.
-      void ensureSource(activeEngineScene());
-    },
+    // ONE knob moves everything (CONTRACTS section 8). The commit body lives
+    // in commitFidelity() now, shared verbatim with the HUD overlay's preset
+    // and params actions -- one pipeline for both windows; see its doc comment
+    // for the ordering rules that used to be spelled out inline here.
+    onChange: commitFidelity,
   });
   sceneParams = ui.presets.getParams();
 
@@ -2970,6 +3776,10 @@ async function boot(): Promise<void> {
   ui.sidebar = createSidebar({
     initial: 'globe',
     onSelect: (id) => {
+      // BENCH: a running sweep owns the stage -- it is what put the current
+      // scene there. Navigating away mid-sweep used to supersede the harness's
+      // own in-flight configure and wedge the run; see benchBlocksNavigation().
+      if (benchBlocksNavigation(id)) return;
       void mountScene(id);
     },
   });
@@ -2994,10 +3804,19 @@ async function boot(): Promise<void> {
 
   installPointerHandlers();
 
-  // The HUD overlay window's input relay. Installed before any scene exists so
-  // the very first native-mode entry already has it armed -- the subscription
-  // is inert until a relayed event actually arrives.
-  installOverlayInputRelay();
+  // The HUD overlay window's relays. Installed before any scene exists so the
+  // very first native-mode entry already has them armed -- both subscriptions
+  // are inert until the overlay actually sends something.
+  //
+  // Skipped outright on the web, where there is no second BrowserWindow to
+  // relay anything from. Both installers already degrade safely on a missing
+  // bridge, but they do it by warning about a preload that is "too old" -- and
+  // shouting about a stale preload into the console of a browser that never had
+  // one is just noise pointed at the wrong problem.
+  if (!IS_BROWSER_BUILD) {
+    installOverlayInputRelay();
+    installOverlayActionRelay();
+  }
 
   // Build the native-view controller before the first scene mounts, so a boot
   // that starts in a native mode (it cannot today, but a persisted mode would)
@@ -3047,7 +3866,7 @@ async function boot(): Promise<void> {
     const overlay = overlayBridge();
     if (overlay) {
       try {
-        overlay.setActive(false, null);
+        overlay.setActive(false);
       } catch {
         /* teardown on unload is best-effort by definition */
       }

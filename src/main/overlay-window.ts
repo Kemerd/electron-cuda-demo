@@ -1,41 +1,53 @@
 /**
- * overlay-window.ts -- the HUD overlay window for the native present modes.
+ * overlay-window.ts -- the full-window cutout HUD overlay for native present
+ * modes (CONTRACTS section 6, cutout amendment).
  *
  * The problem this solves
  * ----------------------
  * In matrix modes 6 and 7 the picture is produced by a Win32 child HWND with
- * its own DXGI swapchain that CUDA writes directly (CONTRACTS section 6).
- * Chromium does not composite that window and cannot draw on top of it: they
- * are two OS windows, and z-order within their overlap is all-or-nothing. So
- * the in-page HUD -- scene title, FPS/GPU card -- simply vanishes behind the
- * native surface the moment those modes engage.
+ * its own DXGI swapchain that CUDA writes directly. Chromium does not composite
+ * that window and cannot draw on top of it: they are two OS windows, and
+ * z-order within their overlap is all-or-nothing. So the in-page UI -- ALL of
+ * it, not just the perf card -- is unreachable over the native surface.
  *
- * CONTRACTS section 6 specifies the fix and this module is it: a second,
- * frameless, transparent BrowserWindow parented to the main window, tracking
- * the native rect in SCREEN coordinates, hosting the same HUD as a dedicated
- * Vite entry, and relaying the pointer/wheel/key events it intercepts back into
- * the main renderer's camera rig.
+ * The wave-4 answer was a small stats window over the native rect plus a
+ * layout gutter that shrank the surface to make room for the controls. That
+ * distorted the stage (the aspect no longer matched the composite tabs) and
+ * moved chrome around between modes. The cutout design replaces it:
  *
- * Three things about the design are non-obvious and worth reading first.
+ *   - This window covers the main window's WHOLE content area and loads the
+ *     SAME renderer bundle with ?hud=1. The page draws the entire chrome --
+ *     sidebar, matrix, presets, scene controls, badges, FPS/GPU card, titles
+ *     -- at exactly its composite positions, with a transparent hole over the
+ *     stage where the native surface shows through.
+ *   - The native child rect underneath is the FULL stage rect (the gutter is
+ *     gone), so the aspect matches the composite tabs by construction.
+ *   - Interactivity: camera gestures over the cutout ride the wave-4 input
+ *     relay (overlay:input -> overlay:input-relay); UI controls ship typed
+ *     intents (overlay:action -> overlay:action-relay) that the main renderer
+ *     applies through its normal code paths, then answers with a UI snapshot
+ *     (overlay:ui -> overlay:ui-push) the HUD mirrors. The main renderer stays
+ *     the single source of truth, which is what makes switching back to
+ *     composite restore an identical view.
  *
- * 1. SCREEN coordinates, not client coordinates. The native child HWND is
- *    positioned in the main window's CLIENT space (that is what WS_CHILD
- *    means), and that is the rect the renderer measures and pushes over
- *    IPC.NVIEW_RECT. A BrowserWindow's setBounds, by contrast, is in screen
- *    space. Converting between them needs the main window's live content
- *    origin, which is why every move/resize of the parent re-runs the same
- *    conversion -- the client rect did not change, but where it LIVES did.
+ * Three design points worth reading before touching anything:
+ *
+ * 1. Geometry is now trivial on purpose. The window tracks the parent's
+ *    CONTENT bounds (screen DIPs, which is what setBounds speaks on Windows)
+ *    and nothing else -- no client-rect conversion, no dependence on the
+ *    native rect. The HUD page lays out with the same CSS as the main page at
+ *    the same size, so every element lands in the same spot by construction.
  *
  * 2. Destroyed, never hidden. The contract calls an orphaned overlay window a
- *    defect, and hiding leaves a real window alive holding a webContents, a GPU
- *    surface and an IPC listener set. Every exit path here destroys: leaving
- *    the mode, minimizing, closing the parent, quitting.
+ *    defect, and hiding leaves a real window alive holding a webContents, a
+ *    GPU surface and an IPC listener set. Every exit path here destroys:
+ *    leaving the mode, minimizing, closing the parent, quitting.
  *
- * 3. The stats push is a PUSH, not a second poll. Main already has to call
- *    nativeViewStats() for the in-page readout and getGpuStats() for the GPU
- *    line. Letting the overlay invoke those itself would double the IPC and
- *    double the native calls to display the same numbers, so main polls once
- *    and sends the merged snapshot to whichever windows are listening.
+ * 3. Main is a dumb, paranoid router. Actions and snapshots pass through with
+ *    shape validation only -- the semantics live in the two renderers, and
+ *    duplicating them here would guarantee drift. What main DOES own is the
+ *    trust boundary: everything arriving on these channels came out of a
+ *    renderer and is re-checked field by field before being forwarded.
  */
 
 import { BrowserWindow, ipcMain, screen } from 'electron';
@@ -44,11 +56,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 
-import { SCENES } from '../shared/protocol.js';
-import type { GpuStats, SceneId } from '../shared/protocol.js';
-import { getEngine } from './capabilities.js';
-import { OVERLAY_IPC } from './overlay-types.js';
-import type { OverlayHudState, OverlayInputEvent } from './overlay-types.js';
+import { HUD_ACTION_KINDS, OVERLAY_IPC } from './overlay-types.js';
+import type { HudAction, HudChip, HudUiState, OverlayInputEvent } from './overlay-types.js';
+import type { ModeState } from '../shared/protocol.js';
 
 /* ------------------------------------------------------------------ *
  *  Paths
@@ -65,41 +75,19 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, '../..');
 
 /**
- * The overlay's own Vite entry (see vite.config.mjs rollupOptions.input).
- *
- * The nested path is not a choice: rollup places an HTML entry at the location
- * implied by its position under the vite root, so src/renderer/overlay/
- * overlay.html emits as dist/renderer/overlay/overlay.html. Flattening it would
- * mean a rename plugin, which is a build step bought with nothing.
+ * The overlay loads the SAME built renderer entry as the main window -- that
+ * is the whole point of the cutout design (one bundle, one layout, ?hud=1
+ * switches the behavior). There is no second HTML entry any more.
  */
-const OVERLAY_HTML = path.join(repoRoot, 'dist/renderer/overlay/overlay.html');
-
-/** Preload for the overlay window; tsc emits overlay-preload.cts as .cjs here. */
-const OVERLAY_PRELOAD = path.join(here, 'overlay-preload.cjs');
-
-/* ------------------------------------------------------------------ *
- *  Tuning
- * ------------------------------------------------------------------ */
+const RENDERER_HTML = path.join(repoRoot, 'dist/renderer/index.html');
 
 /**
- * HUD push cadence.
- *
- * 500 ms matches the in-page native-view stats poll exactly, and that symmetry
- * is deliberate: both readouts are showing the same three atomics off the same
- * render thread, and a mismatch would have the two cards disagree by up to half
- * a second during a mode switch. The GPU half of the snapshot only actually
- * changes at 1 Hz (see GPU_STATS_EVERY), so it rides along on every second
- * push rather than getting a timer of its own.
+ * And the SAME preload. The HUD page needs the real bridge (caps, GPU stats,
+ * the read-only nview stats poll, the overlay action/snapshot surface); the
+ * preload suppresses the RENDERER_READY handshake for hud=1 windows so the
+ * frame pump's single port stays with the main renderer.
  */
-const HUD_INTERVAL_MS = 500;
-
-/**
- * How many HUD pushes pass between getGpuStats() calls. Two pushes at 500 ms is
- * the ~1 Hz cadence CONTRACTS section 4 pins the telemetry to; NVML's first
- * call pays a dynamic load of the driver's nvml.dll and none of these numbers
- * move meaningfully inside a second.
- */
-const GPU_STATS_EVERY = 2;
+const PRELOAD = path.join(here, 'preload.cjs');
 
 /* ------------------------------------------------------------------ *
  *  Module state
@@ -111,28 +99,16 @@ let overlayWin: BrowserWindow | null = null;
 /** The parent window the overlay is currently attached to. */
 let parentWin: BrowserWindow | null = null;
 
-/**
- * Last native rect reported by the renderer, in CSS pixels relative to the
- * parent window's content area. This is the rect the child HWND occupies, and
- * it is what gets converted to screen space every time the parent moves.
- */
-let lastClientRect: { x: number; y: number; w: number; h: number } | null = null;
-
-/** Scene metadata for the title chip, pushed by the renderer on scene changes. */
-let sceneTitle = '';
-let sceneSubtitle = '';
-
-/** Handle for the HUD push interval; 0 when nothing is running. */
-let hudTimer: NodeJS.Timeout | null = null;
-
-/** Counts HUD pushes so the GPU half can run at half rate. See GPU_STATS_EVERY. */
-let hudTick = 0;
-
-/** Most recent GPU snapshot, reused on the pushes that do not re-poll. */
-let lastGpuStats: GpuStats | null = null;
-
 /** Guards against double registration -- registerOverlayIpc() is idempotent. */
 let installed = false;
+
+/**
+ * Latest UI snapshot pushed by the main renderer, replayed to the HUD when it
+ * announces overlay:ready. The window is created and loads asynchronously, so
+ * the snapshot always beats the page -- without the replay the HUD would boot
+ * showing default state until the user changed something.
+ */
+let lastUiState: HudUiState | null = null;
 
 /**
  * Whether the RENDERER wants a HUD overlay at all.
@@ -188,34 +164,24 @@ function wcAlive(wc: WebContents | null | undefined): wc is WebContents {
 }
 
 /* ------------------------------------------------------------------ *
- *  Geometry: client rect -> screen rect
+ *  Geometry: the parent's content area, in screen DIPs
  * ------------------------------------------------------------------ */
 
 /**
- * Convert the native view's client-space rect into the screen-space bounds the
- * overlay window needs.
+ * Where the overlay belongs: exactly the parent's content area.
  *
- * The two coordinate systems in play:
- *
- *   - `lastClientRect` is in CSS pixels measured by getBoundingClientRect() in
- *     the main renderer. In Electron the viewport origin IS the window's
- *     content-area origin, which is also what a WS_CHILD window's coordinates
- *     are relative to -- that is why the same rect feeds both the child HWND
- *     and this function.
- *   - BrowserWindow.setBounds() is in SCREEN coordinates, and (on Windows)
- *     in DIPs rather than physical pixels, which is the same unit the CSS rect
- *     is already in. So no dpr multiply happens here at all; doing one would
- *     square the scale factor on a 150% display, which is the exact bug
- *     CONTRACTS section 6 warns about for the native side.
- *
- * getContentBounds() rather than getBounds(): the client rect is relative to
- * the CONTENT area, so adding the outer window origin would offset the overlay
- * by the frame thickness and title bar.
+ * getContentBounds() rather than getBounds(): the HUD page lays out against
+ * the same viewport the main page does, and the viewport IS the content area
+ * -- including the frame would offset everything by the title-bar height and
+ * put every element visibly below its composite twin. Both this call and
+ * setBounds speak screen-space DIPs on Windows, so no DPR math happens here at
+ * all; the native side owns the one physical-pixel multiply (CONTRACTS
+ * section 6).
  *
  * @returns screen-space bounds, or null when nothing usable can be computed
  */
-function toScreenBounds(): Rectangle | null {
-  if (!alive(parentWin) || !lastClientRect) return null;
+function contentBounds(): Rectangle | null {
+  if (!alive(parentWin)) return null;
 
   let content: Rectangle;
   try {
@@ -225,162 +191,39 @@ function toScreenBounds(): Rectangle | null {
     return null;
   }
 
-  if (!content || !Number.isFinite(content.x) || !Number.isFinite(content.y)) return null;
+  if (
+    !content ||
+    !Number.isFinite(content.x) ||
+    !Number.isFinite(content.y) ||
+    !Number.isFinite(content.width) ||
+    !Number.isFinite(content.height)
+  ) {
+    return null;
+  }
 
-  const w = Math.max(1, Math.round(lastClientRect.w));
-  const h = Math.max(1, Math.round(lastClientRect.h));
-
-  return {
-    x: Math.round(content.x + lastClientRect.x),
-    y: Math.round(content.y + lastClientRect.y),
-    width: w,
-    height: h,
-  };
+  if (content.width < 1 || content.height < 1) return null;
+  return content;
 }
 
 /**
- * Push the current screen bounds onto the overlay window.
+ * Push the current content bounds onto the overlay window.
  *
- * Called from three places -- a fresh NVIEW_RECT, a parent move, a parent
- * resize -- and it is cheap enough to call unconditionally from all of them:
- * setBounds on an unchanged rect is a no-op inside Electron, and the comparison
- * that would avoid it costs about as much as the call.
- *
- * A zero-area rect is refused outright. A BrowserWindow cannot be 0 px wide,
- * and asking for one produces a 1x1 window parked in the corner of the display
- * -- a visible artifact rather than an invisible one.
+ * Called from a fresh create, a parent move and a parent resize, and cheap
+ * enough to call unconditionally from all of them: setBounds on an unchanged
+ * rect is a no-op inside Electron, and the comparison that would avoid it
+ * costs about as much as the call.
  */
 function applyBounds(): void {
   if (!alive(overlayWin)) return;
 
-  const bounds = toScreenBounds();
-  if (!bounds || bounds.width < 1 || bounds.height < 1) return;
+  const bounds = contentBounds();
+  if (!bounds) return;
 
   try {
     overlayWin.setBounds(bounds);
   } catch (err) {
     console.warn('[overlay] setBounds failed: %s', errText(err));
   }
-}
-
-/* ------------------------------------------------------------------ *
- *  HUD snapshot
- * ------------------------------------------------------------------ */
-
-/**
- * Read the native render thread's stats.
- *
- * A local copy of the same three atomics nview.ts reads, rather than an import
- * of its stats() -- that function is the IPC handler's shape (it carries an
- * OkResult wrapper the HUD does not want) and reaching across for it would
- * couple this module to the reply format of a channel it never calls.
- * The read itself is lock-free native-side, so doing it twice costs nothing.
- */
-function readNativeStats(): { fps?: number; frameMs?: number; simMs?: number } {
-  const engine = getEngine();
-  if (!engine || typeof engine.nativeViewStats !== 'function') return {};
-
-  try {
-    const res = engine.nativeViewStats();
-    if (!res) return {};
-
-    // Same gauge rule the rest of the codebase uses on addon output: a
-    // non-finite or negative number is dropped rather than forwarded to a UI
-    // that would render it as "NaN fps".
-    const gauge = (x: unknown): number | undefined =>
-      typeof x === 'number' && Number.isFinite(x) && x >= 0 ? x : undefined;
-
-    return { fps: gauge(res.fps), frameMs: gauge(res.frameMs), simMs: gauge(res.simMs) };
-  } catch (err) {
-    console.warn('[overlay] nativeViewStats threw: %s', errText(err));
-    return {};
-  }
-}
-
-/**
- * Read GPU telemetry, at half the HUD rate.
- *
- * Returns the cached snapshot on the ticks it skips, so the HUD's GPU line
- * never blinks out between polls -- a line that disappears every other frame
- * reads as a hardware fault rather than as a slower refresh.
- */
-function readGpuStats(): GpuStats | null {
-  if (hudTick % GPU_STATS_EVERY !== 0) return lastGpuStats;
-
-  const engine = getEngine();
-  if (!engine || typeof engine.getGpuStats !== 'function') {
-    lastGpuStats = null;
-    return null;
-  }
-
-  try {
-    const res = engine.getGpuStats();
-    lastGpuStats = res && res.ok === true ? (res as GpuStats) : null;
-  } catch (err) {
-    console.warn('[overlay] getGpuStats threw: %s', errText(err));
-    lastGpuStats = null;
-  }
-
-  return lastGpuStats;
-}
-
-/**
- * Build and send one HUD snapshot.
- *
- * Everything the card draws travels in a single message -- see the
- * OverlayHudState doc comment for why one snapshot beats three channels.
- */
-function pushHud(): void {
-  if (!alive(overlayWin)) return;
-
-  const wc = overlayWin.webContents;
-  if (!wcAlive(wc)) return;
-
-  hudTick++;
-
-  const stats = readNativeStats();
-  const state: OverlayHudState = {
-    title: sceneTitle,
-    subtitle: sceneSubtitle,
-    running: true,
-    gpu: readGpuStats(),
-  };
-
-  if (stats.fps !== undefined) state.fps = stats.fps;
-  if (stats.frameMs !== undefined) state.frameMs = stats.frameMs;
-  if (stats.simMs !== undefined) state.simMs = stats.simMs;
-
-  try {
-    wc.send(OVERLAY_IPC.HUD, state);
-  } catch (err) {
-    // A send into a webContents that died between the liveness check and here
-    // is a race, not an error worth escalating.
-    console.warn('[overlay] hud push failed: %s', errText(err));
-  }
-}
-
-/** Start the HUD push loop. Idempotent. */
-function startHudPush(): void {
-  if (hudTimer !== null) return;
-
-  // One immediate push so the card has real numbers before the first interval
-  // elapses -- half a second of "--" on every mode entry looks like a hang.
-  pushHud();
-
-  hudTimer = setInterval(pushHud, HUD_INTERVAL_MS);
-
-  // The push loop must never be the reason the process stays alive.
-  if (typeof hudTimer.unref === 'function') hudTimer.unref();
-}
-
-/** Stop the HUD push loop. Safe when nothing is running. */
-function stopHudPush(): void {
-  if (hudTimer !== null) {
-    clearInterval(hudTimer);
-    hudTimer = null;
-  }
-  hudTick = 0;
-  lastGpuStats = null;
 }
 
 /* ------------------------------------------------------------------ *
@@ -392,28 +235,22 @@ function stopHudPush(): void {
  *
  * The move hook is the one that is easy to forget and impossible to miss once
  * it is wrong: the native child HWND rides along with its parent automatically
- * (it is a child window, so its client coordinates are unchanged by a move),
- * but the overlay is a TOP-LEVEL window positioned in screen space -- so
- * without this it stays exactly where it was while the app slides out from
- * under it.
+ * (it is a child window), but the overlay is a TOP-LEVEL window positioned in
+ * screen space -- so without this it stays exactly where it was while the app
+ * slides out from under it.
  *
  * 'minimize' destroys rather than hides, per the contract. It also happens to
  * be necessary: nview.ts stops the render thread on minimize, so a surviving
- * overlay would sit there showing a frozen fps for a view that is not running.
+ * overlay would sit there annotating a view that is not running.
  */
 function installParentHooks(win: BrowserWindow): void {
   if (hookedParents.has(win)) return;
   hookedParents.add(win);
 
-  // 'move' fires continuously during a drag on Windows; applyBounds is a
-  // rect computation and one setBounds, which is what a drag can afford.
+  // 'move' fires continuously during a drag on Windows; applyBounds is one
+  // getContentBounds and one setBounds, which is what a drag can afford.
   win.on('move', applyBounds);
   win.on('moved', applyBounds);
-
-  // A resize changes the content origin as well as the size when the window is
-  // dragged by an edge, so the same conversion has to re-run. The renderer will
-  // also push a fresh NVIEW_RECT a frame later; this one keeps the overlay from
-  // lagging visibly in between.
   win.on('resize', applyBounds);
   win.on('resized', applyBounds);
 
@@ -424,9 +261,8 @@ function installParentHooks(win: BrowserWindow): void {
   });
 
   // A parent that goes away takes the overlay with it. Electron destroys child
-  // windows with their parent, but doing it explicitly here means the timers
-  // and module state are cleaned up too rather than left pointing at a dead
-  // window.
+  // windows with their parent, but doing it explicitly here means the module
+  // state is cleaned up too rather than left pointing at a dead window.
   win.on('close', () => {
     if (overlayWin) console.log('[overlay] parent closing -- destroying the HUD overlay');
     destroyOverlayWindow();
@@ -438,43 +274,45 @@ function installParentHooks(win: BrowserWindow): void {
  * ------------------------------------------------------------------ */
 
 /**
- * Create the overlay window over the current native rect.
+ * Create the overlay window over the parent's content area.
  *
  * Window options, and why each one is load-bearing:
  *
- *   frameless + transparent  the HUD is two floating cards over a surface this
- *                            process does not draw; any chrome or background
- *                            would occlude the CUDA output.
+ *   frameless + transparent  the page paints the chrome and leaves the stage
+ *                            region fully transparent -- that hole is the
+ *                            entire design, and any window chrome or opaque
+ *                            background would fill it in.
  *   parent                   keeps it z-above the main window and makes it
  *                            follow focus/minimize as one unit.
  *   skipTaskbar              it is not a window a user switches to.
  *   hasShadow: false         a drop shadow on a transparent window paints a
- *                            dark band along the native surface's edges.
- *   resizable/movable false  its geometry is derived from the native rect;
- *                            a user-draggable HUD would desync on the next
- *                            rect push and look like a bug.
- *   focusable: false         clicking the HUD must not steal focus from the
- *                            main window -- the relayed input is replayed
- *                            there, and a keystroke going to the overlay
- *                            instead would silently do nothing.
+ *                            dark band along every opaque region's edge.
+ *   resizable/movable false  its geometry is derived from the parent; a
+ *                            user-draggable HUD would desync on the next
+ *                            bounds push and look like a bug.
+ *   focusable: false         interaction works without activation (Windows
+ *                            delivers mouse input to no-activate windows), and
+ *                            keeping focus on the main window is what lets the
+ *                            storm scene's 1/2/3 keys keep working directly.
  *   backgroundThrottling     off, same reason main.ts sets it: this window is
- *                            frequently not the focused one and its readout
- *                            must keep updating anyway.
+ *                            never the focused one and its readouts must keep
+ *                            updating anyway.
  *
- * @param parent the main window whose client area the native rect lives in
+ * @param parent the main window this HUD covers
  * @returns the window, or null when creation failed (never throws)
  */
 function createOverlayWindow(parent: BrowserWindow): BrowserWindow | null {
-  const bounds = toScreenBounds();
+  const bounds = contentBounds();
   if (!bounds) {
-    console.warn('[overlay] no native rect known yet -- HUD overlay not created');
+    console.warn('[overlay] parent has no usable content bounds -- HUD overlay not created');
     return null;
   }
 
-  if (!fs.existsSync(OVERLAY_HTML)) {
+  const devUrl = process.env.VITE_DEV_SERVER_URL;
+  if (!devUrl && !fs.existsSync(RENDERER_HTML)) {
     console.warn(
-      '[overlay] overlay bundle missing at %s -- run npm run build:renderer',
-      OVERLAY_HTML,
+      '[overlay] renderer bundle missing at %s -- run npm run build:renderer',
+      RENDERER_HTML,
     );
     return null;
   }
@@ -499,7 +337,7 @@ function createOverlayWindow(parent: BrowserWindow): BrowserWindow | null {
       show: false,
       title: 'GeoSwarm HUD',
       webPreferences: {
-        preload: OVERLAY_PRELOAD,
+        preload: PRELOAD,
         contextIsolation: true,
         sandbox: true,
         nodeIntegration: false,
@@ -512,7 +350,7 @@ function createOverlayWindow(parent: BrowserWindow): BrowserWindow | null {
   }
 
   // Mirror the overlay's console into the main log the way main.ts does for the
-  // primary renderer -- otherwise a failure inside the HUD bundle is invisible
+  // primary renderer -- otherwise a failure inside the HUD page is invisible
   // (this window has no devtools anyone will open).
   win.webContents.on('console-message', (details) => {
     const line = typeof details?.message === 'string' ? details.message : '';
@@ -528,12 +366,12 @@ function createOverlayWindow(parent: BrowserWindow): BrowserWindow | null {
   });
 
   // Shown only once the page has painted. A transparent window that appears
-  // before its content exists flashes as a rectangle of desktop over the native
-  // surface for a frame or two.
+  // before its content exists flashes as a rectangle of nothing over the app
+  // for a frame or two.
   win.once('ready-to-show', () => {
     if (!alive(win)) return;
     // showInactive, not show: focus must stay with the main window, which is
-    // where the relayed input is replayed and where the keyboard belongs.
+    // where the relayed camera input is replayed and where the keyboard belongs.
     try {
       win.showInactive();
     } catch (err) {
@@ -546,28 +384,25 @@ function createOverlayWindow(parent: BrowserWindow): BrowserWindow | null {
   win.on('closed', () => {
     // Whoever closed it (us, the parent going away, a crash), the module state
     // must not keep pointing at a dead window.
-    if (overlayWin === win) {
-      overlayWin = null;
-      stopHudPush();
-    }
+    if (overlayWin === win) overlayWin = null;
   });
 
-  const devUrl = process.env.VITE_DEV_SERVER_URL;
+  // The hud=1 flag is what flips the renderer into chrome-only mode; it rides
+  // the query string in both load paths so the page sees the same signal
+  // regardless of where the bundle came from (same pattern as --smoke-test).
   if (devUrl && typeof devUrl === 'string' && devUrl.length > 0) {
-    // Vite serves the second entry at its source path under the root; the
-    // trailing-slash handling keeps a dev URL with or without one working.
-    const base = devUrl.endsWith('/') ? devUrl : `${devUrl}/`;
-    win.loadURL(`${base}overlay/overlay.html`).catch((err: unknown) => {
+    const sep = devUrl.includes('?') ? '&' : '?';
+    win.loadURL(`${devUrl}${sep}hud=1`).catch((err: unknown) => {
       console.error('[overlay] loadURL failed: %s', errText(err));
     });
   } else {
-    win.loadFile(OVERLAY_HTML).catch((err: unknown) => {
+    win.loadFile(RENDERER_HTML, { query: { hud: '1' } }).catch((err: unknown) => {
       console.error('[overlay] loadFile failed: %s', errText(err));
     });
   }
 
   console.log(
-    '[overlay] HUD overlay created at %d,%d %dx%d (screen)',
+    '[overlay] HUD overlay created at %d,%d %dx%d (screen, full content area)',
     bounds.x,
     bounds.y,
     bounds.width,
@@ -578,13 +413,13 @@ function createOverlayWindow(parent: BrowserWindow): BrowserWindow | null {
 }
 
 /**
- * Bring the overlay up for the current native rect, creating it if needed.
+ * Bring the overlay up over the parent's content area, creating it if needed.
  *
  * Idempotent: an already-live overlay is simply re-positioned, which is what
- * lets the NVIEW_RECT handler call this on every layout change without
- * thinking about whether the window exists.
+ * lets every caller invoke this without thinking about whether the window
+ * exists.
  *
- * @param parent the window that owns the native surface
+ * @param parent the window whose content area the HUD covers
  */
 export function showOverlayWindow(parent: BrowserWindow | null | undefined): void {
   if (!alive(parent ?? null)) {
@@ -597,14 +432,10 @@ export function showOverlayWindow(parent: BrowserWindow | null | undefined): voi
 
   if (alive(overlayWin)) {
     applyBounds();
-    startHudPush();
     return;
   }
 
   overlayWin = createOverlayWindow(parentWin);
-  if (!overlayWin) return;
-
-  startHudPush();
 }
 
 /**
@@ -619,8 +450,6 @@ export function showOverlayWindow(parent: BrowserWindow | null | undefined): voi
  * module funnels through it.
  */
 export function destroyOverlayWindow(): void {
-  stopHudPush();
-
   const win = overlayWin;
   overlayWin = null;
 
@@ -659,8 +488,22 @@ export function restoreOverlayWindow(parent: BrowserWindow | null | undefined): 
   showOverlayWindow(parent);
 }
 
+/**
+ * Remember which window owns the native surface, without opening the overlay.
+ *
+ * nview.ts calls this the moment the child window is created, so that a later
+ * OVERLAY_SET already knows what it is parented to. Keeping it separate from
+ * showOverlayWindow means creating the native view never has the side effect
+ * of putting a HUD on screen.
+ */
+export function setOverlayParent(win: BrowserWindow | null | undefined): void {
+  if (!alive(win ?? null)) return;
+  parentWin = win as BrowserWindow;
+  installParentHooks(parentWin);
+}
+
 /* ------------------------------------------------------------------ *
- *  Input relay
+ *  Input relay (unchanged from wave 4, now normalized to the full stage)
  * ------------------------------------------------------------------ */
 
 /**
@@ -751,17 +594,213 @@ function relayInput(payload: unknown): void {
 }
 
 /* ------------------------------------------------------------------ *
- *  IPC registration
+ *  Action relay (HUD chrome -> main renderer)
  * ------------------------------------------------------------------ */
 
 /**
- * Resolve a scene id off the wire, or null. Same helper shape nview.ts uses --
- * the scene string arrives from a renderer and is therefore untrusted.
+ * Validate one HUD action and forward it to the main renderer.
+ *
+ * Shape validation only -- semantics (is this scene id real, is this mode
+ * legal, does this count fit in VRAM) belong to the receiving renderer, which
+ * already validates all of them on its normal input paths. What main enforces
+ * is that nothing but the enumerated variants with sane field types can cross.
  */
-function readScene(value: unknown): SceneId | null {
-  if (typeof value !== 'string') return null;
-  return Object.values(SCENES).find((s) => s === value) ?? null;
+function relayAction(payload: unknown): void {
+  const body = asRecord(payload);
+  if (!body) return;
+
+  const kind = body.kind;
+  if (typeof kind !== 'string' || !(HUD_ACTION_KINDS as readonly string[]).includes(kind)) {
+    return;
+  }
+
+  if (!alive(parentWin)) return;
+  const wc = parentWin.webContents;
+  if (!wcAlive(wc)) return;
+
+  // Rebuilt variant by variant; a malformed instance is dropped in silence
+  // (an attacker probing the channel does not deserve an oracle, and a bug on
+  // the HUD side shows up in its own console via the sendAction validation).
+  let action: HudAction | null = null;
+
+  if (kind === 'scene') {
+    if (typeof body.id === 'string' && body.id.length > 0 && body.id.length <= 64) {
+      action = { kind: 'scene', id: body.id };
+    }
+  } else if (kind === 'mode') {
+    const mode = asRecord(body.mode);
+    const compute = mode?.compute;
+    const raster = mode?.raster;
+    const present = mode?.present;
+    if (
+      typeof compute === 'string' &&
+      typeof raster === 'string' &&
+      typeof present === 'string' &&
+      compute.length <= 32 &&
+      raster.length <= 32 &&
+      present.length <= 32
+    ) {
+      // The strings are re-validated against the real unions by isLegalMode()
+      // in the receiving renderer (applyMode refuses anything illegal); the
+      // cast carries no claim beyond "three bounded strings", which is exactly
+      // what crossed the wire.
+      action = { kind: 'mode', mode: { compute, raster, present } as ModeState };
+    }
+  } else if (kind === 'preset') {
+    if (typeof body.presetKey === 'string' && body.presetKey.length > 0 && body.presetKey.length <= 32) {
+      action = { kind: 'preset', presetKey: body.presetKey };
+    }
+  } else if (kind === 'params') {
+    const params = asRecord(body.params);
+    const swarmCount = num(params?.swarmCount);
+    const weatherGrid = num(params?.weatherGrid);
+    const stormCount = num(params?.stormCount);
+    if (swarmCount !== undefined && weatherGrid !== undefined && stormCount !== undefined) {
+      action = {
+        kind: 'params',
+        params: {
+          swarmCount: Math.max(0, Math.round(swarmCount)),
+          weatherGrid: Math.max(0, Math.round(weatherGrid)),
+          stormCount: Math.max(0, Math.round(stormCount)),
+        },
+      };
+    }
+  } else if (kind === 'count') {
+    const value = num(body.value);
+    if ((body.target === 'swarm' || body.target === 'storm') && value !== undefined) {
+      action = { kind: 'count', target: body.target, value: Math.max(0, Math.round(value)) };
+    }
+  } else if (kind === 'coverage') {
+    const value = num(body.value);
+    if (value !== undefined) {
+      action = { kind: 'coverage', value: Math.max(0, Math.min(1, value)) };
+    }
+  } else if (kind === 'pointScale') {
+    const value = num(body.value);
+    if (value !== undefined) {
+      action = { kind: 'pointScale', value: Math.max(0.01, Math.min(100, value)) };
+    }
+  }
+
+  if (!action) return;
+
+  try {
+    wc.send(OVERLAY_IPC.ACTION_RELAY, action);
+  } catch (err) {
+    console.warn('[overlay] action relay to renderer failed: %s', errText(err));
+  }
 }
+
+/* ------------------------------------------------------------------ *
+ *  UI snapshot store-and-forward (main renderer -> HUD)
+ * ------------------------------------------------------------------ */
+
+/** One chip off the wire, sanitized, or null. */
+function readChip(value: unknown): HudChip | null {
+  const body = asRecord(value);
+  if (!body) return null;
+  if (typeof body.id !== 'string' || body.id.length === 0 || body.id.length > 64) return null;
+  if (typeof body.text !== 'string' || body.text.length > 200) return null;
+
+  const chip: HudChip = { id: body.id, text: body.text };
+  if (body.variant === 'cuda' || body.variant === 'accent' || body.variant === 'warn') {
+    chip.variant = body.variant;
+  }
+  if (typeof body.tooltip === 'string' && body.tooltip.length > 0) {
+    chip.tooltip = body.tooltip.slice(0, 600);
+  }
+  return chip;
+}
+
+/**
+ * Validate a UI snapshot off the wire.
+ *
+ * The snapshot travels renderer -> main -> renderer, and both ends are our own
+ * code -- but "our own code" is exactly what every compromised renderer claims
+ * to be, so the shape is rebuilt field by field like everything else here.
+ *
+ * @returns a sanitized snapshot, or null when the payload cannot be trusted
+ */
+function readUiState(payload: unknown): HudUiState | null {
+  const body = asRecord(payload);
+  if (!body) return null;
+
+  if (typeof body.sceneId !== 'string' || body.sceneId.length > 64) return null;
+
+  const mode = asRecord(body.mode);
+  if (
+    !mode ||
+    typeof mode.compute !== 'string' ||
+    typeof mode.raster !== 'string' ||
+    typeof mode.present !== 'string'
+  ) {
+    return null;
+  }
+
+  const params = asRecord(body.params);
+  const swarmCount = num(params?.swarmCount);
+  const weatherGrid = num(params?.weatherGrid);
+  const stormCount = num(params?.stormCount);
+  if (swarmCount === undefined || weatherGrid === undefined || stormCount === undefined) {
+    return null;
+  }
+
+  const stormPointScale = num(body.stormPointScale);
+  const weatherCoverage = num(body.weatherCoverage);
+
+  const chips: HudChip[] = [];
+  if (Array.isArray(body.chips)) {
+    // Bounded: the topbar never holds more than a handful, and an attacker
+    // shipping ten thousand chips should not get them rendered.
+    for (const raw of body.chips.slice(0, 16)) {
+      const chip = readChip(raw);
+      if (chip) chips.push(chip);
+    }
+  }
+
+  let note: HudUiState['note'] = null;
+  const rawNote = asRecord(body.note);
+  if (rawNote && typeof rawNote.text === 'string' && rawNote.text.length > 0) {
+    note = { text: rawNote.text.slice(0, 400) };
+    if (rawNote.variant === 'warn' || rawNote.variant === 'info') note.variant = rawNote.variant;
+  }
+
+  return {
+    sceneId: body.sceneId,
+    mode: {
+      compute: mode.compute,
+      raster: mode.raster,
+      present: mode.present,
+    } as HudUiState['mode'],
+    presetKey: typeof body.presetKey === 'string' ? body.presetKey.slice(0, 32) : null,
+    params: {
+      swarmCount: Math.max(0, Math.round(swarmCount)),
+      weatherGrid: Math.max(0, Math.round(weatherGrid)),
+      stormCount: Math.max(0, Math.round(stormCount)),
+    },
+    stormPointScale: stormPointScale !== undefined ? stormPointScale : 1,
+    weatherCoverage: weatherCoverage !== undefined ? Math.max(0, Math.min(1, weatherCoverage)) : 0,
+    chips,
+    note,
+  };
+}
+
+/** Forward the stored snapshot to the HUD window, if both exist. */
+function pushUiStateToOverlay(): void {
+  if (!lastUiState || !alive(overlayWin)) return;
+  const wc = overlayWin.webContents;
+  if (!wcAlive(wc)) return;
+
+  try {
+    wc.send(OVERLAY_IPC.UI_PUSH, lastUiState);
+  } catch (err) {
+    console.warn('[overlay] ui push failed: %s', errText(err));
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ *  IPC registration
+ * ------------------------------------------------------------------ */
 
 /**
  * Install the overlay's IPC handlers. Idempotent -- a second call is a no-op
@@ -775,9 +814,9 @@ export function registerOverlayIpc(): void {
    * The main renderer asks for the overlay to come up or go down.
    *
    * The renderer is the only thing that knows whether a native present mode is
-   * actually engaged -- it owns the mode router -- so it drives this rather than
-   * main inferring it from nview:start. Inferring would also be wrong: the
-   * overlay must not appear for a start that FAILED, and start's result is
+   * actually engaged -- it owns the mode router -- so it drives this rather
+   * than main inferring it from nview:start. Inferring would also be wrong:
+   * the overlay must not appear for a start that FAILED, and start's result is
    * something the renderer sees and main would have to re-derive.
    */
   ipcMain.on(OVERLAY_IPC.SET, (event, payload: unknown) => {
@@ -793,17 +832,6 @@ export function registerOverlayIpc(): void {
         return;
       }
 
-      // Scene metadata rides in on the same message, so the title chip is
-      // correct on the very first push instead of one interval later.
-      if (typeof body.title === 'string') sceneTitle = body.title.slice(0, 120);
-      if (typeof body.subtitle === 'string') sceneSubtitle = body.subtitle.slice(0, 240);
-
-      // The rect may arrive here before any NVIEW_RECT has been seen (the
-      // renderer measures and requests in the same turn), so take it if it is
-      // offered rather than refusing to open.
-      const rect = asRecord(body.rect);
-      if (rect) applyClientRect(rect);
-
       const win = BrowserWindow.fromWebContents(event.sender);
       if (!win || win.isDestroyed()) {
         console.warn('[overlay] no BrowserWindow owns the requesting renderer');
@@ -816,38 +844,7 @@ export function registerOverlayIpc(): void {
     }
   });
 
-  /**
-   * Scene title/description updates, pushed when the user navigates.
-   *
-   * Separate from OVERLAY_SET because a scene change does not necessarily
-   * change whether the overlay should exist -- in a native mode the surface
-   * restarts and the window stays.
-   */
-  ipcMain.on(OVERLAY_IPC.SCENE, (_event, payload: unknown) => {
-    try {
-      const body = asRecord(payload);
-      if (!body) return;
-
-      if (typeof body.title === 'string') sceneTitle = body.title.slice(0, 120);
-      if (typeof body.subtitle === 'string') sceneSubtitle = body.subtitle.slice(0, 240);
-
-      // Validated but unused beyond the log: the scene id is here so a future
-      // per-scene HUD affordance has it, and validating now means the channel's
-      // shape is pinned from the start.
-      const scene = readScene(body.scene);
-      if (scene === null && typeof body.scene === 'string') {
-        console.warn('[overlay] overlay:scene carried an unknown scene "%s"', String(body.scene));
-      }
-
-      // Repaint immediately rather than waiting up to half a second -- a scene
-      // switch that leaves the old title on screen looks like a stuck HUD.
-      pushHud();
-    } catch (err) {
-      console.warn('[overlay] overlay:scene failed: %s', errText(err));
-    }
-  });
-
-  /** Input relayed from the overlay page. */
+  /** Camera/pointer input relayed from the HUD page's cutout. */
   ipcMain.on(OVERLAY_IPC.INPUT, (_event, payload: unknown) => {
     try {
       relayInput(payload);
@@ -856,78 +853,52 @@ export function registerOverlayIpc(): void {
     }
   });
 
+  /** User intents from the HUD chrome. */
+  ipcMain.on(OVERLAY_IPC.ACTION, (_event, payload: unknown) => {
+    try {
+      relayAction(payload);
+    } catch (err) {
+      console.warn('[overlay] overlay:action failed: %s', errText(err));
+    }
+  });
+
   /**
-   * The overlay page finished loading its listeners.
-   *
-   * Same handshake shape as IPC.RENDERER_READY: the first push goes out the
-   * moment this lands, so the card paints as soon as it can rather than at the
-   * next interval boundary.
+   * Fresh UI snapshot from the main renderer. Stored (so a HUD that boots
+   * later can be replayed into the right state) and forwarded immediately.
+   */
+  ipcMain.on(OVERLAY_IPC.UI, (_event, payload: unknown) => {
+    try {
+      const state = readUiState(payload);
+      if (!state) return;
+      lastUiState = state;
+      pushUiStateToOverlay();
+    } catch (err) {
+      console.warn('[overlay] overlay:ui failed: %s', errText(err));
+    }
+  });
+
+  /**
+   * The HUD page finished booting its chrome. Replay the latest snapshot so it
+   * mirrors the real state immediately instead of waiting for the next change.
    */
   ipcMain.on(OVERLAY_IPC.READY, () => {
-    pushHud();
+    pushUiStateToOverlay();
   });
-}
-
-/**
- * Record a new native rect and re-position the overlay over it.
- *
- * Called from nview.ts's NVIEW_RECT/NVIEW_CREATE path so the overlay tracks the
- * surface without a second channel: the renderer already pushes that rect on
- * every layout change, and duplicating it would guarantee the two drift.
- *
- * @param rect raw {x,y,w,h} in CSS px relative to the parent's content area
- */
-export function applyClientRect(rect: unknown): void {
-  const body = asRecord(rect);
-  if (!body) return;
-
-  const x = num(body.x);
-  const y = num(body.y);
-  const w = num(body.w);
-  const h = num(body.h);
-  if (x === undefined || y === undefined || w === undefined || h === undefined) return;
-  if (w <= 0 || h <= 0) return;
-
-  lastClientRect = {
-    x: Math.max(0, Math.round(x)),
-    y: Math.max(0, Math.round(y)),
-    w: Math.round(w),
-    h: Math.round(h),
-  };
-
-  applyBounds();
-}
-
-/**
- * Remember which window owns the native surface, without opening the overlay.
- *
- * nview.ts calls this the moment the child window is created, so that a later
- * OVERLAY_SET (or a rect push) already knows what it is parented to. Keeping it
- * separate from showOverlayWindow means creating the native view never has the
- * side effect of putting a HUD on screen.
- */
-export function setOverlayParent(win: BrowserWindow | null | undefined): void {
-  if (!alive(win ?? null)) return;
-  parentWin = win as BrowserWindow;
-  installParentHooks(parentWin);
 }
 
 /**
  * Teardown hook for app quit.
  *
- * The 'will-quit' path in main.ts calls this before the engine goes away: the
- * overlay's push loop reads nativeViewStats() off the addon, so it has to stop
- * before the addon is unloaded or the last tick reads freed state.
+ * The 'will-quit' path in main.ts calls this before the engine goes away, and
+ * a renderer that dies mid-session must not leave a stale intent behind: a
+ * reloaded page cannot have a leftover "yes" here resurrect a HUD before it
+ * has told us what mode it is in.
  */
 export function shutdownOverlayWindow(): void {
   destroyOverlayWindow();
-  // Intent is cleared too, so a renderer reload cannot have a stale "yes" here
-  // resurrect a HUD before the new page has told us what mode it is in.
   overlayWanted = false;
   parentWin = null;
-  lastClientRect = null;
-  sceneTitle = '';
-  sceneSubtitle = '';
+  lastUiState = null;
 }
 
 /**
@@ -940,12 +911,10 @@ export function shutdownOverlayWindow(): void {
  * an off-by-one-monitor bounds value obvious.
  */
 export function describeOverlayGeometry(): string {
-  const bounds = toScreenBounds();
-  const display = bounds
-    ? screen.getDisplayMatching(bounds)
-    : screen.getPrimaryDisplay();
+  const bounds = contentBounds();
+  const display = bounds ? screen.getDisplayMatching(bounds) : screen.getPrimaryDisplay();
 
-  if (!bounds) return 'overlay geometry: no native rect known';
+  if (!bounds) return 'overlay geometry: no parent content bounds known';
 
   return (
     `overlay geometry: ${bounds.width}x${bounds.height} at ${bounds.x},${bounds.y} ` +

@@ -217,14 +217,21 @@ export function modeUnavailableReason(mode: BenchMode, caps: MergedCaps): string
  *  Plan construction
  * ------------------------------------------------------------------ */
 
-/** Knobs the tab exposes for narrowing a sweep. */
+/**
+ * Knobs the tab exposes for narrowing a sweep.
+ *
+ * The narrowing fields are written `T | undefined` rather than `T?` on purpose:
+ * they are forwarded straight from the runner's own options object, so an
+ * absent key and an explicit undefined have to mean the same thing here or the
+ * forwarding needs a spread dance to satisfy exactOptionalPropertyTypes.
+ */
 export interface PlanOptions {
   /** Scenes to include. Empty/absent means all of them. */
-  readonly scenes?: readonly SceneId[];
+  readonly scenes?: readonly SceneId[] | undefined;
   /** Mode numbers to include. Empty/absent means every available mode. */
-  readonly modes?: readonly number[];
+  readonly modes?: readonly number[] | undefined;
   /** Cap the ladder to its first N rungs. Absent means the whole ladder. */
-  readonly maxRungs?: number;
+  readonly maxRungs?: number | undefined;
   /** Active weather grid height, from the live scene params. */
   readonly weatherGrid: number;
   /** Capability model, for gating. */

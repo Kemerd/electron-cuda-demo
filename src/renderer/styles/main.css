@@ -746,20 +746,15 @@ input[type='range']:active::-webkit-slider-thumb { transform: scale(1.06); }
   pointer-events: none;
 }
 
-/* While a native present path is live the slot becomes the reserved region,
-   inset on the right by the perf card's own column so the two never overlap. */
+/* While a native present path is live the slot becomes the active region.
+   It spans the FULL stage surface: the old right-hand gutter that shrank the
+   surface to make room for floating panels is gone -- it distorted the aspect
+   relative to the composite tabs, and CONTRACTS section 6 now requires the
+   native rect to BE the stage rect. The chrome that used to be pushed into
+   the gutter renders at its normal composite position inside the full-window
+   cutout overlay instead (see overlay/hud.css). */
 .native-present .native-view-slot {
   display: block;
-  right: var(--native-gutter);
-}
-
-/*
-   The reserved gutter. Wide enough for the 216px perf card plus the overlay
-   layer's 18px padding on both sides, with a little air so the card is not
-   pressed against the native surface's edge.
-*/
-#app-shell {
-  --native-gutter: 260px;
 }
 
 /* A visible hairline where the native surface begins. Without it the boundary
@@ -776,28 +771,10 @@ input[type='range']:active::-webkit-slider-thumb { transform: scale(1.06); }
   box-shadow: inset 0 0 24px rgba(118, 185, 0, 0.06);
 }
 
-/*
-   Push the floating chrome out of the reserved rect.
-
-   The overlay layer normally spans the whole shell and right-aligns its card
-   over the scene. In native present it is clamped to the gutter, so the card
-   lands beside the CUDA surface instead of inside it.
-*/
-.native-present .overlay-layer {
-  justify-content: flex-end;
-}
-
-/* The scene-control strip lives bottom-left inside the stage, which is INSIDE
-   the reserved rect -- so it is pulled out of it entirely rather than being
-   drawn where nobody can see it. */
-.native-present .scene-controls {
-  left: auto;
-  right: 18px;
-  bottom: 18px;
-  /* Narrowed to fit the gutter exactly: the default 232px would spill back
-     over the reserved rect by a few pixels and be clipped by the child window. */
-  width: calc(var(--native-gutter) - 36px);
-}
+/* No gutter overrides for .native-present any more: with the full-window
+   cutout overlay the perf card and the scene-control strip render at their
+   normal composite positions (in the overlay window, over the surface), so
+   the main page's layout is identical in every mode by construction. */
 
 /* ---------------------------------------------------------------------
    Overlay layer
@@ -1244,6 +1221,17 @@ input[type='range']:active::-webkit-slider-thumb { transform: scale(1.06); }
 
 /* ---- header ---------------------------------------------------------- */
 
+/* The FPS/GPU card lives in .overlay-layer at z-index 10 and hangs over the
+   top-right of the stage. The panel sits UNDER it (z-index 4) deliberately --
+   the live readout should stay legible while a sweep runs -- so the header
+   reserves a gutter the width of that card plus its padding instead. Without
+   this the Run/Cancel/Export buttons render beneath the card and cannot be
+   clicked at all, which the first windowed capture caught. */
+.bench-header,
+.bench-method {
+  padding-right: 244px;
+}
+
 .bench-header {
   display: flex;
   align-items: flex-start;
@@ -1384,7 +1372,12 @@ input[type='range']:active::-webkit-slider-thumb { transform: scale(1.06); }
 
 .bench-method p {
   margin: 0;
-  flex: 1 1 42ch;
+  /* flex-basis 100% forces the paragraph onto its own line so the debug knob
+     below it wraps rather than sharing the row -- the knob is the last flex
+     child and on a wide stage it would otherwise land in the reserved gutter,
+     i.e. underneath the perf card. */
+  flex: 1 1 100%;
+  min-width: 0;
   font-size: var(--fs-micro);
   line-height: 1.5;
   color: var(--text-secondary);
@@ -1591,6 +1584,16 @@ input[type='range']:active::-webkit-slider-thumb { transform: scale(1.06); }
   .bench-panel { padding: 12px; }
   .bench-panel.is-observing { inset: 0; width: auto; }
   .bench-chart { height: 172px; }
+  /* The perf card narrows to 176px + 12px padding at this breakpoint. */
+  .bench-header,
+  .bench-method { padding-right: 200px; }
+}
+
+/* Observing mode puts the panel in a left-hand column that never reaches the
+   card, so the gutter would only be wasted width. */
+.bench-panel.is-observing .bench-header,
+.bench-panel.is-observing .bench-method {
+  padding-right: 0;
 }
 
 /* ---------------------------------------------------------------------

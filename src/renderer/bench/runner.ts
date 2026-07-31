@@ -532,15 +532,14 @@ export function createBenchRunner(host: BenchHost, hooks: BenchCallbacks): Bench
       (apply?.capped === true) ||
       (cell.countKind === 'entities' && actual > 0 && actual < requested * 0.99);
 
-    return {
+    // A cell produced something if the page counted fresh frames, or -- in the
+    // native modes, where the page counts nothing by design -- if the render
+    // thread reported a present rate at least once.
+    const produced = native ? samples.nativeCount > 0 : samples.count > 0;
+
+    const result: BenchResult = {
       cell,
-      ok: samples.count > 0 || (native && samples.nativeCount > 0),
-      ...(samples.count === 0 && !(native && samples.nativeCount > 0)
-        ? {
-            skipped: 'no-samples' as BenchSkipReason,
-            reason: 'The measure window closed with no fresh frames.',
-          }
-        : {}),
+      ok: produced,
       effectiveFps,
       displayFps,
       fpsSource: native ? 'native' : 'raf',
@@ -561,17 +560,25 @@ export function createBenchRunner(host: BenchHost, hooks: BenchCallbacks): Bench
       actualCount: actual,
       requestedCount: requested,
       capped,
-      ...(capped
-        ? {
-            cappedReason:
-              apply?.cappedReason ||
-              `Backend ran ${fmtCount(actual)} of the ${fmtCount(requested)} requested.`,
-          }
-        : {}),
       warmupMs,
       measureMs,
       startedAtMs: sweepStartMs > 0 ? phaseStartMs - sweepStartMs : 0,
     };
+
+    // A window that closed empty is not a zero-fps result, it is an absence of
+    // measurement -- and the table renders the two very differently.
+    if (!produced) {
+      result.skipped = 'no-samples';
+      result.reason = 'The measure window closed with no fresh frames.';
+    }
+
+    if (capped) {
+      result.cappedReason =
+        apply?.cappedReason ||
+        `Backend ran ${fmtCount(actual)} of the ${fmtCount(requested)} requested.`;
+    }
+
+    return result;
   }
 
   /** Build the rig block from the live capability model. */
@@ -654,7 +661,7 @@ export function createBenchRunner(host: BenchHost, hooks: BenchCallbacks): Bench
         `${(measureMs / 1000).toFixed(1)} s. Warmup samples never reach a result.`,
       'Capped cells ran FEWER entities than requested (the CPU baseline auto-caps). Their ' +
         'numbers describe the smaller run; nothing is extrapolated to the requested count.',
-      'Mode 2 (CUDA sim -> three.js draw) pays a full device->host readback every frame. ' +
+      'Mode 4 (CUDA sim -> three.js draw) pays a full device->host readback every frame. ' +
         'That cost is inside its copyMs and inside its frame time, as measured.',
       'Modes 6/7 present through a D3D11 swapchain Chromium never composites, so their fps ' +
         'comes from the native render thread (fpsSource: "native"), not from rAF.',

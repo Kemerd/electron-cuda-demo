@@ -5,6 +5,7 @@ node_modules/
 native/build/
 dist/
 dist-electron/
+dist-web/
 .vite/
 
 # Logs and OS cruft

@@ -49,11 +49,16 @@ import type { Capabilities, GpuStats, OkResult, PumpToRendererMsg, SceneParams }
  *
  * location.search is readable at preload time (the document URL is committed
  * before the preload runs), but it is still wrapped -- a throw here would take
- * the whole bridge down with it.
+ * the whole bridge down with it. Read through globalThis with a structural
+ * type: this file compiles under the main-process tsconfig, which has no DOM
+ * lib, so `window`/`location` do not exist as typed globals here even though
+ * they exist at run time.
  */
 const IS_HUD_WINDOW: boolean = (() => {
   try {
-    return /[?&]hud=1(?:&|$)/.test(window.location.search);
+    const loc = (globalThis as { location?: { search?: unknown } }).location;
+    const search = typeof loc?.search === 'string' ? loc.search : '';
+    return /[?&]hud=1(?:&|$)/.test(search);
   } catch (err) {
     console.warn('[preload] could not read location.search:', String(err));
     return false;

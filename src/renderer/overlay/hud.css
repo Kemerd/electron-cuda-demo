@@ -1,0 +1,131 @@
+/* =====================================================================
+   hud.css -- the two window-role skins for the full-window cutout overlay
+   (CONTRACTS section 6, cutout design).
+
+   One bundle serves two windows, and this file carries the ONLY styling
+   difference between them. Both class hooks are namespaced so neither can
+   leak into the other window:
+
+     .hud-mode   on <html> in the HUD overlay window (?hud=1). The page
+                 renders the full chrome at its normal composite positions,
+                 and these rules punch the transparent hole over the stage
+                 where the native D3D11 surface shows through.
+
+     .hud-under  on #app-shell in the MAIN window while the HUD window is
+                 up. The HUD covers the whole content area and draws every
+                 piece of chrome itself, so the main page hides its text
+                 chrome underneath -- otherwise the HUD's transparent stage
+                 margins would show the same glyphs twice, double-composited
+                 into slightly bolder text.
+
+   Why the HUD's stage region is transparent INSTEAD of repainting the
+   stage gradient: a CSS background cannot have a hole punched through it,
+   so the cutout has to go through every ancestor of the stage surface.
+   The main window right underneath paints the identical gradient at the
+   identical position, so letting it show through reproduces the composite
+   look exactly -- the only pixels the HUD must own outright are the ones
+   with no identical twin beneath (the sidebar column, whose translucent
+   panel would otherwise double-composite, gets a pre-mixed opaque color).
+   ===================================================================== */
+
+/* ---------------------------------------------------------------------
+   HUD window (.hud-mode)
+   ------------------------------------------------------------------- */
+
+/* The window itself is transparent (BrowserWindow transparent:true); the
+   page must not fill it back in. Everything that should read as opaque
+   paints its own region below. */
+:root.hud-mode,
+.hud-mode body {
+  background: transparent;
+}
+
+/*
+   Sidebar: pre-composited to an opaque color.
+
+   --panel is rgba(22,24,30,0.72) and normally composites over --bg
+   (#0b0c10), which works out to rgb(19,21,26). Keeping it translucent here
+   would blend with the OTHER window's sidebar pixels instead (a second
+   72% layer over an already-composited one), which reads as a slightly
+   darker rail than the composite tabs -- exactly the class of "shifted
+   between modes" difference the cutout design forbids. The backdrop blur
+   goes with it: a transparent-window backdrop is empty, so the filter buys
+   nothing and costs compositor work.
+*/
+.hud-mode .sidebar {
+  background: rgb(19, 21, 26);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+/*
+   Stage: fully transparent. The topbar text, chips and margins render over
+   the main window's identical gradient showing through from beneath, which
+   is pixel-for-pixel the composite look (the main page hides its own text
+   chrome via .hud-under so nothing draws twice).
+*/
+.hud-mode .stage {
+  background: transparent;
+}
+
+/*
+   The cutout itself. In composite the surface's own tint sits under an
+   opaque scene canvas, so dropping it here changes nothing the eye ever
+   saw -- and keeping it would wash the native surface with a black film
+   the composite tabs do not have. The hairline border stays: it is the
+   visible boundary between "Chromium drew this" and "CUDA drew this",
+   same as the composite tabs' frame.
+*/
+.hud-mode .stage-surface {
+  background: transparent;
+}
+
+/*
+   Rounded-corner masks for the cutout.
+
+   The composite canvas is clipped by the surface's border radius; the
+   native child HWND is a square rectangle and cannot be. These nibs paint
+   the four corner slivers (outside the rounded rect, inside its bounding
+   box) so the cutout presents the same rounded frame as every other tab.
+   One element, no images: the box-shadow spread paints OUTSIDE the
+   pseudo-element's rounded outline and the surface's overflow:hidden clips
+   it to exactly the corner regions. --bg matches the stage wash to within
+   its very faint gradients, which is beneath the noise floor at 1-14px
+   corner scale.
+*/
+.hud-mode .stage-surface::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: calc(var(--r-lg) - 1px);
+  box-shadow: 0 0 0 60px var(--bg);
+  pointer-events: none;
+}
+
+/* ---------------------------------------------------------------------
+   Main window while the HUD is up (.hud-under)
+   ------------------------------------------------------------------- */
+
+/*
+   visibility, not display: these boxes are part of the layout the two
+   windows must agree on, and collapsing them would reflow the stage under
+   an overlay still laid out around the old geometry. Hidden-but-laid-out
+   keeps every rect stable while guaranteeing only one copy of the chrome
+   is ever legible.
+
+   The sidebar is NOT hidden: the HUD's opaque rail covers it completely,
+   and leaving it intact means a destroyed overlay (minimize, mode exit)
+   reveals a fully-drawn page with no repaint gap.
+*/
+.hud-under .stage-topbar,
+.hud-under .overlay-layer,
+.hud-under .scene-controls {
+  visibility: hidden;
+}
+
+/* The surface frame is drawn by the HUD's own ring; letting both windows
+   draw the same 1px hairline would double-composite it into a brighter
+   line than any composite tab shows. */
+.hud-under .stage-surface {
+  border-color: transparent;
+}

@@ -100,6 +100,48 @@ function describeWebGpu(webgpu: WebGpuCaps | null | undefined): string {
 }
 
 /**
+ * Build-time flag set only by vite.config.web.mjs. See the matching block in
+ * app.ts for why this is a define rather than a userAgent sniff.
+ */
+declare const __GEOSWARM_WEB_BUILD__: boolean | undefined;
+const IS_BROWSER_BUILD: boolean =
+  typeof __GEOSWARM_WEB_BUILD__ !== 'undefined' && __GEOSWARM_WEB_BUILD__ === true;
+
+/**
+ * Format the Runtime detail line.
+ *
+ * The version numbers come from process.versions in the main process, so they
+ * only exist when there IS a main process. The same source also ships as a
+ * hosted browser demo, where all three arrive empty -- and "Electron ? --
+ * Chromium ? -- Node ?" reads like three broken lookups rather than the
+ * accurate statement that none of them apply. So the web build gets its own
+ * line, with the Chromium version pulled from the UA: that part IS a genuine
+ * runtime fact about the visitor's browser, unlike which bundle this is.
+ */
+function describeRuntime(versions: Partial<MergedCaps['versions']>): string {
+  const model = versions && typeof versions === 'object' ? versions : {};
+
+  if (!IS_BROWSER_BUILD) {
+    return `Electron ${model.electron || '?'}  ·  Chromium ${model.chrome || '?'}  ·  Node ${model.node || '?'}`;
+  }
+
+  // navigator can be made hostile by hardened environments, so the read is
+  // wrapped and the version stays optional garnish, never a requirement.
+  let chromeVersion = '';
+  try {
+    const ua = typeof navigator === 'object' && navigator ? String(navigator.userAgent) : '';
+    const match = /Chrome\/(\d+)/.exec(ua);
+    if (match && match[1]) chromeVersion = match[1];
+  } catch {
+    /* the label below is complete without it */
+  }
+
+  return chromeVersion
+    ? `Browser build  ·  Chromium ${chromeVersion}  ·  no native addon`
+    : 'Browser build  ·  no native addon';
+}
+
+/**
  * Mount the capability panel.
  *
  * @param host container element (#badges-panel)
@@ -150,7 +192,7 @@ export function createBadges(host: HTMLElement | null): BadgesApi {
       }),
       makeBadge({
         name: 'Runtime',
-        detail: `Electron ${versions.electron || '?'}  ·  Chromium ${versions.chrome || '?'}  ·  Node ${versions.node || '?'}`,
+        detail: describeRuntime(versions),
         state: STATE.OK,
       }),
     ];

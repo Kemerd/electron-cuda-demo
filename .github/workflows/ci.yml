@@ -1,0 +1,172 @@
+# GeoSwarm CI -- build and type gates on a clean Windows runner.
+#
+# What this workflow proves: the repository compiles from scratch on a machine
+# that is not the development box. That covers the type gate, both TypeScript
+# builds, and -- the interesting one -- that the CUDA addon compiles with the
+# real 12.9 toolkit against Electron's Node ABI.
+#
+# What it deliberately does NOT prove: that anything RUNS on a GPU. GitHub's
+# windows-latest runners have no NVIDIA device, so every GPU-dependent suite
+# is excluded rather than skipped-with-a-green-tick. See the note above the
+# test step -- a suite that silently passes when the hardware is missing is
+# worse than no suite at all, because it reads as coverage.
+#
+# The GPU suites (npm run test:native, npm run smoke, and the benchmark sweep)
+# run on real hardware. They are the reason the numbers in the README mean
+# something, and they cannot be delegated to a cloud runner.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Manual runs, for when a toolchain pin changes and the answer is wanted
+  # before a push rather than after it.
+  workflow_dispatch:
+
+# Least privilege: this workflow reads the repository and writes nothing.
+# No packages are published, no pages are deployed, no releases are cut.
+permissions:
+  contents: read
+
+# A second push to the same branch makes the first run irrelevant. Cancel it
+# rather than paying for a Windows runner to finish answering a stale question.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and typecheck (Windows)
+    # Windows is not a preference here. The addon links d3d11 and dxgi, and
+    # the native view is Win32 -- there is no other platform this builds on.
+    runs-on: windows-latest
+    # The CUDA toolkit install is the long pole (several minutes on a cold
+    # cache). 45 minutes leaves room for a slow install without letting a hung
+    # job burn an hour.
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      # Node 22 LTS drives the build scripts only. It is NOT the runtime the
+      # addon is compiled against -- cmake-js targets Electron 43.2.0's ABI
+      # explicitly (see the build:native script), which is what makes the
+      # resulting .node loadable by Electron and not by this Node.
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          # Caches the npm download cache, keyed on package-lock.json.
+          cache: npm
+
+      # CUDA 12.9 to match the pin in CONTRACTS section 1. The network method
+      # downloads only the requested subpackages rather than the full ~3 GB
+      # local installer, which is the difference between a two-minute step and
+      # a ten-minute one.
+      #
+      # The action caches the installer itself; `use-github-cache: true` is
+      # what makes the second run skip the download.
+      - name: Install the CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.19
+        id: cuda-toolkit
+        with:
+          cuda: '12.9.0'
+          method: 'network'
+          # nvcc plus the runtime headers/libs the addon actually links. The
+          # full toolkit would add profilers and samples this build never
+          # touches.
+          sub-packages: '["nvcc", "cudart", "visual_studio_integration", "thrust"]'
+          use-github-cache: true
+          use-local-cache: false
+
+      - name: Report the toolchain
+        # Sanity output for a failed run: which nvcc actually got picked up.
+        # CONTRACTS warns that a v10.1 nvcc may sit on PATH on a dev box, and
+        # a runner that resolved the wrong one should say so here rather than
+        # producing a confusing sm_120 error later.
+        run: |
+          node --version
+          npm --version
+          nvcc --version
+          cmake --version
+
+      # `npm ci` rather than `npm install`: it installs exactly the lockfile
+      # and fails if package.json and the lock have drifted, which is the
+      # behavior a CI build wants.
+      - name: Install dependencies
+        run: npm ci
+
+      # The type gate. CONTRACTS ranks this equal to the builds, so it runs
+      # before them -- a type error should be reported as a type error, not as
+      # a confusing downstream build failure.
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build the main process
+        run: npm run build:main
+
+      - name: Build the renderer
+        run: npm run build:renderer
+
+      # The real point of running Windows + CUDA in CI: this compiles the
+      # kernels for sm_120 and links the addon. It needs no GPU -- nvcc is a
+      # compiler, and a machine with no NVIDIA card compiles device code
+      # perfectly well. It just cannot run it.
+      - name: Build the native CUDA addon
+        run: npm run build:native
+
+      - name: Verify the addon binary was produced
+        # cmake-js can exit zero on some configuration paths without emitting
+        # the .node, and a build step that "passed" without producing its
+        # artifact is the kind of green tick that hides a broken pipeline.
+        shell: pwsh
+        run: |
+          $addon = "native/build/Release/cuda_engine.node"
+          if (-not (Test-Path $addon)) {
+            Write-Error "Addon was not produced at $addon"
+            exit 1
+          }
+          $size = (Get-Item $addon).Length
+          Write-Output "Addon built: $addon ($size bytes)"
+          if ($size -lt 100000) {
+            Write-Error "Addon is implausibly small ($size bytes)"
+            exit 1
+          }
+
+      # Unit tests: pure protocol/geometry/preset logic, no GPU and no DOM.
+      # These are the only tests that can run honestly on this runner, and
+      # they run with Node's native TypeScript type-stripping (no build step,
+      # no ts-node).
+      - name: Run unit tests
+        run: npm run test:unit
+
+      # ------------------------------------------------------------------
+      # NOT RUN HERE, and not by omission:
+      #
+      #   npm run test:native  - drives the real addon on a real device:
+      #                          device queries, VRAM allocation, kernel
+      #                          launches, NVML telemetry, determinism
+      #                          checksums. Every one of those needs an
+      #                          NVIDIA GPU. windows-latest has none.
+      #   npm run smoke        - launches Electron and drives 60 frames
+      #                          through the MessagePort pump; needs both a
+      #                          GPU and a display.
+      #   the benchmark sweep  - produces the timing numbers in the README.
+      #                          Meaningless on virtualised hardware even if
+      #                          it could run.
+      #
+      # These execute on real hardware (RTX 5090, CUDA 12.9). Adding them
+      # here would mean either a guaranteed red build or a suite rewritten to
+      # pass without a GPU -- and the second option is the dangerous one,
+      # because it looks like coverage while testing nothing.
+      # ------------------------------------------------------------------
+
+      - name: Summary
+        shell: pwsh
+        run: |
+          Write-Output "Typecheck, main build, renderer build, native addon build and unit tests all passed."
+          Write-Output "GPU-dependent suites (test:native, smoke, benchmark) run on real hardware, not in CI."

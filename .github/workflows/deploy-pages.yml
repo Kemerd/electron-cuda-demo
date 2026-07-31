@@ -1,0 +1,92 @@
+# Publish the browser build of the GeoSwarm renderer to GitHub Pages.
+#
+# BEFORE THIS CAN RUN: Pages must be enabled for the repository first --
+# Settings -> Pages -> "Build and deployment" -> Source: "GitHub Actions".
+# Until that switch is flipped the deploy step fails with a 404 from the Pages
+# API, because there is no Pages site to deploy TO. Nothing in a workflow file
+# can turn it on; it is a repository setting.
+#
+# What gets published is `npm run build:web` output (vite.config.web.mjs ->
+# dist-web/), which is the same renderer the desktop app runs, minus everything
+# that needs a main process. In a browser window.geoswarm is simply absent, so
+# the CUDA compute/raster cells and both native present modes grey themselves
+# out with "requires the desktop build" and the three.js / WebGPU / CPU paths
+# carry the demo. No native addon is built here -- CI has no NVIDIA GPU and no
+# CUDA toolkit, and the web build never links against one.
+#
+# The site lands on a subpath (https://<owner>.github.io/<repo>/), which is why
+# the web vite config keeps base:'./' -- root-absolute asset URLs would resolve
+# against the user-site root and 404.
+
+name: Deploy web demo to Pages
+
+on:
+  # Manual runs, so the first deploy is a deliberate act rather than a surprise
+  # that happens the moment this file merges.
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+# Read the repo, write the Pages deployment, and mint the OIDC token the
+# deploy-pages action exchanges for its deploy credential. Least privilege:
+# nothing here needs write access to repository contents.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One live deployment at a time. Queued runs are NOT cancelled -- cancelling a
+# deploy mid-flight is how a site ends up half-published; a superseded queue
+# entry costs a couple of wasted minutes instead.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          # The web build is pure vite; it does not care about Electron's ABI
+          # the way the native addon does. 22 LTS is the safe CI baseline.
+          node-version: '22'
+          cache: npm
+
+      # `npm ci` respects the lockfile exactly. The dependency tree includes
+      # electron and cmake-js as devDependencies -- neither is imported by the
+      # browser bundle, but installing them keeps the lockfile honest rather
+      # than fighting it with --omit flags that would invalidate `npm ci`.
+      - name: Install dependencies
+        run: npm ci
+
+      # Type errors must fail the deploy, not ship. This is the same gate the
+      # desktop build runs; it covers the renderer sources the web build emits.
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build the web bundle
+        run: npm run build:web
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload the built site
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist-web
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

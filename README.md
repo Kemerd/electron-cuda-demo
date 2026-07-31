@@ -8,6 +8,8 @@ A 3D globe. A two-million-agent drone swarm. Live procedural weather. Four milli
 
 The point: Electron doesn't have to mean slow. A Node-API native module puts CUDA one `require()` away from your renderer process, and this repo measures exactly what that buys you — no hand-waving, no rigged comparisons.
 
+**Live demo:** [kemerd.github.io/electron-cuda-demo](https://kemerd.github.io/electron-cuda-demo/) — the same renderer built for the browser. It serves **modes 1–3** (CPU and WebGPU); the CUDA compute, CUDA raster and both native present modes grey out with "requires the desktop build", because they do. *(Requires Pages to be enabled for the repo: Settings → Pages → Source: GitHub Actions.)*
+
 ## The matrix
 
 Instead of *claiming* native is faster, the app runs every legal combination of **compute** (who simulates), **raster** (who draws), and **present** (how pixels reach the screen), and lets the graphs argue:
@@ -26,9 +28,9 @@ Illegal cells grey out with a tooltip explaining the data-locality reason — th
 
 ## Scenes
 
-- **Globe + Swarm** — day/night earth with a drone swarm flying a thin altitude shell: boid flocking over a spatial hash grid, rally-point targets, wind drift.
-- **Weather** — procedural wind + storm systems advected on the GPU; drawn as field overlays in the WebGL paths and as true volumetric ray-marched atmosphere in the CUDA raster path (the workload fixed-function pipelines are bad at — that's the point).
-- **Particle Storm** — millions of particles in a curl-noise flow, bending around your cursor. The pretty one.
+- **Globe + Swarm** — day/night earth with a drone swarm flying a thin altitude shell: boid flocking over a spatial hash grid, rally-point targets, wind drift. Agents draw as **ADS-B traffic darts** — the concave notched kite off a real avionics traffic display, with the point showing track direction, lying in the sphere's tangent plane. Zoom out far enough and the glyph drops its notch for a **single filled triangle clamped to a 2 px minimum**: an agent is always a readable directional mark, never a round blob. Every backend uses the same glyph and the same LOD ladder.
+- **Weather** — an **EFB radar view**, not abstract volumetrics. The classic NEXRAD reflectivity ramp (transparent → green → yellow → orange → red → magenta) in ~6 stepped bands, because the slight banding of a real mosaic is authentic. Wind vectors render only above a **significance floor** (~40th percentile of the live field), so calm regions stay clean and the visible barbs trace the actual structure — jet bands, outflow, circulation — with **knots labels on the strongest cores only**, clustered so you get "65 kt" once per system rather than a label per glyph. A **Coverage dial** (Clear → Severe) reshapes the density field *in the sim* in every backend, so the swarm flies the same weather the radar draws. WebGL/WebGPU fake the vertical with a **2.5D stack of 12–16 concentric translucent shells**; the CUDA raster path marches the real volume. Same data — three.js fakes the depth with 16 texture slices, CUDA marches the actual field. Compare them, and check the weather table below for what the difference costs.
+- **Particle Storm** — millions of particles in a curl-noise flow, bending around your cursor, with live **count and point-size sliders** (the size baseline re-snaps whenever the fidelity preset moves). The pretty one.
 - **Benchmark** — automated sweep across every legal mode and an entity-count ladder; percentile tables, charts, JSON export.
 
 ## Interaction
@@ -50,8 +52,10 @@ Input travels *down* to the kernels as a few bytes of uniforms per frame — int
 │    D3D11 child-window presenter (zero-copy path)           │
 │  Frame pump: pooled ArrayBuffers over a MessagePort        │
 └──────────────────────────┬─────────────────────────────────┘
-                           │ transferred buffers (detach + recycle,
-                           │ zero steady-state allocation)
+                           │ structured clone, both directions
+                           │ (no transfer lists — see below)
+                           │ pump re-pools its own buffer:
+                           │ zero main-side steady-state alloc
 ┌──────────────────────────┴─────────────────────────────────┐
 │  Renderer — three.js (WebGL) · raw WGSL WebGPU · UI        │
 └────────────────────────────────────────────────────────────┘
@@ -61,9 +65,19 @@ Design decisions worth stealing:
 
 - **Node-API, not raw V8** — one binary, ABI-stable across Electron versions. No `electron-rebuild` treadmill.
 - **Static CUDA runtime + hash-based RNG** — the built `.node` ships zero CUDA DLLs.
-- **MessagePort transport, honestly accounted** — Electron only supports true ArrayBuffer transfer on the renderer→main leg (main-side `postMessage` accepts ports alone in its transfer list), so outbound frames are structured clones. The pump re-pools its undetached buffer immediately — zero main-side allocation — and the renderer transfers consumed buffers back for deterministic disposal. That outbound copy is real, measured, and reported in the transport column; it's also exactly why the zero-copy present modes exist.
+- **MessagePort transport, honestly accounted** — **both legs are structured clones. There are no transfer lists on this port in either direction**, and that is a finding, not a shortcut. Main→renderer, `MessagePortMain.postMessage` accepts *ports only* in its transfer list; an ArrayBuffer there throws and the frame is lost. Renderer→main, transfer *appears* to work — no throw, the buffer detaches — but it never becomes reachable on the main side, and if a transferred entry is also referenced from the message body the entire message arrives empty, every property silently stripped. The code is built around that: the pump re-pools **its own** buffer immediately (a clone does not detach it), so there is zero main-side allocation in steady state, and the renderer treats every buffer it receives as disposable garbage — it is a fresh IPC-layer allocation either way, and shipping it back would buy a second full copy to discard. There is no recycle channel; requests carry no buffers.
+
+  **What that copy costs, measured.** Subtract the engine's own reported work from the observed frame interval in mode 4 and what remains is the clone plus the IPC hop: 61 MiB/frame (2M agents × 32 B, or 4M storm particles × 16 B) costs **93–99 ms**, and the residual tracks payload size at a steady **620–660 MB/s** regardless of scene or record layout. At 2M agents that is 3.07 ms of sim and 4.31 ms of device→host copy buried under ~93 ms of transport — the reason mode 4 reads 10 effective fps while the page is still spinning at 46. **This is why modes 6/7 exist**: they move no frame data across the boundary at all.
 - **Zero-copy present** — a Win32 child window with a flip-model DXGI swapchain; CUDA writes an intermediate D3D11 texture via `cudaGraphicsD3D11RegisterResource`, one VRAM→VRAM copy to the backbuffer, `Present`. Chromium never touches the pixels.
 - **Raw WGSL for the WebGPU path** — no framework transpiler between the benchmark and the shader, so the comparison stays defensible. Sim storage buffers bind directly as vertex buffers for the draw.
+
+### The native present modes (6 and 7)
+
+HTML cannot blend over a native child HWND inside the same window — they are two OS windows and z-order in the overlap is all-or-nothing. So the native modes get a **full-window cutout overlay**: a frameless transparent window, parented to the main one and tracking its bounds, running the *same renderer bundle* in HUD mode. It draws the entire UI — sidebar, matrix, presets, scene controls, badges, the FPS/GPU card — with the stage region rendered fully transparent, and the CUDA surface shows through the hole at exactly the rect the composite layout computes.
+
+The point of that machinery is that **the UI is identical across all seven modes**. Toggling Composite ↔ Native moves nothing, hides nothing, and shrinks nothing: same panels, same positions, same text. Camera gestures over the cutout drive the same orbit controller and feed the same `InputState`, so switching back and forth preserves your view in both directions. The native view is destroyed — not hidden — on leaving the mode, on minimize, and on quit; any failure falls back to composite cleanly.
+
+The two modes differ only in `Present()`'s sync interval, and the measured rates show exactly what that buys. **Mode 6 (vsync)** pins to the panel — 240 fps on this 240 Hz display — right up until the kernel can no longer fill a 4.2 ms budget, at which point it reports the truth (190 fps at 2M agents, 109 at the 2048 weather grid). **Mode 7 (unlocked, `DXGI_PRESENT_ALLOW_TEARING`)** removes the ceiling and shows the actual throughput: **1250 fps** on 50k storm particles, **910** on 50k swarm agents, **478** at 4M particles. Where the GPU is already saturated the two converge — 190 vs 195 at 2M agents, both at 95% utilization, and weather is a dead heat at 97%. Unlocking a present path that is kernel-bound buys nothing, and the numbers say so rather than pretending otherwise.
 
 ## Requirements
 
@@ -74,7 +88,7 @@ Design decisions worth stealing:
 | CUDA Toolkit | 12.8+ (12.9 tested) | Build-time only |
 | Visual Studio 2022 | Desktop C++ workload | Host compiler for nvcc |
 | CMake | 3.24+ | |
-| Node.js | 20+ | |
+| Node.js | 22.18+ (24 tested) | The unit suite runs `.ts` files directly via Node's built-in type stripping |
 
 **No NVIDIA GPU?** The app still runs — CUDA cells grey out with a reason badge, and the CPU/WebGPU paths work anywhere Chromium does.
 
@@ -100,25 +114,58 @@ Test rig for all published numbers:
 | CPU | Intel Core i9-14900K |
 | OS | Windows 11 Pro |
 
-> **Pending:** full sweep results from the Benchmark tab land here — every legal matrix cell across the entity-count ladder, captured on the rig above.
+Numbers below are one uninterrupted 61-cell sweep from the Benchmark tab, run windowed on an otherwise idle machine at the shipped methodology: **2.0 s warmup discarded, then a 5.0 s measure window, per cell**, 9.6 minutes end to end. Every cell produced samples — zero skips, zero retries, nothing hand-picked. The panel's reduced-durations knob is a debug affordance that ships off; it was off, and the export records that it was. Reproduce it with the tab's Export JSON button, which writes the whole document — rig block, methodology, notes, and every row — in the same schema the table you're reading was built from.
 
-| Scene | Mode | Entities | Avg FPS | p99 frame ms | Sim ms | Transport ms |
-|-------|------|----------|---------|--------------|--------|--------------|
-| Globe + Swarm | 1 · CPU / three.js | — | *TBD* | *TBD* | *TBD* | *TBD* |
-| Globe + Swarm | 3 · WebGPU / WebGPU | — | *TBD* | *TBD* | *TBD* | *TBD* |
-| Globe + Swarm | 4 · CUDA / three.js | — | *TBD* | *TBD* | *TBD* | *TBD* |
-| Weather | 5 · CUDA / CUDA blit | — | *TBD* | *TBD* | *TBD* | *TBD* |
-| Weather | 6 · CUDA / zero-copy | — | *TBD* | *TBD* | *TBD* | *TBD* |
-| Particle Storm | 3 · WebGPU / WebGPU | — | *TBD* | *TBD* | *TBD* | *TBD* |
-| Particle Storm | 7 · CUDA / unlocked | — | *TBD* | *TBD* | *TBD* | *TBD* |
+The display is 240 Hz, which is the ceiling every vsync-locked row runs into. Mode 1's ladder deliberately stops one rung past the point the CPU baseline starts clamping: measuring the same 20k agents four times tells you nothing the first row didn't.
+
+**Effective FPS is the headline**: frames that presented genuinely new state. **Display** is the raw rAF rate over the same window, which is *not* a performance figure — it is there so the gap between the two is impossible to miss. In modes 6/7 both columns are the D3D11 swapchain's present rate off the native render thread, because rAF is not measuring that surface at all.
+
+**Globe + Swarm — effective FPS up the agent ladder**
+
+| Mode | 50k | 250k | 1M | 2M |
+|---|---|---|---|---|
+| 1 · CPU / three.js | 42.8 *(capped to 20k)* | 43.6 *(capped to 20k)* | 43.8 *(capped to 20k)* | — |
+| 3 · WebGPU / WebGPU | **224** (display 240) | **199** (display 240) | **90** | **46** |
+| 4 · CUDA / three.js | **237** (display 240) | **70** (display 206) | **19** (display 83) | **10** (display 46) |
+| 6 · CUDA / native vsync | **242** | **240** | **240** | **190** |
+| 7 · CUDA / native unlocked | **910** | **682** | **322** | **195** |
+
+Mode 4 is the readback mode, and this is what a readback costs. The sim is fast (3.07 ms at 2M) and the device→host copy is fast (4.31 ms); the frame still takes 100 ms, because 61 MiB has to be structure-cloned across the process boundary every frame. Mode 3 beats it from 250k upward not because WebGPU out-computes CUDA but because WebGPU never leaves the GPU.
+
+**Particle Storm at 4M — the storm ladder's top rung**
+
+| Mode | Effective FPS | Display | p50 ms | p99 ms | Sim ms | Copy ms |
+|---|---|---|---|---|---|---|
+| 3 · WebGPU / WebGPU | 48.4 | 48.4 | 20.8 | 29.2 | 0.74 | 9.54 |
+| 5 · CUDA raster / blit | **75.8** | 205.8 | 12.5 | 25.1 | 1.13 | 0.48 |
+| 7 · CUDA raster / native unlocked | **478** | 478 | 2.49 | — | — | — |
+
+Mode 5 already beats the web path at 4M — CUDA rasterizing 4M splats in software still wins once the alternative is reading 61 MiB back per frame — and mode 7, which never crosses the boundary, is another 6.3× on top. The full storm ladder for mode 7: 1250 / 1184 / 916 / 478 fps at 50k / 250k / 1M / 4M.
+
+**Weather at the 2048 grid — every mode, one field**
+
+| Mode | Effective FPS | Display | p50 ms | p99 ms | Sim ms | Copy ms | Render ms | GPU |
+|---|---|---|---|---|---|---|---|---|
+| 2 · WebGPU / three.js | 38.1 | 38.3 | 25.0 | 41.7 | 4.34 | 11.79 | — | 59% |
+| 3 · WebGPU / WebGPU | 38.7 | 38.7 | 25.0 | 41.6 | 3.42 | 11.60 | — | 58% |
+| 4 · CUDA / three.js | 8.3 | 22.0 | 116.8 | 150.0 | 6.91 | 4.24 | — | 25% |
+| 5 · CUDA raster / blit | **47.4** | 60.2 | 20.8 | 41.7 | 7.57 | 0.45 | 0.40 | 60% |
+| 6 · CUDA raster / native vsync | **109** | 109 | 9.28 | — | — | — | — | 97% |
+| 7 · CUDA raster / native unlocked | **105** | 105 | 11.08 | — | — | — | — | 97% |
+
+This is the volumetric comparison the scene exists for. The WebGL/WebGPU paths draw 16 translucent shells and land at 38 fps; CUDA marches the real 3D field and lands at 47 through the blit and **109 through the native surface** — 2.8× the web paths on a workload the fixed-function rasterizer cannot help with. Note modes 6 and 7 tie here at 97% GPU: the ray-march is the bottleneck, so unlocking vsync buys nothing.
+
+**Where the CPU baseline actually stops.** The worker auto-caps at the Low preset rather than freezing the app, and it says so: every mode-1 row above ran 20k agents no matter what was requested. Weather at the 2048 grid is the honest disaster — **3.8 effective fps against a 239 fps display**, 158 ms of single-threaded sim per step. That row is the whole argument for the rest of the table.
 
 ## The honesty clauses
 
 Benchmarks you can't trust are decoration. Ground rules here:
 
 - **WebGL wins plain triangles.** It gets the GPU's fixed-function rasterizer and ROPs; CUDA rasterizes in software on the shader cores. That's why the CUDA raster path renders volumetrics and mass splats — workloads where the fixed-function hardware can't help — instead of pretending to win a triangle contest.
-- **The blit path (mode 5) is deliberately wasteful** — pixels leave the GPU and come straight back so Chromium can composite them. It exists so mode 6 has something to embarrass.
-- **WebGPU is genuinely good.** On memory-bandwidth-bound advection it lands close to CUDA. The gap opens on workloads that want warp-level intrinsics and fine-grained memory control — the numbers show where, not adjectives.
+- **The blit path (mode 5) is deliberately wasteful** — pixels leave the GPU and come straight back so Chromium can composite them. It exists so mode 6 has something to embarrass, and the measured gap is 47 → 109 fps on the weather volume.
+- **WebGPU is genuinely good.** On memory-bandwidth-bound advection it lands close to CUDA, and on the swarm ladder it *beats* the CUDA readback mode from 250k upward (199 vs 70 at 250k, 46 vs 10 at 2M) — because staying on the GPU beats a faster kernel that has to ship its results back. The gap reopens where the workload wants warp-level intrinsics and fine-grained memory control, or where the CUDA path also keeps its pixels on the GPU. The numbers show where, not adjectives.
+- **Vsync ceilings are real ceilings.** Mode 6 reading exactly 240 fps means it hit the panel, not that it ran out of headroom — mode 7 is the same pipeline with the sync interval removed, and it's what to read for throughput. Where the two converge (2M agents, the weather volume, both at 95–97% GPU) the path is genuinely kernel-bound and there is nothing left to unlock.
+- **A capped row is a smaller run, never an extrapolation.** The CPU baseline clamps to 20k agents and the table prints what it actually ran beside what was asked for. No number in this README is interpolated, scaled, or estimated from a neighbouring cell.
 
 ## Testing
 
@@ -126,24 +173,32 @@ Performance claims deserve the same rigor as correctness claims, so the repo shi
 
 ```bash
 npm test               # everything below, in order
-npm run test:unit      # protocol invariants, mode legality, math — plain node:test, no GPU needed
-npm run test:native    # addon suite under Electron's ABI: format/bounds/determinism checks on real kernels
-npm run test:smoke     # full app launch, capability probe, one end-to-end frame through the pump
+npm run test:unit      # 47 cases — protocol invariants, mode legality, math. No GPU needed
+npm run test:native    # 37 cases — addon suite under Electron's ABI, on real kernels
+npm run smoke          # full app launch, capability probe, 60 frames through the pump
 ```
 
-- **Unit** — the shared protocol is the contract everything hangs off, so it's tested exhaustively: matrix legality (every cell, both directions), buffer stride math, coordinate conversions, preset sanity.
-- **Native** — runs inside Electron (a Node-built addon wouldn't even load — the ABI is the point): device probe, every API's argument validation, entity records land inside the flight shell, RGBA output is well-formed, sim steps are deterministic for a fixed seed + input stream, timings are sane.
-- **Smoke** — `electron . --smoke-test` boots the real app headless, gathers capabilities, pushes a frame end-to-end, and exits with a machine-readable verdict. One command, no excuses.
-- **CI** — GitHub Actions on Windows: full CUDA compile (the toolkit installs fine on runners; kernels compile without a GPU) + unit suite on every push. GPU-dependent suites run on real hardware and publish their numbers to the benchmark table above.
+- **Unit (47 cases, `node:test`)** — the shared protocol is the contract everything hangs off, so it's tested exhaustively: the full 27-cell matrix cross product both directions, mode 1–7 numbering checked against the legality rules from both sides, `latLonToXyz` and stride/byte math, preset shape and monotonicity, and uniqueness of every message/kind/IPC constant.
+- **Native (37 cases, under Electron)** — runs inside Electron because a Node-built addon wouldn't even load; the ABI is the point. Device probe, argument validation on every exported function, entity records landing inside the flight shell, well-formed RGBA output, sane timings — and **bit-exact determinism**: nothing in the sim path touches a clock or `rand()`, seeding is a pure hash of agent index, so two fresh `configureScene`+`step` sequences reproduce byte-identically. Asserted with strict equality against an FNV-1a hash of the raw IEEE bytes, paired with a control case proving different inputs *do* diverge, so the test cannot pass vacuously.
+- **Smoke** — `electron . --smoke-test` boots the real app headless, gathers capabilities, drives 60 REQ/FRAME cycles end-to-end, and prints one machine-readable verdict line. A load-only check once passed while the transport was completely broken, which is why it drives real frames now.
+- **The suites are mutation-tested.** Every invariant was deliberately broken — a legality rule disabled, a longitude sign flipped, preset monotonicity violated, an IPC constant duplicated, the native flight shell tightened — and each mutation was confirmed to produce failures before being reverted. A suite that cannot fail is decoration.
+- **CI** — GitHub Actions on Windows: pinned CUDA 12.9 toolkit install, typecheck, all three builds, an explicit **artifact existence + size check** (cmake-js can exit 0 without emitting the `.node`), then the unit suite. The GPU suites are deliberately excluded: runners have no NVIDIA device, and a suite that silently passes without hardware reads as coverage while testing nothing.
 
 ## Layout
 
 ```
-native/          CUDA addon: CMakeLists, Node-API surface, kernels, D3D11 presenter
-  test/          addon test suite (runs under Electron)
-src/main/        Electron main: window, capabilities, frame pump, preload
-src/renderer/    UI, scenes, WGSL compute, WebGL/WebGPU drawing, benchmark runner
-src/shared/      protocol.ts — every constant, type, and message shape; single source of truth
-test/            unit suite (node:test)
-.github/         CI: compile + unit gates on every push
+native/            CUDA addon: CMakeLists, Node-API surface, kernels, D3D11 presenter
+  test/            addon suite + smoke harness (run under Electron)
+src/main/          Electron main: window, capabilities, frame pump, preload
+  overlay-window   the full-window cutout HUD for native present modes
+src/renderer/      UI, scenes, WGSL compute, WebGL/WebGPU drawing
+  bench/           benchmark tab: plan, runner, panel, charts, schema v1 export
+  present/         cuda-blit, native-view client, WebGPU draw
+  overlay/         HUD-mode styling for the cutout window
+  scenes/          globe, weather (radar/wind/cells), storm, benchmark
+src/shared/        protocol.ts — every constant, type, and message shape; single source of truth
+test/unit/         unit suite (node:test): matrix, geometry, presets, modes
+.github/workflows/ ci.yml (compile + unit gates) · deploy-pages.yml (web demo)
+vite.config.mjs      desktop renderer build
+vite.config.web.mjs  browser build → dist-web/
 ```

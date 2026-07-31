@@ -112,6 +112,14 @@ export interface PresetsApi {
   getParams(): FidelityParams;
   getPreset(): PresetId | null;
   setPreset(key: string): void;
+  /**
+   * Force the raw params from outside without firing onChange -- the
+   * off-preset counterpart of setPreset(). The HUD overlay mirror uses it to
+   * resync this panel from a state snapshot, where the values may not match
+   * any named preset; the chips re-derive their pressed state from whether
+   * the params happen to match one.
+   */
+  setParams(next: Partial<FidelityParams>): void;
 }
 
 /**
@@ -150,7 +158,12 @@ export function createPresets(host: HTMLElement | null, opts?: PresetsOptions | 
   if (!host) {
     console.warn('[presets] host element missing; fidelity picker disabled');
     const fallback = paramsFromPreset(DEFAULT_PRESET);
-    return { getParams: () => ({ ...fallback }), getPreset: () => DEFAULT_PRESET, setPreset() {} };
+    return {
+      getParams: () => ({ ...fallback }),
+      getPreset: () => DEFAULT_PRESET,
+      setPreset() {},
+      setParams() {},
+    };
   }
 
   const initialKey = asPresetId(options.initial) ?? DEFAULT_PRESET;
@@ -351,6 +364,27 @@ export function createPresets(host: HTMLElement | null, opts?: PresetsOptions | 
       if (!id) return;
       activePreset = id;
       params = paramsFromPreset(id);
+      syncChips();
+      syncSliders();
+    },
+
+    /**
+     * Force raw params without firing onChange. Every field is validated and
+     * clamped into its slider's own range so the panel can never be pushed
+     * into showing a value the track cannot represent.
+     */
+    setParams(next) {
+      if (!next || typeof next !== 'object') return;
+
+      const merged: FidelityParams = { ...params };
+      for (const spec of SLIDERS) {
+        const v = next[spec.key];
+        if (typeof v !== 'number' || !Number.isFinite(v)) continue;
+        merged[spec.key] = Math.max(spec.min, Math.min(spec.max, Math.round(v)));
+      }
+
+      params = merged;
+      activePreset = matchPreset(params);
       syncChips();
       syncSliders();
     },

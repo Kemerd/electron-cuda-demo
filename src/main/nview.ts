@@ -38,7 +38,6 @@ import type { OkResult, SceneId } from '../shared/protocol.js';
 import { getEngine } from './capabilities.js';
 import type { CudaEngine, NativeViewStats } from './engine-types.js';
 import {
-  applyClientRect as applyOverlayRect,
   destroyOverlayWindow,
   restoreOverlayWindow,
   setOverlayParent,
@@ -247,12 +246,12 @@ function createView(win: BrowserWindow, rect: ViewRect): OkResult {
   created = true;
   lastRect = rect;
 
-  // The HUD overlay tracks the same rect in screen coordinates, so it learns
-  // about it here rather than over a second channel -- one measurement, one
-  // source, no way for the two windows to drift apart. Recording the parent at
-  // the same time means a later overlay:set already knows what to attach to.
+  // Let the overlay module know which window owns the native surface, so a
+  // later overlay:set already knows what to attach to. The full-window cutout
+  // overlay covers the whole content area and no longer tracks the native rect
+  // -- the HUD page produces the hole at exactly the stage rect because it
+  // lays out with the same stylesheet at the same window size.
   setOverlayParent(win);
-  applyOverlayRect(rect);
 
   console.log(
     '[nview] child window created at %d,%d %dx%d css (dpr %s)',
@@ -287,12 +286,6 @@ function setRect(rect: ViewRect): OkResult {
   }
 
   lastRect = rect;
-
-  // Keep the HUD overlay glued to the surface it annotates. Cheap: the overlay
-  // recomputes screen bounds and issues one setBounds, and it early-returns
-  // entirely when no overlay window exists (every non-native mode).
-  applyOverlayRect(rect);
-
   return { ok: true };
 }
 

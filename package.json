@@ -14,7 +14,11 @@
     "build:native": "cmake-js compile --runtime=electron --runtime-version=43.2.0 --arch=x64 --directory native --out native/build",
     "rebuild:native": "cmake-js rebuild --runtime=electron --runtime-version=43.2.0 --arch=x64 --directory native --out native/build",
     "clean:native": "node -e \"require('fs').rmSync('native/build',{recursive:true,force:true})\"",
-    "smoke": "npm run build:main && npm run build:renderer && electron . --smoke-test"
+    "smoke": "npm run build:main && npm run build:renderer && electron . --smoke-test",
+    "test": "npm run test:unit && npm run test:native && npm run smoke",
+    "test:unit": "node --test \"test/unit/*.test.ts\"",
+    "test:native": "electron native/test/run-tests.cjs",
+    "build:web": "vite build --config vite.config.web.mjs"
   },
   "dependencies": {
     "node-addon-api": "^8.9.0",
