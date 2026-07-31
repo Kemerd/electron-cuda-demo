@@ -2555,9 +2555,19 @@ function installPointerHandlers(): void {
     // Button maps to interaction mode: left attracts, right repels, middle vortex.
     frameState.pointer.mode = e.button === 2 ? 2 : e.button === 1 ? 3 : 1;
     // Capture so a drag that leaves the surface still reports up.
-    if (typeof host.setPointerCapture === 'function' && Number.isFinite(e.pointerId)) {
+    //
+    // The capture goes on the element the press LANDED on (normally the scene
+    // canvas), never on this ancestor. Pointer capture RETARGETS every later
+    // event of the gesture at the capturing element, and capturing here was
+    // exactly how the marker commit path died: the canvas's own pointerup
+    // listeners (globe-controls.ts -- picker release, middle-click rally,
+    // click-to-place) simply never fired again once the stage held the
+    // capture. Events dispatched on the captured canvas still BUBBLE through
+    // this element, so the stage-level tracking above loses nothing.
+    const grab: Element = e.target instanceof Element ? e.target : host;
+    if (typeof grab.setPointerCapture === 'function' && Number.isFinite(e.pointerId)) {
       try {
-        host.setPointerCapture(e.pointerId);
+        grab.setPointerCapture(e.pointerId);
       } catch {
         /* capture is a nicety, not a requirement */
       }
