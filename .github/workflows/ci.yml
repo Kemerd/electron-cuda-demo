@@ -42,7 +42,14 @@ jobs:
     name: Build and typecheck (Windows)
     # Windows is not a preference here. The addon links d3d11 and dxgi, and
     # the native view is Win32 -- there is no other platform this builds on.
-    runs-on: windows-latest
+    #
+    # Pinned to windows-2022, not windows-latest: the -latest image moved to
+    # Visual Studio 2026 (MSVC 19.51, _MSC_VER 1951), which is OUTSIDE nvcc
+    # 12.9's supported host-compiler window (1910 <= _MSC_VER < 1950) and has
+    # no CUDA build customizations, so CMake's VS generator reports "No CUDA
+    # toolset found". windows-2022 carries VS2022 -- the exact toolchain the
+    # README documents.
+    runs-on: windows-2022
     # The CUDA toolkit install is the long pole (several minutes on a cold
     # cache). 45 minutes leaves room for a slow install without letting a hung
     # job burn an hour.
