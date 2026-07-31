@@ -759,7 +759,7 @@ cudaError_t Engine::StepForView(float dtSec, cudaStream_t stream) {
 
   if (scene == SceneId::kSwarm) {
     if (d_swarm_ && swarm_count_ > 0) {
-      err = LaunchSwarmStep(d_swarm_, swarm_count_, dtSec, d_input_, stream);
+      err = LaunchSwarmStep(d_swarm_, swarm_count_, dtSec, d_input_, &host_input_, stream);
     }
   } else if (scene == SceneId::kWeather) {
     // Same ordering as Step()/RenderFrame(): the field advances first, then the
@@ -773,7 +773,7 @@ cudaError_t Engine::StepForView(float dtSec, cudaStream_t stream) {
                               stream);
     }
     if (err == cudaSuccess && d_swarm_ && swarm_count_ > 0) {
-      err = LaunchSwarmStep(d_swarm_, swarm_count_, dtSec, d_input_, stream);
+      err = LaunchSwarmStep(d_swarm_, swarm_count_, dtSec, d_input_, &host_input_, stream);
     }
   } else {
     if (d_storm_ && storm_count_ > 0) {
@@ -859,7 +859,7 @@ StepResult Engine::Step(SceneId scene, double dtMs, void* out, size_t outBytes) 
   }
 
   if (scene == SceneId::kSwarm) {
-    err = LaunchSwarmStep(d_swarm_, swarm_count_, dtSec, d_input_, sim_stream_);
+    err = LaunchSwarmStep(d_swarm_, swarm_count_, dtSec, d_input_, &host_input_, sim_stream_);
   } else if (scene == SceneId::kWeather) {
     // Weather updates the field first, then moves the agents through it.
     err = LaunchWeatherStep(d_weather_, static_cast<int>(weather_grid_ * 2u),
@@ -867,7 +867,7 @@ StepResult Engine::Step(SceneId scene, double dtMs, void* out, size_t outBytes) 
                               host_input_.weatherCoverage, d_input_,
                             sim_stream_);
     if (err == cudaSuccess) {
-      err = LaunchSwarmStep(d_swarm_, swarm_count_, dtSec, d_input_, sim_stream_);
+      err = LaunchSwarmStep(d_swarm_, swarm_count_, dtSec, d_input_, &host_input_, sim_stream_);
     }
   } else {
     err = LaunchStormStep(d_storm_, storm_count_, dtSec, d_input_, sim_stream_);
@@ -1238,7 +1238,7 @@ RenderResult Engine::RenderFrame(SceneId scene, int w, int h, double dtMs,
 
   if (scene == SceneId::kSwarm) {
     err = (d_swarm_ && swarm_count_)
-              ? LaunchSwarmStep(d_swarm_, swarm_count_, dtSec, d_input_, sim_stream_)
+              ? LaunchSwarmStep(d_swarm_, swarm_count_, dtSec, d_input_, &host_input_, sim_stream_)
               : cudaSuccess;
   } else if (scene == SceneId::kWeather) {
     if (d_weather_ && weather_grid_) {
@@ -1248,7 +1248,7 @@ RenderResult Engine::RenderFrame(SceneId scene, int w, int h, double dtMs,
                               sim_stream_);
     }
     if (err == cudaSuccess && d_swarm_ && swarm_count_) {
-      err = LaunchSwarmStep(d_swarm_, swarm_count_, dtSec, d_input_, sim_stream_);
+      err = LaunchSwarmStep(d_swarm_, swarm_count_, dtSec, d_input_, &host_input_, sim_stream_);
     }
   } else {
     err = (d_storm_ && storm_count_)

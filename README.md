@@ -16,6 +16,8 @@ Most GPU-adjacent web apps stop at three.js with the simulation on the CPU — o
 
 A 3D globe. A two-million-agent drone swarm flying live weather. Four million GPU particles bending around your cursor. Every backend switchable at runtime, with the frame-time receipts on screen.
 
+> **New to CUDA?** It's essentially **C++ with a small extension set, compiled for the GPU**. You write a function, mark it `__global__` (a "kernel"), and instead of running once it launches across tens of thousands of threads simultaneously — in this repo, one thread per drone. NVIDIA's compiler (`nvcc`) splits your source: host code builds like ordinary C++, device code becomes GPU machine code. You keep real C++ — templates, classes, the CUB/Thrust libraries — and gain the GPU-specific toolbox: shared memory, warp intrinsics, atomics, streams. The trade: it runs on NVIDIA hardware only, which is exactly why this project ships WebGPU behind the same interface as the portable fallback.
+
 ## Quick start
 
 ```bash

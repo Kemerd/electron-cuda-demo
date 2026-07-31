@@ -49,6 +49,9 @@ import {
 } from '../../../shared/protocol';
 import type { EntityFrame, FieldFrame, FrameState, Scene, SceneMountContext } from '../../types';
 import { createGlobeControls } from '../globe-controls';
+import { createMarkerField } from '../markers';
+import type { MarkerFieldApi } from '../markers';
+import { placeTarget } from '../../interaction';
 import type { GlobeControlsApi } from '../globe-controls';
 import { createDartSwarm } from '../dart-swarm';
 import type { DartSwarmApi } from '../dart-swarm';
@@ -199,6 +202,9 @@ export default function createScene(): Scene {
 
   /** Sparse "45 kt" callouts at the clustered cores. */
   let labels: KnotsLabelsApi | null = null;
+
+  /** Behavior-aware marker rings, shared with the globe scene. */
+  let markerField: MarkerFieldApi | null = null;
 
   /**
    * Grid spec handed to the analyzer. Mutated in place every rebuild rather
@@ -862,7 +868,20 @@ export default function createScene(): Scene {
       // everything flying inside it, radar and darts alike.
       scene.add(earth.atmosphere);
 
-      rig = createGlobeControls(renderer.domElement);
+      // Markers ride above every field layer -- they are the interaction
+      // surface and must never be buried under a red radar cell.
+      markerField = createMarkerField();
+      markerField.addTo(scene);
+
+      // Same rig, same gesture state machine, same behaviors as the globe
+      // scene: CONTRACTS section 8 puts the marker system on BOTH globe
+      // scenes, and the swarm flying this weather obeys the same commands.
+      rig = createGlobeControls(renderer.domElement, {
+        onPlaceTarget: (pos, behavior) => {
+          if (!lastState) return;
+          placeTarget(lastState.input, pos, behavior);
+        },
+      });
 
       console.log('[weather] EFB radar scene mounted');
     },
@@ -878,6 +897,9 @@ export default function createScene(): Scene {
       // The label layer owns its atlas texture, so it must release it before
       // the generic scene traversal below only gets as far as geometry+material.
       if (labels) labels.dispose();
+      // Its eight meshes share one geometry; disposing here keeps that
+      // ownership explicit rather than leaving it to the traversal below.
+      if (markerField) markerField.dispose();
       if (fieldTexture) fieldTexture.dispose();
 
       if (scene) {
@@ -914,6 +936,7 @@ export default function createScene(): Scene {
       radarMaterial = null;
       cells = null;
       labels = null;
+      markerField = null;
       uHasField = null;
       fieldTexture = null;
       fieldData = null;
@@ -1049,6 +1072,9 @@ export default function createScene(): Scene {
         lastVectorBuildMs = now;
         rebuildVectors();
       }
+
+      // Markers animate on the scene clock, same as the globe scene's.
+      if (markerField) markerField.update(state ? state.input : null, timeSec);
 
       renderer.render(scene, rig.camera);
     },

@@ -45,19 +45,40 @@
  *  Uniforms
  * =================================================================== */
 
-// One rally point. Mirrors TargetUniform in common.cuh / TargetPoint in
+// One placed marker. Mirrors TargetUniform in common.cuh / TargetPoint in
 // protocol.ts. std140-ish padding: vec3 in a uniform array must be padded to
-// 16 bytes, so position and strength share one vec4 and ttl gets its own.
+// 16 bytes, so position and strength share one vec4 and the marker scalars
+// occupy the second. The behavior arrives as a float because a uniform vec4
+// cannot mix types -- it is written from an integer and compared against the
+// kBehavior* constants below, so the round trip is exact.
 struct Target {
   posStrength : vec4<f32>,   // xyz = world position, w = strength
-  ttlPad      : vec4<f32>,   // x = ttl seconds, yzw unused
+  ttlPad      : vec4<f32>,   // x = ttl seconds, y = behavior, z = id, w unused
 };
+
+// Behavior enum, mirroring GS_BEHAVIOR_* in native/src/kernels/common.cuh.
+// Ultimately sourced from TARGET_BEHAVIOR in protocol.ts, which names the
+// strings; the integers are the native mirror's contract and webgpu-source.ts
+// maps the strings onto them exactly as addon.cc does.
+const kBehaviorRally        : f32 = 0.0;
+const kBehaviorAvoid        : f32 = 1.0;
+const kBehaviorVortex       : f32 = 2.0;
+const kBehaviorShootThrough : f32 = 3.0;
+
+// Marker fade window, seconds. protocol.ts: MARKER_FADE_SEC = 2.
+const kMarkerFadeSec : f32 = 2.0;
+// Shoot-through capture radius in world units. common.cuh:
+// GS_MARKER_CAPTURE_RADIUS = 0.02.
+const kMarkerCaptureRadius : f32 = 0.02;
 
 // Per-frame uniform block. Mirrors InputUniforms, trimmed to the fields the
 // swarm solver actually reads -- the storm-only members would just waste
 // uniform bandwidth here.
 struct SwarmUniforms {
-  // x = agent count, y = target count, z = wind-field enabled (0/1), w unused
+  // x = agent count, y = target count, z = wind-field enabled (0/1),
+  // w = visited-bit clear mask: bit t set means marker slot t was recycled
+  //     this frame (its TargetPoint.id changed) and its stale shoot-through
+  //     bits must be dropped before the forces read them.
   counts      : vec4<u32>,
   // x = dt seconds, y = scene clock, z/w unused
   timing      : vec4<f32>,
@@ -97,6 +118,17 @@ struct SwarmUniforms {
 @group(0) @binding(8) var windField   : texture_2d<f32>;
 @group(0) @binding(9) var windSampler : sampler;
 
+// Shoot-through memory: one u32 per agent, bit t = "this agent has already
+// passed through marker slot t". Each agent owns its own word exclusively, so
+// plain (non-atomic) loads and stores are safe -- no two invocations ever
+// touch the same element. Mirrors SwarmScratch::visited in swarm.cu.
+//
+// Slot recycling is handled by U.clearMask rather than a separate clearing
+// pass: the CUDA side gets a dedicated tiny kernel because its launcher can
+// cheaply issue one, whereas here folding the clear into the force pass avoids
+// a second pipeline and an extra dispatch per frame for the same result.
+@group(0) @binding(10) var<storage, read_write> visited : array<u32>;
+
 /* =================================================================== *
  *  Tunables -- mirrored from native/src/kernels/swarm.cu
  * =================================================================== */
@@ -112,6 +144,9 @@ const kCohesionWeight    : f32 = 0.55;
 
 const kTargetWeight      : f32 = 3.2;
 const kTargetReachDot    : f32 = 0.25;
+
+const kVortexSwirl       : f32 = 4.6;
+const kVortexPullFrac    : f32 = 0.35;
 
 const kWindWeight        : f32 = 1.8;
 
@@ -711,6 +746,18 @@ fn force(@builtin(global_invocation_id) gid : vec3<u32>) {
   /* --- targets ---------------------------------------------------------- */
   let radial = safeNormalize(pos);
 
+  // Shoot-through memory for this agent. Recycled slots are cleared here, on
+  // the way in, so the rest of the loop can trust every surviving bit.
+  //
+  // visitedStored is what is currently IN the buffer, which is what the
+  // write-back compares against -- comparing against the post-clear value
+  // instead would let a clear that captures nothing evaporate, leaving stale
+  // bits in memory for the next frame to read back.
+  let hasVisited = i < arrayLength(&visited);
+  var visitedStored : u32 = 0u;
+  if (hasVisited) { visitedStored = visited[i]; }
+  var visitedWord = visitedStored & ~U.counts.w;
+
   let nTargets = min(U.counts.y, MAX_TARGETS);
   for (var t : u32 = 0u; t < nTargets; t = t + 1u) {
     let tgt = U.targets[t];
@@ -729,17 +776,59 @@ fn force(@builtin(global_invocation_id) gid : vec3<u32>) {
     let reach = smoothstepf(kTargetReachDot, 1.0, facing);
     if (reach <= 0.0) { continue; }
 
-    // Fade the pull out as the target expires, so formations dissolve rather
-    // than snapping apart the instant ttl crosses zero.
-    let ttlFade = smoothstepf(0.0, 0.75, ttl);
+    // Fade the influence out over the marker's final seconds so the force dies
+    // in lockstep with the visual fade -- "no popping" covers behaviour too.
+    let ttlFade = smoothstepf(0.0, kMarkerFadeSec, ttl);
 
-    // Steer along the shell toward the target, not straight at it -- a direct
+    // Steer along the shell toward the marker, not straight at it -- a direct
     // pull would drive agents into the globe surface.
     let toTarget = tdir * ac.altitude - pos;
     let len2 = dot(toTarget, toTarget);
     if (len2 < 1e-12) { continue; }
 
-    accel = accel + toTarget * (tgt.posStrength.w * kTargetWeight * reach * ttlFade * inverseSqrt(len2));
+    let invLen = inverseSqrt(len2);
+    // Common scalar for every behavior: marker weight x angular falloff x TTL
+    // fade. Behaviors differ only in the direction they apply it in.
+    let gain = tgt.posStrength.w * kTargetWeight * reach * ttlFade;
+    let behavior = tgt.ttlPad.y;
+
+    if (behavior == kBehaviorAvoid) {
+      // Same falloff as rally with the sign flipped.
+      accel = accel - toTarget * (gain * invLen);
+
+    } else if (behavior == kBehaviorVortex) {
+      // Swirl about the marker's radial axis; the cross product degenerates
+      // only when the agent sits exactly on that axis.
+      let tangent = cross(tdir, toTarget);
+      let tanLen2 = dot(tangent, tangent);
+      if (tanLen2 > 1e-12) {
+        accel = accel + tangent * (gain * kVortexSwirl * inverseSqrt(tanLen2));
+      }
+      // Mild centripetal term so agents orbit instead of spiralling away.
+      accel = accel + toTarget * (gain * kVortexPullFrac * invLen);
+
+    } else if (behavior == kBehaviorShootThrough) {
+      let bit = 1u << t;
+      // Already passed through: no force, momentum carries the agent onward.
+      if ((visitedWord & bit) == 0u) {
+        let dist = len2 * invLen;              // == sqrt(len2)
+        if (dist <= kMarkerCaptureRadius) {
+          visitedWord = visitedWord | bit;     // captured: release from here on
+        } else {
+          accel = accel + toTarget * (gain * invLen);
+        }
+      }
+
+    } else {
+      // Rally, and the safe landing spot for an unrecognised behavior value.
+      accel = accel + toTarget * (gain * invLen);
+    }
+  }
+
+  // Write back only when the word actually differs from what is in memory, so
+  // a steady frame (no recycling, no capture) stores nothing at all.
+  if (hasVisited && visitedWord != visitedStored) {
+    visited[i] = visitedWord;
   }
 
   /* --- wind advection ---------------------------------------------------- */

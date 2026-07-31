@@ -83,6 +83,44 @@
 /** Concurrent click shockwaves in the storm scene. protocol.js: MAX_SHOCKWAVES = 8. */
 #define GS_MAX_SHOCKWAVES 8
 
+/* ---------------------------------------------------------------------- *
+ *  Marker behaviors - mirrors TARGET_BEHAVIOR in src/shared/protocol.ts.
+ *
+ *  protocol.ts carries these as STRINGS ('rally' | 'avoid' | 'vortex' |
+ *  'shootThrough'); addon.cc maps the string to the integer below once, at
+ *  parse time, so the kernels compare ints instead of chasing chars. The
+ *  numbering is this file's own contract with addon.cc - protocol.ts does not
+ *  name the integers, so it must not be reordered casually.
+ * ---------------------------------------------------------------------- */
+
+/** Converge and hold - the original attraction force. Also the fallback for
+ *  an absent/unrecognised behavior string, matching the doc's "missing ->
+ *  rally" rule. */
+#define GS_BEHAVIOR_RALLY 0
+/** Repulsion: identical falloff to rally with the sign flipped. */
+#define GS_BEHAVIOR_AVOID 1
+/** Tangential swirl about the marker's radial axis plus a mild centripetal
+ *  pull, so agents orbit the marker instead of escaping it. */
+#define GS_BEHAVIOR_VORTEX 2
+/** Attraction that releases once the agent has passed within the capture
+ *  radius; the per-agent visited bit for the slot remembers that it did. */
+#define GS_BEHAVIOR_SHOOT_THROUGH 3
+
+/** Marker lifetime defaults. protocol.ts: MARKER_TTL_DEFAULT_SEC = 10,
+ *  MARKER_FADE_SEC = 2. Only the fade window is read by the kernels (the TTL
+ *  itself is counted down renderer-side and arrives per frame), but both are
+ *  mirrored so the pair stays legible next to each other. */
+#define GS_MARKER_TTL_DEFAULT_SEC 10.0f
+#define GS_MARKER_FADE_SEC 2.0f
+
+/**
+ * Shoot-through capture radius, as a fraction of the marker's influence
+ * reach. The spec calls for "~0.02R"; on the unit globe that is 0.02 world
+ * units of arc from the marker centre, which is where an agent counts as
+ * having passed through and gets its visited bit set.
+ */
+#define GS_MARKER_CAPTURE_RADIUS 0.02f
+
 /** Unit-sphere globe. protocol.js: GLOBE_RADIUS = 1.0. */
 #define GS_GLOBE_RADIUS 1.0f
 
@@ -126,12 +164,29 @@ __host__ __device__ __forceinline__ int gsDivUp(int n, int d) {
 
 namespace geoswarm {
 
-/** @brief One swarm rally point. Mirrors InputState.targets[i]. */
+/**
+ * @brief One placed marker. Mirrors InputState.targets[i] (TargetPoint).
+ *
+ * Still exactly 32 bytes: @c behavior and @c id claim two of the three former
+ * padding slots, so the uniform block's layout - and every offset the WGSL
+ * mirror and the raster pass depend on - is unchanged by the marker work.
+ */
 struct TargetUniform {
   float pos[3];    ///< world-space position (globe = unit sphere at origin)
-  float strength;  ///< attraction weight; negative repels
+  float strength;  ///< force weight; the behavior decides the sign/shape
   float ttl;       ///< remaining lifetime in seconds; <= 0 means inactive
-  float _pad[3];   ///< keeps the struct at 32 bytes / 8-float alignment
+  int   behavior;  ///< one of GS_BEHAVIOR_*; parsed from the protocol string
+  /**
+   * Monotonic placement id from TargetPoint.id, doubling as the slot
+   * generation key. When the value in a slot changes, the slot was reused for
+   * a different marker, and the shoot-through visited bits recorded against
+   * that slot are stale - the engine notices the change and runs the clearing
+   * kernel exactly once. Stored as a float because the uniform block is a
+   * float-addressed mirror on the WGSL side; ids stay well inside the 2^24
+   * range a float indexes exactly.
+   */
+  float id;
+  float _pad[1];   ///< keeps the struct at 32 bytes / 8-float alignment
 };
 
 /** @brief One expanding click shockwave. Mirrors InputState.shockwaves[i]. */

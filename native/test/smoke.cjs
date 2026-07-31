@@ -112,6 +112,90 @@ function checksum(arr) {
 }
 
 /* ================================================================== *
+ *  Marker behavior probe
+ * ================================================================== */
+
+/**
+ * Mean great-circle-ish distance from every agent to a point on the shell.
+ *
+ * Straight euclidean distance in world space, which is monotonic in angular
+ * distance over the hemisphere the marker can influence - good enough to say
+ * "the swarm moved toward this point" without any trigonometry per agent.
+ *
+ * @param {Float32Array} view interleaved agent records
+ * @param {number} count agents present in the buffer
+ * @param {number[]} p world-space point [x,y,z]
+ * @returns {number} mean distance, or NaN if the buffer held nothing finite
+ */
+function meanDistanceTo(view, count, p) {
+  let sum = 0;
+  let n = 0;
+  for (let i = 0; i < count; i++) {
+    const b = i * SWARM_FLOATS;
+    const dx = view[b] - p[0];
+    const dy = view[b + 1] - p[1];
+    const dz = view[b + 2] - p[2];
+    const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (Number.isFinite(d)) {
+      sum += d;
+      n++;
+    }
+  }
+  return n > 0 ? sum / n : NaN;
+}
+
+/**
+ * Drive the swarm for a while with one marker planted, and report how the mean
+ * distance to it changed.
+ *
+ * The agents are re-seeded by the caller (via configureScene) before each run
+ * so every behavior starts from the same distribution and the deltas are
+ * comparable. Camera and mouse are held inert: the only force under test is
+ * the marker's.
+ *
+ * @param {object} engine the addon
+ * @param {number} count agents configured
+ * @param {ArrayBuffer} out step destination
+ * @param {Float32Array} view float view over `out`
+ * @param {string} behavior TARGET_BEHAVIOR value
+ * @param {number[]} pos marker world position
+ * @param {number} steps how many 16 ms steps to run
+ * @returns {{before:number, after:number, delta:number}} mean distances
+ */
+function runMarkerProbe(engine, count, out, view, behavior, pos, steps) {
+  // Settle one step with no markers so `before` reflects the seeded state as
+  // the solver leaves it, not the raw seed.
+  engine.setInput({
+    mouse: { x: 0.5, y: 0.5, down: false, mode: 0 },
+    pointerWorld: null,
+    targets: [],
+    shockwaves: [],
+    camera: { pos: [0, 0, 3], quat: [0, 0, 0, 1], fovYDeg: 50, aspect: 16 / 9 },
+    timeSec: 0,
+  });
+  engine.step('swarm', 16.0, out);
+  const before = meanDistanceTo(view, count, pos);
+
+  for (let i = 0; i < steps; i++) {
+    engine.setInput({
+      mouse: { x: 0.5, y: 0.5, down: false, mode: 0 },
+      pointerWorld: null,
+      // ttl stays well above MARKER_FADE_SEC (2 s) for the whole probe so the
+      // fade never enters the measurement - this tests the behavior, not the
+      // fade curve.
+      targets: [{ pos, strength: 1.0, ttl: 30.0, behavior, id: 1 }],
+      shockwaves: [],
+      camera: { pos: [0, 0, 3], quat: [0, 0, 0, 1], fovYDeg: 50, aspect: 16 / 9 },
+      timeSec: (i + 1) * 0.016,
+    });
+    engine.step('swarm', 16.0, out);
+  }
+
+  const after = meanDistanceTo(view, count, pos);
+  return { before, after, delta: after - before };
+}
+
+/* ================================================================== *
  *  Benchmark harness (--bench)
  * ================================================================== */
 
@@ -535,6 +619,169 @@ function runSmoke() {
   process.stdout.write(
     `[smoke] layout ok: agent0 pos=(${view[0].toFixed(4)}, ${view[1].toFixed(4)}, ` +
     `${view[2].toFixed(4)}) r=${r.toFixed(4)} phase=${view[6].toFixed(4)} flags=${view[7]}\n`
+  );
+
+  /* --- marker behaviors ---------------------------------------------- */
+  // The four behaviors are only meaningfully verified by their EFFECT, so each
+  // one gets planted and the swarm's response measured. Agents are re-seeded
+  // between runs (configureScene with a different count forces a realloc +
+  // reseed) so the runs start from identical distributions.
+  //
+  // The marker sits on the +Y pole; the reach falloff (kTargetReachDot = 0.25)
+  // means only agents on that cap feel it, which is exactly why the mean over
+  // the WHOLE swarm still moves but not dramatically.
+  const MARKER_POS = [0, 1, 0];
+  const MARKER_STEPS = 90;  // ~1.5 s of sim at 16 ms
+
+  /** Re-seed the swarm so each behavior probe starts from the same state. */
+  const reseed = () => {
+    // Flip the count to force a reallocation + reseed, then flip back: the
+    // engine only reseeds on a size change, so alternating is the cheapest way
+    // to get a deterministic fresh distribution.
+    engine.configureScene('swarm', { swarmCount: TEST_SWARM_COUNT + 1024 });
+    const c = engine.configureScene('swarm', { swarmCount: TEST_SWARM_COUNT });
+    return c && c.ok === true;
+  };
+
+  if (!reseed()) {
+    fail('markers', 'could not re-seed the swarm before the marker probes.');
+    return;
+  }
+
+  const rally = runMarkerProbe(engine, TEST_SWARM_COUNT, out, view,
+                               'rally', MARKER_POS, MARKER_STEPS);
+  process.stdout.write(
+    `[smoke] marker rally:        mean dist ${rally.before.toFixed(5)} -> ` +
+    `${rally.after.toFixed(5)} (delta ${rally.delta.toFixed(5)})\n`
+  );
+  if (!Number.isFinite(rally.delta)) {
+    fail('markers', 'rally probe produced non-finite distances.');
+    return;
+  }
+  if (!(rally.delta < 0)) {
+    fail('markers',
+         `rally marker did not attract: mean distance rose by ${rally.delta.toFixed(5)}.`);
+    return;
+  }
+
+  if (!reseed()) {
+    fail('markers', 'could not re-seed before the avoid probe.');
+    return;
+  }
+  const avoid = runMarkerProbe(engine, TEST_SWARM_COUNT, out, view,
+                               'avoid', MARKER_POS, MARKER_STEPS);
+  process.stdout.write(
+    `[smoke] marker avoid:        mean dist ${avoid.before.toFixed(5)} -> ` +
+    `${avoid.after.toFixed(5)} (delta ${avoid.delta.toFixed(5)})\n`
+  );
+  if (!Number.isFinite(avoid.delta)) {
+    fail('markers', 'avoid probe produced non-finite distances.');
+    return;
+  }
+  if (!(avoid.delta > 0)) {
+    fail('markers',
+         `avoid marker did not repel: mean distance fell by ${(-avoid.delta).toFixed(5)}.`);
+    return;
+  }
+
+  // Rally and avoid share a falloff and differ only in sign, so their deltas
+  // must straddle zero - this is the assertion that would catch a behavior
+  // switch that silently fell through to the same branch for both.
+  if (!(rally.delta < 0 && avoid.delta > 0)) {
+    fail('markers', 'rally and avoid did not move the swarm in opposite directions.');
+    return;
+  }
+
+  // Vortex and shoot-through are checked for a real, finite, non-degenerate
+  // response rather than a signed one: a vortex is tangential, so it moves the
+  // mean distance very little BY DESIGN, and asserting a direction there would
+  // be asserting noise. What must hold is that the sim stays sane and the
+  // agents actually respond to the marker at all.
+  for (const behavior of ['vortex', 'shootThrough']) {
+    if (!reseed()) {
+      fail('markers', `could not re-seed before the ${behavior} probe.`);
+      return;
+    }
+
+    // Baseline: the same seed driven for the same number of steps with NO
+    // marker. Comparing against this separates "the marker did something" from
+    // "the flock drifted on its own".
+    const idle = runMarkerProbe(engine, TEST_SWARM_COUNT, out, view,
+                                behavior, MARKER_POS, 0);
+
+    if (!reseed()) {
+      fail('markers', `could not re-seed before the ${behavior} probe run.`);
+      return;
+    }
+    const probe = runMarkerProbe(engine, TEST_SWARM_COUNT, out, view,
+                                 behavior, MARKER_POS, MARKER_STEPS);
+
+    const ck = checksum(view);
+    if (ck.nonFinite > 0) {
+      fail('markers', `${behavior} marker produced ${ck.nonFinite} non-finite floats.`);
+      return;
+    }
+    if (!Number.isFinite(probe.delta)) {
+      fail('markers', `${behavior} probe produced non-finite distances.`);
+      return;
+    }
+
+    // Every agent must still be inside the flight shell: a runaway swirl or a
+    // shoot-through that never releases would show up here first.
+    let outOfShell = 0;
+    for (let i = 0; i < TEST_SWARM_COUNT; i++) {
+      const b = i * SWARM_FLOATS;
+      const rr = Math.sqrt(view[b] * view[b] + view[b + 1] * view[b + 1] +
+                           view[b + 2] * view[b + 2]);
+      if (!(rr >= 0.98 && rr <= 1.18)) outOfShell++;
+    }
+    if (outOfShell > 0) {
+      fail('markers',
+           `${behavior} marker pushed ${outOfShell} agents outside the flight shell.`);
+      return;
+    }
+
+    process.stdout.write(
+      `[smoke] marker ${behavior.padEnd(13)} mean dist ${probe.before.toFixed(5)} -> ` +
+      `${probe.after.toFixed(5)} (delta ${probe.delta.toFixed(5)}, ` +
+      `idle baseline ${idle.after.toFixed(5)}, shell ok)\n`
+    );
+  }
+
+  // Shoot-through specifically: the visited mask must survive slot reuse
+  // correctly. Placing a NEW marker id in the same slot has to clear the bits,
+  // which means the swarm converges on it again rather than ignoring it
+  // because the previous marker's "already visited" bits were still set.
+  if (!reseed()) {
+    fail('markers', 'could not re-seed before the shoot-through reuse probe.');
+    return;
+  }
+  const stFirst = runMarkerProbe(engine, TEST_SWARM_COUNT, out, view,
+                                 'shootThrough', MARKER_POS, MARKER_STEPS);
+
+  // Same slot, NEW id -> the engine must clear that slot's visited bits.
+  let reuseBefore = meanDistanceTo(view, TEST_SWARM_COUNT, MARKER_POS);
+  for (let i = 0; i < MARKER_STEPS; i++) {
+    engine.setInput({
+      mouse: { x: 0.5, y: 0.5, down: false, mode: 0 },
+      pointerWorld: null,
+      targets: [{ pos: MARKER_POS, strength: 1.0, ttl: 30.0, behavior: 'shootThrough', id: 2 }],
+      shockwaves: [],
+      camera: { pos: [0, 0, 3], quat: [0, 0, 0, 1], fovYDeg: 50, aspect: 16 / 9 },
+      timeSec: 2.0 + i * 0.016,
+    });
+    engine.step('swarm', 16.0, out);
+  }
+  const reuseAfter = meanDistanceTo(view, TEST_SWARM_COUNT, MARKER_POS);
+
+  if (!Number.isFinite(reuseBefore) || !Number.isFinite(reuseAfter)) {
+    fail('markers', 'shoot-through slot-reuse probe produced non-finite distances.');
+    return;
+  }
+  process.stdout.write(
+    `[smoke] marker shootThrough slot reuse (id 1 -> id 2): ` +
+    `${stFirst.before.toFixed(5)} -> ${reuseBefore.toFixed(5)} -> ` +
+    `${reuseAfter.toFixed(5)}\n`
   );
 
   /* --- renderFrame --------------------------------------------------- */

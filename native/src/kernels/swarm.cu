@@ -111,6 +111,16 @@ constexpr float kTargetWeight = 3.2f;
  *  globe should not drag agents through the core. */
 constexpr float kTargetReachDot = 0.25f;
 
+/** Tangential swirl rate for GS_BEHAVIOR_VORTEX. Tuned against kTargetWeight:
+ *  strong enough to read as a distinct orbit within a second or two, not so
+ *  strong that the speed clamp saturates and the ring degenerates into a
+ *  uniform blur. */
+constexpr float kVortexSwirl = 4.6f;
+/** Centripetal component of the vortex, as a fraction of kVortexSwirl. Without
+ *  it the tangential push alone would spiral agents outward until the reach
+ *  falloff released them; this is what makes them ORBIT rather than escape. */
+constexpr float kVortexPullFrac = 0.35f;
+
 /** Wind advection strength when the weather scene supplies a field. */
 constexpr float kWindWeight = 1.8f;
 
@@ -482,6 +492,10 @@ __device__ __forceinline__ void SampleWind(const unsigned char* __restrict__ fie
  * @param cellEnd     per-cell one-past-last sorted slot
  * @param windField   RGBA8 equirect wind field, null outside the weather scene
  * @param windW,windH wind field dimensions
+ * @param visited     per-agent shoot-through bitmask, one u32 per agent (bit t
+ *                    = "passed through marker slot t"). May be null, in which
+ *                    case shoot-through markers simply behave as rally points
+ *                    rather than crashing.
  */
 __global__ __launch_bounds__(GS_BLOCK_1D)
 void SwarmForceKernel(float* __restrict__ records, unsigned int count, float dtSec,
@@ -490,7 +504,8 @@ void SwarmForceKernel(float* __restrict__ records, unsigned int count, float dtS
                       const float4* __restrict__ sortedVel,
                       const unsigned int* __restrict__ cellStart,
                       const unsigned int* __restrict__ cellEnd,
-                      const unsigned char* __restrict__ windField, int windW, int windH) {
+                      const unsigned char* __restrict__ windField, int windW, int windH,
+                      unsigned int* __restrict__ visited) {
   const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= count) return;
 
@@ -627,6 +642,13 @@ void SwarmForceKernel(float* __restrict__ records, unsigned int count, float dtS
 
   if (input) {
     const int nTargets = min(input->targetCount, GS_MAX_TARGETS);
+
+    // The agent's shoot-through memory: one bit per marker slot. Read once
+    // into a register, written back only if this step captures something, so
+    // the common case costs a single load and no store at all.
+    const unsigned int visitedWord = visited ? visited[i] : 0u;
+    unsigned int visitedNext = visitedWord;
+
     for (int t = 0; t < nTargets; ++t) {
       const TargetUniform& tgt = input->targets[t];
       if (tgt.ttl <= 0.0f) continue;  // expired
@@ -642,20 +664,81 @@ void SwarmForceKernel(float* __restrict__ records, unsigned int count, float dtS
       const float reach = gsSmoothstep(kTargetReachDot, 1.0f, facing);
       if (reach <= 0.0f) continue;
 
-      // Fade the pull out as the target expires so formations dissolve rather
-      // than snapping apart the instant ttl crosses zero.
-      const float ttlFade = gsSmoothstep(0.0f, 0.75f, tgt.ttl);
+      // Fade the influence out over the marker's final GS_MARKER_FADE_SEC so
+      // the force dies in lockstep with the visual fade - the spec's "no
+      // popping" rule applies to what agents do, not just to what is drawn.
+      const float ttlFade = gsSmoothstep(0.0f, GS_MARKER_FADE_SEC, tgt.ttl);
 
-      // Steer along the shell toward the target, not straight at it - a direct
+      // Steer along the shell toward the marker, not straight at it - a direct
       // pull would drive agents into the globe surface.
       const float3 toTarget = gsSub(gsScale(tdir, altitude), pos);
       const float len2 = gsDot(toTarget, toTarget);
       if (len2 < 1e-12f) continue;
 
-      accel = gsAdd(accel, gsScale(toTarget,
-                                   tgt.strength * kTargetWeight * reach * ttlFade *
-                                       gsRsqrt(len2)));
+      const float invLen = gsRsqrt(len2);
+      // Common scalar for every behavior: marker weight x angular falloff x
+      // TTL fade. Behaviors differ in the DIRECTION they apply it in, which is
+      // what keeps them visually comparable at equal strength.
+      const float gain = tgt.strength * kTargetWeight * reach * ttlFade;
+
+      switch (tgt.behavior) {
+        case GS_BEHAVIOR_AVOID: {
+          // Same falloff as rally, sign flipped. Nothing else changes, so a
+          // marker flipped from rally to avoid pushes exactly as hard as it
+          // used to pull.
+          accel = gsSub(accel, gsScale(toTarget, gain * invLen));
+          break;
+        }
+
+        case GS_BEHAVIOR_VORTEX: {
+          // Swirl about the marker's RADIAL axis (the globe normal under the
+          // marker). Tangent = axis x offset gives the circulation direction;
+          // it degenerates only when the agent sits exactly on the axis, which
+          // the length guard below catches.
+          const float3 tangent = gsCross(tdir, toTarget);
+          const float tanLen2 = gsDot(tangent, tangent);
+          if (tanLen2 > 1e-12f) {
+            accel = gsAdd(accel, gsScale(tangent, gain * kVortexSwirl * gsRsqrt(tanLen2)));
+          }
+          // Mild centripetal pull so the orbit is bounded: pure tangential
+          // acceleration would spiral agents outward until reach released them.
+          accel = gsAdd(accel, gsScale(toTarget, gain * kVortexPullFrac * invLen));
+          break;
+        }
+
+        case GS_BEHAVIOR_SHOOT_THROUGH: {
+          const unsigned int bit = 1u << t;
+
+          // Already passed through this marker: no force at all. Momentum
+          // carries the agent onward, which is the whole point of the behavior.
+          if (visitedWord & bit) break;
+
+          // Distance to the marker along the shell. Inside the capture radius
+          // the agent counts as having passed through: set the bit and stop
+          // pulling from this step on.
+          const float dist = len2 * invLen;  // len2 * rsqrt(len2) == sqrt(len2)
+          if (dist <= GS_MARKER_CAPTURE_RADIUS) {
+            visitedNext |= bit;
+            break;
+          }
+
+          accel = gsAdd(accel, gsScale(toTarget, gain * invLen));
+          break;
+        }
+
+        case GS_BEHAVIOR_RALLY:
+        default: {
+          // Rally, and the safe landing spot for any behavior integer this
+          // build does not know about.
+          accel = gsAdd(accel, gsScale(toTarget, gain * invLen));
+          break;
+        }
+      }
     }
+
+    // One conditional store per agent per step, taken only on the frame it
+    // actually captures a marker.
+    if (visited && visitedNext != visitedWord) visited[i] = visitedNext;
   }
 
   /* --- wind advection -------------------------------------------------- */
@@ -768,6 +851,26 @@ void SwarmForceKernel(float* __restrict__ records, unsigned int count, float dtS
   // rec[7] (flags/type) is seeded once and never touched by the step.
 }
 
+/**
+ * @brief Clear the shoot-through visited bits for a set of marker slots.
+ *
+ * Runs when a slot's TargetPoint.id changes - i.e. the slot was recycled for a
+ * different marker, so the "already passed through" memory recorded against it
+ * belongs to a marker that no longer exists. One tiny kernel over the swarm
+ * beats clearing the whole mask, because unrelated slots must keep their bits.
+ *
+ * @param visited   per-agent bitmask, one u32 per agent
+ * @param count     agent count
+ * @param clearMask bits to clear; bit t set means "slot t was recycled"
+ */
+__global__ __launch_bounds__(GS_BLOCK_1D)
+void SwarmClearVisitedKernel(unsigned int* __restrict__ visited, unsigned int count,
+                             unsigned int clearMask) {
+  const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= count) return;
+  visited[i] &= ~clearMask;
+}
+
 /* ===================================================================== *
  *  Host-side scratch buffers
  *
@@ -789,6 +892,22 @@ struct SwarmScratch {
   void* cubTemp = nullptr;           ///< CUB's own temp storage
   size_t cubTempBytes = 0;
   uint32_t capacity = 0;             ///< agents the above arrays can hold
+
+  /**
+   * Shoot-through visited bits: one u32 per agent, bit t = "this agent has
+   * passed through marker slot t". 8 MB at the 2M-agent ultra preset - small
+   * next to the 64 MB record buffer, and each agent owns its word exclusively
+   * so no atomics are needed to maintain it.
+   */
+  unsigned int* visited = nullptr;
+
+  /**
+   * Last TargetPoint.id observed in each marker slot, host-side. Comparing
+   * against the incoming ids is what detects slot reuse; the ids themselves
+   * live in device memory inside InputUniforms, so the engine keeps this
+   * host mirror updated from the host copy of the uniform block.
+   */
+  float lastTargetId[GS_MAX_TARGETS] = {};
 };
 
 /** Single instance. Only ever touched from the launcher, which the engine
@@ -806,6 +925,7 @@ void FreeScratch() {
   if (g_scratch.sortedPos) cudaFree(g_scratch.sortedPos);
   if (g_scratch.sortedVel) cudaFree(g_scratch.sortedVel);
   if (g_scratch.cubTemp) cudaFree(g_scratch.cubTemp);
+  if (g_scratch.visited) cudaFree(g_scratch.visited);
   g_scratch = SwarmScratch{};
   // Swallow any error the frees raised - this runs on teardown paths where
   // there is nobody left to report to.
@@ -845,6 +965,16 @@ cudaError_t EnsureScratch(uint32_t count, cudaStream_t stream) {
   const size_t vecBytes = static_cast<size_t>(count) * sizeof(float4);
   CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&g_scratch.sortedPos), vecBytes));
   CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&g_scratch.sortedVel), vecBytes));
+
+  // Visited bits start clear: a freshly sized swarm has passed through
+  // nothing. cudaMemset (not Async) because this runs on the allocation path,
+  // not per frame, and the following launches must observe zeroes.
+  CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&g_scratch.visited), idxBytes));
+  CUDA_CHECK(cudaMemset(g_scratch.visited, 0, idxBytes));
+
+  // The mask was just reset wholesale, so no slot's history survives - forget
+  // the ids too, or the first frame after a resize would skip a needed clear.
+  for (int t = 0; t < GS_MAX_TARGETS; ++t) g_scratch.lastTargetId[t] = 0.0f;
 
   // Query CUB's temp requirement with a null temp pointer - the documented way
   // to size the allocation. The bit range must match the real call exactly or
@@ -890,7 +1020,8 @@ cudaError_t LaunchSwarmSeed(float* records, uint32_t count, cudaStream_t stream)
 }
 
 cudaError_t LaunchSwarmStep(float* records, uint32_t count, float dtSec,
-                            const InputUniforms* input, cudaStream_t stream) {
+                            const InputUniforms* input, const InputUniforms* hostInput,
+                            cudaStream_t stream) {
   if (!records) {
     fprintf(stderr, "[cuda_engine] LaunchSwarmStep: null record buffer.\n");
     return cudaErrorInvalidValue;
@@ -912,6 +1043,34 @@ cudaError_t LaunchSwarmStep(float* records, uint32_t count, float dtSec,
   CUDA_CHECK(EnsureScratch(count, stream));
 
   const int blocks = gsDivUp(static_cast<int>(count), GS_BLOCK_1D);
+
+  /* --- 0. marker slot generations -------------------------------------- */
+  // A slot whose TargetPoint.id changed is a different marker than the one the
+  // visited bits were recorded against, so those bits are stale and have to go
+  // before this frame's forces read them. Every changed slot is folded into a
+  // single mask, so slot churn costs at most one tiny kernel per frame - and
+  // nothing at all in the overwhelmingly common case where nothing changed.
+  if (hostInput && g_scratch.visited) {
+    unsigned int clearMask = 0u;
+    const int nTargets = min(hostInput->targetCount, GS_MAX_TARGETS);
+
+    for (int t = 0; t < GS_MAX_TARGETS; ++t) {
+      // Slots past the live count are treated as empty (id 0), so retiring a
+      // marker also retires its bits - otherwise a later marker landing in the
+      // same slot could inherit them via a coincidental id match.
+      const float id = (t < nTargets) ? hostInput->targets[t].id : 0.0f;
+      if (id != g_scratch.lastTargetId[t]) {
+        clearMask |= (1u << t);
+        g_scratch.lastTargetId[t] = id;
+      }
+    }
+
+    if (clearMask != 0u) {
+      SwarmClearVisitedKernel<<<blocks, GS_BLOCK_1D, 0, stream>>>(g_scratch.visited, count,
+                                                                  clearMask);
+      CUDA_CHECK(cudaGetLastError());
+    }
+  }
 
   /* --- 1. cell keys ---------------------------------------------------- */
   HashKernel<<<blocks, GS_BLOCK_1D, 0, stream>>>(records, count, g_scratch.keysIn,
@@ -952,7 +1111,7 @@ cudaError_t LaunchSwarmStep(float* records, uint32_t count, float dtSec,
 
   SwarmForceKernel<<<blocks, GS_BLOCK_1D, 0, stream>>>(
       records, count, dtSec, input, g_scratch.sortedPos, g_scratch.sortedVel,
-      g_scratch.cellStart, g_scratch.cellEnd, wind, windW, windH);
+      g_scratch.cellStart, g_scratch.cellEnd, wind, windW, windH, g_scratch.visited);
 
   return cudaGetLastError();
 }

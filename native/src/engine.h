@@ -472,9 +472,20 @@ Engine& GetEngine();
 /** @brief Seed swarm agent records on the flight shell. */
 cudaError_t LaunchSwarmSeed(float* records, uint32_t count, cudaStream_t stream);
 
-/** @brief Advance swarm agents by dt seconds. */
+/**
+ * @brief Advance swarm agents by dt seconds.
+ *
+ * @param input     DEVICE-side uniform block the kernels read.
+ * @param hostInput host mirror of the same block, or null. Used only to track
+ *        marker-slot generations (TargetPoint.id): the launcher runs on the
+ *        host and cannot dereference @p input, so the slot-reuse test that
+ *        decides whether to clear the shoot-through visited bits has to read
+ *        the ids from here. Passing null simply skips generation tracking -
+ *        same rationale as the coverage/timeSec scalars on LaunchWeatherStep.
+ */
 cudaError_t LaunchSwarmStep(float* records, uint32_t count, float dtSec,
-                            const InputUniforms* input, cudaStream_t stream);
+                            const InputUniforms* input, const InputUniforms* hostInput,
+                            cudaStream_t stream);
 
 /**
  * @brief Write the animated weather field (RGBA8 equirect, w = 2*h).

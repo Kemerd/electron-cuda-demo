@@ -38,6 +38,42 @@ import { isFiniteNumber } from '../types';
 /** Ring capacity. 240 samples is ~4 s at 60 Hz, ~1 s at 240 Hz. */
 const SAMPLES = 240;
 
+/**
+ * Stat-block window, CONTRACTS section 8: the avg/min/max/1%/0.1% figures
+ * describe the last ~2048 EFFECTIVE frames. Deliberately much longer than the
+ * sparkline's 240 -- percentile lows are a statement about rare events, and a
+ * one-second window has no rare events in it to speak of. At 2048 samples the
+ * 0.1% bucket is 2 intervals wide, which is the smallest window where that
+ * figure means anything at all.
+ */
+const STAT_SAMPLES = 2048;
+
+/**
+ * Stat-block recompute cadence (~2 Hz). The sort is O(n log n) over 2048
+ * floats, which is nothing on its own but is pure waste at frame rate; twice a
+ * second is as fast as the eye can read five changing numbers anyway.
+ */
+const STAT_INTERVAL_MS = 500;
+
+/**
+ * Minimum samples before the block prints anything.
+ *
+ * Below this the "worst 1%" is one or two intervals off a cold start -- the
+ * first frames after a scene mount, which are shader compiles and buffer
+ * allocations rather than steady-state cost. Printing those as a 1% low would
+ * slander every backend for the first half second after every switch.
+ */
+const STAT_MIN_SAMPLES = 60;
+
+/**
+ * Same floor for the native present modes, where samples arrive from the ~2 Hz
+ * nativeViewStats poll instead of per frame. Sixty of those would be thirty
+ * seconds of blank cells after every mode entry, and each one is already an
+ * aggregate over hundreds of presents -- six is several seconds of settled
+ * measurement, which is what the composite floor buys at its own cadence.
+ */
+const STAT_MIN_SAMPLES_NATIVE = 6;
+
 /** Text/percentile refresh interval in ms. Faster than this and the numbers
  *  are unreadable; slower and it feels laggy. */
 const READOUT_INTERVAL_MS = 160;
@@ -135,6 +171,20 @@ export interface FpsOverlayApi {
    * @param frameMs the same thread's frame time, used for the per-frame cell
    */
   setNativeFps(fps: number | null, frameMs?: number): void;
+  /**
+   * Drop the accumulated stat-block window and start a new one.
+   *
+   * The block describes ONE configuration (CONTRACTS section 8) -- a window
+   * that straddles a switch reports a number no configuration ever produced,
+   * and the 1% low is the cell that suffers most from it because the frames
+   * around a reconfigure are precisely the slow ones.
+   *
+   * Callers do not have to reach for this: the overlay already detects every
+   * context change it can see from the signals it is fed (see maybeResetForContext).
+   * It is exported for a caller that knows about a switch the overlay cannot
+   * observe -- a compute-backend swap at identical scene and preset.
+   */
+  resetStats(): void;
   /** Per-frame update. @param nowMs performance.now() from the frame loop */
   tick(nowMs: number): void;
 }
@@ -156,6 +206,7 @@ export function createFpsOverlay(host: HTMLElement | null): FpsOverlayApi {
       pushSimStep() {},
       setGpuStats() {},
       setNativeFps() {},
+      resetStats() {},
       tick() {},
     };
   }
@@ -166,6 +217,52 @@ export function createFpsOverlay(host: HTMLElement | null): FpsOverlayApi {
   const scratch = new Float32Array(SAMPLES);
   let ringHead = 0; // next write index
   let ringCount = 0; // valid samples, saturating at SAMPLES
+
+  /**
+   * Stat-block storage. Same discipline as the sparkline ring and for the same
+   * reason -- two preallocated Float32Arrays, one holding the live window and
+   * one used as sort scratch, both filled in place forever. 2048 floats is 8 KB
+   * each; the alternative (slice + sort at 2 Hz) would hand the GC 16 KB a
+   * second for the sole purpose of measuring how often the GC runs.
+   */
+  const statRing = new Float32Array(STAT_SAMPLES);
+  const statScratch = new Float32Array(STAT_SAMPLES);
+  let statHead = 0;
+  let statCount = 0;
+
+  /** Last computed block, in fps. Held as numbers so the readout formats from
+   *  primitives instead of caching a string per cell. */
+  let statAvgFps = 0;
+  let statMinFps = 0;
+  let statMaxFps = 0;
+  let statLow1Fps = 0;
+  let statLow01Fps = 0;
+  let lastStatMs = 0;
+
+  /**
+   * Context fingerprint -- how the block knows a switch happened WITHOUT a call
+   * from app.ts.
+   *
+   * The overlay is not told about mode/scene/preset changes; it is told about
+   * their consequences, and two of those consequences are unambiguous:
+   *
+   *  - `setCount()` moves whenever the scene changes (swarm's agent count is not
+   *    storm's particle count) or the preset changes (that IS what a preset
+   *    knob does -- every preset carries different counts). It is also written
+   *    every frame with the same value, so only a CHANGE counts.
+   *  - `setNativeFps()` crossing the null boundary is a present-mode switch:
+   *    composite <-> native, the two sources whose intervals are least
+   *    comparable of all (rAF-derived vs D3D11 present).
+   *
+   * Together those cover scene, preset and the composite/native split with no
+   * new wiring and no possibility of the two windows disagreeing about when a
+   * reset happened. The residual gap is documented on resetStats(): a pure
+   * compute-axis swap (CUDA -> WebGPU -> CPU) at identical scene and preset
+   * changes the counts by nothing, so the overlay cannot see it -- that one
+   * needs the caller to say so.
+   */
+  let ctxCount = -1;
+  let ctxNative = false;
 
   /**
    * Rate accounting -- two counts, one window.
@@ -363,7 +460,54 @@ export function createFpsOverlay(host: HTMLElement | null): FpsOverlayApi {
   const drawEl = makeStat('draw', 'accent');
   const countEl = makeStat('records');
 
-  host.append(head, displayLine, gpuLine, spark, stats);
+  /**
+   * The stat block (CONTRACTS section 8) -- avg / min / max / 1% low / 0.1% low
+   * over the rolling effective-interval window, at the bottom of the card.
+   *
+   * One cell per figure rather than a single formatted string: the label and
+   * the number need different weights to stay readable at 11px, and building
+   * five label+value pairs into one string would allocate on every recompute.
+   * The cells flex-wrap, so the block is one line on the desktop card and two
+   * on the narrow responsive widths without any width math here.
+   */
+  const statBlock = document.createElement('div');
+  statBlock.className = 'fps-stat-block';
+  statBlock.title =
+    'Frame-rate distribution over the last ~2048 frames that presented new ' +
+    'state, in fps. 1% and 0.1% lows are the mean of the worst 1% / 0.1% of ' +
+    'frame intervals -- the stutter figures, not the average. Resets on a ' +
+    'scene, preset or present-mode change so the numbers always describe one ' +
+    'configuration.';
+
+  /**
+   * Build one stat-block cell.
+   * @param label short caption ('avg', '1%', ...)
+   * @returns the value span this readout writes into
+   */
+  function makeBlockCell(label: string): HTMLElement {
+    const cell = document.createElement('span');
+    cell.className = 'fps-stat';
+
+    const l = document.createElement('span');
+    l.className = 'fps-stat-label';
+    l.textContent = label;
+
+    const v = document.createElement('span');
+    v.className = 'fps-stat-value';
+    v.textContent = '--';
+
+    cell.append(l, v);
+    statBlock.appendChild(cell);
+    return v;
+  }
+
+  const avgEl = makeBlockCell('avg');
+  const minEl = makeBlockCell('min');
+  const maxEl = makeBlockCell('max');
+  const low1El = makeBlockCell('1%');
+  const low01El = makeBlockCell('0.1%');
+
+  host.append(head, displayLine, gpuLine, spark, stats, statBlock);
 
   /* ---- canvas sizing ---------------------------------------------- */
 
@@ -421,6 +565,117 @@ export function createFpsOverlay(host: HTMLElement | null): FpsOverlayApi {
   }
 
   /**
+   * Discard the stat window. Counters only -- the backing arrays keep their
+   * stale floats, which is safe because every read is bounded by statCount.
+   * Zeroing 8 KB here would be work for no observable difference.
+   */
+  function resetStatWindow(): void {
+    statHead = 0;
+    statCount = 0;
+    statAvgFps = 0;
+    statMinFps = 0;
+    statMaxFps = 0;
+    statLow1Fps = 0;
+    statLow01Fps = 0;
+    // Blank the cells immediately. Leaving the previous configuration's numbers
+    // up for the half second until the next recompute is exactly the blend
+    // across a switch the reset exists to prevent -- just at a smaller scale.
+    setText(avgEl, '--');
+    setText(minEl, '--');
+    setText(maxEl, '--');
+    setText(low1El, '--');
+    setText(low01El, '--');
+  }
+
+  /**
+   * Reset the window if the fingerprint moved. Called from the two setters that
+   * carry context, not per frame -- setCount() IS per frame on the entity path,
+   * so the comparison has to be the cheap part, and it is: two scalar compares.
+   *
+   * @param count  latest record count, or -1 to leave that axis alone
+   * @param native whether the native render thread currently owns the headline
+   */
+  function maybeResetForContext(count: number, native: boolean): void {
+    let changed = false;
+
+    if (count >= 0 && count !== ctxCount) {
+      // The very first count is not a change, it is the initial observation --
+      // resetting on it would throw away the frames measured while the source
+      // was still being configured, which is the correct thing to do anyway.
+      changed = true;
+      ctxCount = count;
+    }
+
+    if (native !== ctxNative) {
+      changed = true;
+      ctxNative = native;
+    }
+
+    if (changed) resetStatWindow();
+  }
+
+  /**
+   * Recompute the five figures over the live window.
+   *
+   * Sorting is what makes all five cheap at once: after one ascending sort of
+   * the intervals, the worst frames (longest intervals) are the TAIL, so the
+   * lows are contiguous slices off the end and min/max fps are the two
+   * endpoints -- no second pass, no separate scan.
+   *
+   * Percentile lows follow the standard convention: the mean of the worst 1% /
+   * 0.1% of intervals, converted to fps at the end. Averaging the intervals and
+   * then inverting (rather than averaging the per-frame fps values) is the part
+   * that matters -- fps is a rate, and the mean of a rate over unequal
+   * durations is not the rate of the mean. The conventional figure everyone
+   * quotes is the one computed in the time domain.
+   */
+  function recomputeStats(): void {
+    // Native polls land at ~2 Hz, so the composite minimum would hold the block
+    // blank for half a minute after entering mode 6/7. Each of those polls is
+    // already an average over ~500 ms of presents, so a handful of them is a
+    // better-settled measurement than 60 raw rAF intervals ever is.
+    const minSamples = nativeFps === null ? STAT_MIN_SAMPLES : STAT_MIN_SAMPLES_NATIVE;
+    if (statCount < minSamples) return;
+
+    statScratch.set(statRing.subarray(0, statCount));
+    const view = statScratch.subarray(0, statCount);
+    view.sort();
+
+    // Mean interval over the whole window -> average fps. Same time-domain
+    // reasoning as the lows: this is total frames over total time, which is
+    // what "average fps" has always meant.
+    let sum = 0;
+    for (let i = 0; i < statCount; i++) sum += view[i] ?? 0;
+    const meanMs = sum / statCount;
+
+    // Ascending sort: index 0 is the shortest interval (the FASTEST frame, so
+    // max fps) and the last index is the longest (the SLOWEST, so min fps).
+    const fastestMs = view[0] ?? 0;
+    const slowestMs = view[statCount - 1] ?? 0;
+
+    /**
+     * Mean of the worst `frac` of intervals, expressed as fps.
+     * @param frac 0..1 tail fraction
+     */
+    const lowFps = (frac: number): number => {
+      // At least one sample, never more than the window -- a 0.1% bucket over
+      // 300 samples rounds to zero otherwise and the cell would read "--"
+      // forever on short windows.
+      const n = Math.max(1, Math.min(statCount, Math.floor(statCount * frac)));
+      let tail = 0;
+      for (let i = statCount - n; i < statCount; i++) tail += view[i] ?? 0;
+      const avgMs = tail / n;
+      return avgMs > 0 ? 1000 / avgMs : 0;
+    };
+
+    statAvgFps = meanMs > 0 ? 1000 / meanMs : 0;
+    statMaxFps = fastestMs > 0 ? 1000 / fastestMs : 0;
+    statMinFps = slowestMs > 0 ? 1000 / slowestMs : 0;
+    statLow1Fps = lowFps(0.01);
+    statLow01Fps = lowFps(0.001);
+  }
+
+  /**
    * Assign textContent only when the value actually differs. Saves a DOM write
    * and a style invalidation on every unchanged cell.
    */
@@ -432,6 +687,20 @@ export function createFpsOverlay(host: HTMLElement | null): FpsOverlayApi {
   function ms(v: number): string {
     if (!Number.isFinite(v) || v <= 0) return '--';
     return v < 10 ? `${v.toFixed(2)}` : `${v.toFixed(1)}`;
+  }
+
+  /**
+   * Stat-block fps formatting -- one decimal, always.
+   *
+   * Fixed precision rather than the headline's adaptive rule: these five cells
+   * sit in a row and are meant to be COMPARED to each other, so "187.2" beside
+   * "44.1" has to line up digit for digit. Dropping the decimal above 100 would
+   * make min and max different widths and the row would shuffle every time the
+   * average crossed a hundred.
+   */
+  function fps(v: number): string {
+    if (!Number.isFinite(v) || v <= 0) return '--';
+    return v.toFixed(1);
   }
 
   /**
@@ -554,6 +823,17 @@ export function createFpsOverlay(host: HTMLElement | null): FpsOverlayApi {
       ringHead = (ringHead + 1) % SAMPLES;
       if (ringCount < SAMPLES) ringCount++;
 
+      // Same sample into the long stat window. Only in composite modes: while
+      // the native thread owns the headline this process is not presenting the
+      // scene at all, and its rAF cadence would be a distribution of the
+      // compositor rather than of the surface anyone is looking at. The native
+      // path feeds the window from setNativeFps() instead.
+      if (nativeFps === null) {
+        statRing[statHead] = interval;
+        statHead = (statHead + 1) % STAT_SAMPLES;
+        if (statCount < STAT_SAMPLES) statCount++;
+      }
+
       freshFrames++;
     },
 
@@ -570,7 +850,11 @@ export function createFpsOverlay(host: HTMLElement | null): FpsOverlayApi {
     },
 
     setCount(n) {
-      if (Number.isFinite(n) && n >= 0) entityCount = n;
+      if (!Number.isFinite(n) || n < 0) return;
+      entityCount = n;
+      // The record count is the overlay's window onto scene and preset changes:
+      // both move it, and nothing else does. See the ctxCount declaration.
+      maybeResetForContext(n, nativeFps !== null);
     },
 
     pushSimStep() {
@@ -642,6 +926,27 @@ export function createFpsOverlay(host: HTMLElement | null): FpsOverlayApi {
       nativeFrameMs =
         typeof frameMs === 'number' && Number.isFinite(frameMs) && frameMs > 0 ? frameMs : 0;
 
+      // Entering or leaving a native present mode swaps the measurement source
+      // outright -- rAF-derived intervals and D3D11 present intervals are not
+      // the same quantity, and a window holding both would describe neither.
+      maybeResetForContext(-1, usable !== null);
+
+      // Native modes feed the stat window from the render thread's own numbers
+      // (CONTRACTS section 8: "the same block derives from the native
+      // present-interval samples"). This poll arrives at ~2 Hz and reports the
+      // MEAN frame time over the interval since the last poll, not one frame --
+      // so each poll stands for many presents and the window is a window of
+      // 2048 polls' worth of typical intervals rather than 2048 individual
+      // frames. The lows are correspondingly conservative: a single stuttered
+      // present is averaged into its poll and cannot show up as a spike on its
+      // own. That is a limit of what nativeViewStats() publishes (it exposes an
+      // aggregate, not a distribution), not a choice made here.
+      if (usable !== null && nativeFrameMs > 0) {
+        statRing[statHead] = Math.min(nativeFrameMs, 1000);
+        statHead = (statHead + 1) % STAT_SAMPLES;
+        if (statCount < STAT_SAMPLES) statCount++;
+      }
+
       // The unit line changes wording with the source: "effective fps" is this
       // process counting its own fresh ticks, "present fps" is what a swapchain
       // actually did on a thread we do not tick at all.
@@ -660,6 +965,10 @@ export function createFpsOverlay(host: HTMLElement | null): FpsOverlayApi {
       if (!fpsSource.classList.contains('is-hidden')) fpsSource.classList.add('is-hidden');
     },
 
+    resetStats() {
+      resetStatWindow();
+    },
+
     /**
      * Draws the sparkline every call; refreshes the text and percentiles on the
      * slower cadence.
@@ -674,7 +983,22 @@ export function createFpsOverlay(host: HTMLElement | null): FpsOverlayApi {
       if (renderWindowStartMs === 0) {
         renderWindowStartMs = nowMs;
         lastReadoutMs = nowMs;
+        lastStatMs = nowMs;
         return;
+      }
+
+      // The stat block runs on its own slower clock (~2 Hz vs the readout's
+      // ~6 Hz) and is checked BEFORE the readout gate, because the two cadences
+      // do not divide evenly -- gating it behind the readout would quantize it
+      // to whichever multiple of 160 ms happened to land past 500.
+      if (nowMs - lastStatMs >= STAT_INTERVAL_MS) {
+        lastStatMs = nowMs;
+        recomputeStats();
+        setText(avgEl, fps(statAvgFps));
+        setText(minEl, fps(statMinFps));
+        setText(maxEl, fps(statMaxFps));
+        setText(low1El, fps(statLow1Fps));
+        setText(low01El, fps(statLow01Fps));
       }
 
       if (nowMs - lastReadoutMs < READOUT_INTERVAL_MS) return;

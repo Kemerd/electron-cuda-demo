@@ -104,7 +104,11 @@ export type HudAction =
   /** Coverage dial, live on input (a uniform -- no reallocation). */
   | { kind: 'coverage'; value: number }
   /** Storm particle-size slider, live on input. */
-  | { kind: 'pointScale'; value: number };
+  | { kind: 'pointScale'; value: number }
+  /** Marker lifetime slider (seconds), live on input -- no reallocation. */
+  | { kind: 'markerTtl'; value: number }
+  /** "Clear markers" button: drop every live marker at once. */
+  | { kind: 'clearMarkers' };
 
 /** The closed set of action kinds, for wire-side validation. */
 export const HUD_ACTION_KINDS = Object.freeze([
@@ -115,6 +119,8 @@ export const HUD_ACTION_KINDS = Object.freeze([
   'count',
   'coverage',
   'pointScale',
+  'markerTtl',
+  'clearMarkers',
 ] as const);
 
 /* ------------------------------------------------------------------ *
@@ -158,6 +164,13 @@ export interface HudUiState {
 
   /** Coverage dial value, 0..1. */
   weatherCoverage: number;
+
+  /**
+   * Marker lifetime in seconds (the TTL slider). Optional so a snapshot from
+   * a build predating the marker system still parses -- the HUD falls back to
+   * MARKER_TTL_DEFAULT_SEC rather than showing an empty chip.
+   */
+  markerTtlSec?: number;
 
   /** Status chips currently shown in the stage topbar, in insertion order. */
   chips: HudChip[];

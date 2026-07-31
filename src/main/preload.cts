@@ -625,7 +625,9 @@ const api: GeoSwarmBridge = {
         kind !== 'params' &&
         kind !== 'count' &&
         kind !== 'coverage' &&
-        kind !== 'pointScale'
+        kind !== 'pointScale' &&
+        kind !== 'markerTtl' &&
+        kind !== 'clearMarkers'
       ) {
         return;
       }

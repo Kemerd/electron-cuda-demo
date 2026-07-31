@@ -53,6 +53,7 @@ import {
   MAX_TARGETS,
   MAX_SHOCKWAVES,
   WEATHER_COVERAGE_DEFAULT,
+  MARKER_TTL_DEFAULT_SEC,
   isLegalMode,
 } from '../shared/protocol';
 import type {
@@ -79,7 +80,13 @@ import type {
 } from './types';
 
 import { findSource, hasSource } from './sources/registry';
-import { ageInteractions } from './interaction';
+import {
+  ageInteractions,
+  clearTargets,
+  setMarkerTtl,
+  MARKER_TTL_MIN_SEC,
+  MARKER_TTL_MAX_SEC,
+} from './interaction';
 import { createCudaBlit } from './present/cuda-blit';
 import type { CudaBlitApi } from './present/cuda-blit';
 import { createNativeView } from './present/native-view';
@@ -109,7 +116,11 @@ import type {
 
 import { createSidebar } from './ui/sidebar';
 import { createSceneControls } from './ui/scene-controls';
-import type { SceneControlsApi } from './ui/scene-controls';
+import type {
+  ActionButtonOptions,
+  RangeSliderOptions,
+  SceneControlsApi,
+} from './ui/scene-controls';
 import { createMatrix } from './ui/matrix';
 import { createPresets } from './ui/presets';
 import { createBadges } from './ui/badges';
@@ -277,6 +288,16 @@ const inputState: InputState & { pointScale: number } = {
  * slider to what the user chose rather than snapping back to the default.
  */
 let weatherCoverage = WEATHER_COVERAGE_DEFAULT;
+
+/**
+ * Live marker lifetime in seconds (CONTRACTS section 8).
+ *
+ * Mirrored into interaction.ts's module state via setMarkerTtl(); kept here as
+ * well so a scene remount can restore the slider to the user's choice, exactly
+ * as weatherCoverage does above. The two copies cannot drift because every
+ * write goes through setMarkerTtl() and adopts its clamped return value.
+ */
+let markerTtlSec: number = MARKER_TTL_DEFAULT_SEC;
 
 /**
  * Shared per-frame state handed to scene.frame(). Mutated in place, never
@@ -1655,6 +1676,7 @@ function pushHudUiState(): void {
     params: { ...sceneParams },
     stormPointScale,
     weatherCoverage,
+    markerTtlSec,
     chips,
     note: hudControlNote,
   };
@@ -1775,6 +1797,23 @@ function applyHudAction(action: HudAction): void {
       stormPointAdjust = stormPointBaseline > 0 ? v / stormPointBaseline : 1;
       applyStormPointScale();
       if (sceneControls) sceneControls.setRange('size', v);
+      break;
+    }
+
+    case 'markerTtl': {
+      // setMarkerTtl clamps and returns what it adopted, so the slider settles
+      // on the real value rather than on what the HUD asked for.
+      markerTtlSec = setMarkerTtl(action.value);
+      if (sceneControls) sceneControls.setRange('markerTtl', markerTtlSec);
+      break;
+    }
+
+    case 'clearMarkers': {
+      // The HUD's button is a mirror; THIS renderer owns inputState, so the
+      // clear happens here and every backend sees an empty target array on
+      // its next frame.
+      const removed = clearTargets(inputState);
+      console.log('[app] hud cleared %d marker(s)', removed);
       break;
     }
 
@@ -2001,6 +2040,62 @@ async function mountScene(id: string): Promise<void> {
  *
  * @param id nav scene id
  */
+/**
+ * Build the marker-lifetime slider (CONTRACTS section 8).
+ *
+ * A factory rather than a shared object literal: both globe scenes mount their
+ * own strip and each needs its own closures, and `value` has to be read at
+ * mount time so a scene switch restores the lifetime the user chose rather
+ * than snapping back to the protocol default.
+ *
+ * It is an APPEARANCE-class slider by the module's own taxonomy -- commit on
+ * input, no reallocation behind it -- because setMarkerTtl() only changes what
+ * the NEXT placement gets. Markers already in flight keep the lifetime they
+ * were born with, which is why dragging this never disturbs the live swarm.
+ */
+function markerTtlSliderOptions(): RangeSliderOptions {
+  return {
+    label: 'Marker lifetime',
+    min: MARKER_TTL_MIN_SEC,
+    max: MARKER_TTL_MAX_SEC,
+    value: markerTtlSec,
+    endpoints: ['Brief', 'Persistent'],
+    // Seconds read as seconds. "10.0x" would be a multiplier of nothing.
+    format: (v) => `${Math.round(v)}s`,
+    onInput: (value) => {
+      markerTtlSec = setMarkerTtl(value);
+      if (HUD_MODE) {
+        sendHudAction({ kind: 'markerTtl', value: markerTtlSec });
+        return;
+      }
+      pushHudUiState();
+    },
+  };
+}
+
+/**
+ * Build the "Clear markers" button (CONTRACTS section 8).
+ *
+ * Reports how many were removed through the strip's note line rather than a
+ * console log: the button's whole problem is that its effect happens somewhere
+ * the user may not be looking, and "Cleared 3 markers" is the confirmation
+ * that a marker on the far side of the globe actually went away.
+ */
+function clearMarkersButton(): ActionButtonOptions {
+  return {
+    label: 'Clear markers',
+    flash: 'Cleared',
+    onClick: () => {
+      if (HUD_MODE) {
+        sendHudAction({ kind: 'clearMarkers' });
+        return;
+      }
+      const removed = clearTargets(inputState);
+      console.log('[app] cleared %d marker(s)', removed);
+    },
+  };
+}
+
 function mountSceneControls(id: string): void {
   if (sceneControls) {
     sceneControls.dispose();
@@ -2018,25 +2113,29 @@ function mountSceneControls(id: string): void {
   hudControlNote = null;
 
   if (id === 'globe') {
-    sceneControls = createSceneControls({
-      swarm: {
-        label: 'Swarm agents',
-        min: 10_000,
-        max: 5_000_000,
-        value: sceneParams.swarmCount,
-        onCommit: (value) => {
-          // In the HUD window the strip is a mirror: ship the intent and let
-          // the snapshot echo settle the slider on what actually happened.
-          if (HUD_MODE) {
-            sendHudAction({ kind: 'count', target: 'swarm', value });
-            return;
-          }
-          sceneParams = { ...sceneParams, swarmCount: value };
-          void ensureSource(activeEngineScene());
-          pushHudUiState();
+    sceneControls = createSceneControls(
+      {
+        swarm: {
+          label: 'Swarm agents',
+          min: 10_000,
+          max: 5_000_000,
+          value: sceneParams.swarmCount,
+          onCommit: (value) => {
+            // In the HUD window the strip is a mirror: ship the intent and let
+            // the snapshot echo settle the slider on what actually happened.
+            if (HUD_MODE) {
+              sendHudAction({ kind: 'count', target: 'swarm', value });
+              return;
+            }
+            sceneParams = { ...sceneParams, swarmCount: value };
+            void ensureSource(activeEngineScene());
+            pushHudUiState();
+          },
         },
       },
-    });
+      { markerTtl: markerTtlSliderOptions() },
+      [clearMarkersButton()],
+    );
   } else if (id === 'weather') {
     // The weather scene has no count of its own -- its size is the fidelity
     // panel's weatherGrid -- but it does own the Coverage dial, which is a
@@ -2066,7 +2165,11 @@ function mountSceneControls(id: string): void {
             if (HUD_MODE) sendHudAction({ kind: 'coverage', value: weatherCoverage });
           },
         },
+        // The weather scene carries the marker system too (CONTRACTS section
+        // 8 puts it on both globe scenes), so it gets the same TTL knob.
+        markerTtl: markerTtlSliderOptions(),
       },
+      [clearMarkersButton()],
     );
   } else if (id === 'storm') {
     sceneControls = createSceneControls(
@@ -2145,6 +2248,7 @@ function resyncSceneControls(): void {
   sceneControls.setCount('storm', sceneParams.stormCount);
   sceneControls.setRange('size', stormPointScale);
   sceneControls.setRange('coverage', weatherCoverage);
+  sceneControls.setRange('markerTtl', markerTtlSec);
 }
 
 /* ------------------------------------------------------------------ *
@@ -3304,6 +3408,13 @@ function applyHudUiState(state: HudUiState): void {
   if (isFiniteNumber(state.weatherCoverage)) {
     weatherCoverage = Math.min(1, Math.max(0, state.weatherCoverage));
     inputState.weatherCoverage = weatherCoverage;
+  }
+
+  // Marker lifetime. Absent means the sender predates the marker system, in
+  // which case the local default already holds and overwriting it with a zero
+  // would park the slider at the bottom of its track.
+  if (isFiniteNumber(state.markerTtlSec)) {
+    markerTtlSec = setMarkerTtl(state.markerTtlSec);
   }
 
   // Scene tab: title, nav highlight and the per-scene control strip. Only on

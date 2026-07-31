@@ -78,6 +78,38 @@ bool GetBoolOr(const Napi::Object& obj, const char* key, bool fallback) {
 }
 
 /**
+ * @brief Map a TargetPoint.behavior string onto its GS_BEHAVIOR_* integer.
+ *
+ * protocol.ts spells the behaviors as strings; the kernels want an int. The
+ * mapping lives here so it happens once per marker per frame rather than once
+ * per marker per agent.
+ *
+ * Every failure mode - key absent, wrong type, empty, an unrecognised verb
+ * from a newer renderer talking to an older addon - resolves to RALLY, which
+ * is the documented fallback and also the least surprising force to apply.
+ *
+ * @param obj the marker object from InputState.targets[]
+ * @return one of GS_BEHAVIOR_RALLY / AVOID / VORTEX / SHOOT_THROUGH
+ */
+int GetBehaviorOr(const Napi::Object& obj, const char* key) {
+  if (!obj.Has(key)) return GS_BEHAVIOR_RALLY;
+  Napi::Value v = obj.Get(key);
+  if (!v.IsString()) return GS_BEHAVIOR_RALLY;
+
+  const std::string s = v.As<Napi::String>().Utf8Value();
+  if (s == "rally") return GS_BEHAVIOR_RALLY;
+  if (s == "avoid") return GS_BEHAVIOR_AVOID;
+  if (s == "vortex") return GS_BEHAVIOR_VORTEX;
+  if (s == "shootThrough") return GS_BEHAVIOR_SHOOT_THROUGH;
+
+  // Unknown verb: not worth failing the frame over, but worth saying once so a
+  // protocol drift does not silently behave as a rally point forever.
+  fprintf(stderr, "[cuda_engine] setInput: unknown target behavior '%s', using rally.\n",
+          s.c_str());
+  return GS_BEHAVIOR_RALLY;
+}
+
+/**
  * @brief Read a uint32 count property with a hard ceiling.
  *
  * Negative and fractional values are rejected to zero, which the engine then
@@ -219,6 +251,18 @@ void ParseInputState(const Napi::Object& obj, InputUniforms* out) {
         CopyFloatArray(e.Get("pos"), out->targets[written].pos, 3);
         out->targets[written].strength = static_cast<float>(GetNumberOr(e, "strength", 1.0));
         out->targets[written].ttl = static_cast<float>(GetNumberOr(e, "ttl", 0.0));
+
+        // Marker fields. Both degrade quietly: a renderer that predates the
+        // marker system sends neither, and its targets keep behaving exactly
+        // as they did before (rally, id 0 = "slot never reused").
+        out->targets[written].behavior = GetBehaviorOr(e, "behavior");
+
+        // Negative or non-finite ids would corrupt the generation compare into
+        // clearing the visited mask every frame, so they collapse to 0.
+        const double rawId = GetNumberOr(e, "id", 0.0);
+        out->targets[written].id =
+            (rawId > 0.0 && rawId < 16777216.0) ? static_cast<float>(rawId) : 0.0f;
+
         ++written;
       }
       out->targetCount = static_cast<int>(written);

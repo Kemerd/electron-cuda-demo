@@ -69,6 +69,25 @@ export interface RangeSliderOptions {
   readonly onInput: (value: number) => void;
 }
 
+/**
+ * Options for an action button (the marker system's "Clear markers").
+ *
+ * Buttons sit at the bottom of the strip, after every slider, because a
+ * destructive action next to a value you are dragging is an action you
+ * eventually hit by accident.
+ */
+export interface ActionButtonOptions {
+  readonly label: string;
+  /** Fired on click. */
+  readonly onClick: () => void;
+  /**
+   * Short confirmation flashed in place of the label after a click, e.g.
+   * "Cleared". Buttons whose effect is off-screen need to say they fired --
+   * clearing markers when none exist looks identical to a dead button.
+   */
+  readonly flash?: string;
+}
+
 /** Public surface of a mounted control strip. */
 export interface SceneControlsApi {
   /** The element to place in the scene's overlay. */
@@ -155,10 +174,12 @@ function buildRow(label: string): SliderHandle {
  *
  * @param counts logarithmic count sliders, keyed for setCount()
  * @param ranges linear appearance sliders
+ * @param actions action buttons, rendered after every slider
  */
 export function createSceneControls(
   counts: Readonly<Record<string, CountSliderOptions>>,
   ranges?: Readonly<Record<string, RangeSliderOptions>> | null,
+  actions?: readonly ActionButtonOptions[] | null,
 ): SceneControlsApi {
   const root = document.createElement('div');
   root.className = 'scene-controls';
@@ -245,6 +266,58 @@ export function createSceneControls(
     }
   }
 
+  /**
+   * Live flash timers, so dispose() can cancel them.
+   *
+   * A strip torn down inside the flash window would otherwise leave a timer
+   * holding a reference to a detached button and firing against it later --
+   * harmless in effect, but it is a leak with a name and it costs one Set to
+   * not have.
+   */
+  const flashTimers = new Set<number>();
+
+  if (actions && actions.length > 0) {
+    const bar = document.createElement('div');
+    bar.className = 'scene-control-actions';
+
+    for (const opts of actions) {
+      if (!opts || typeof opts.onClick !== 'function') continue;
+
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'scene-control-button';
+      button.textContent = opts.label;
+
+      button.addEventListener('click', () => {
+        try {
+          opts.onClick();
+        } catch (err) {
+          // A throwing handler must not leave the button stuck mid-flash.
+          const why = err instanceof Error ? err.message : String(err);
+          console.warn('[scene-controls] action "%s" threw: %s', opts.label, why);
+        }
+
+        const flash = opts.flash;
+        if (!flash) return;
+
+        // Swap the caption briefly so the click is visibly acknowledged even
+        // when its effect is somewhere the user is not looking.
+        button.textContent = flash;
+        button.classList.add('flashed');
+        const handle = window.setTimeout(() => {
+          flashTimers.delete(handle);
+          button.textContent = opts.label;
+          button.classList.remove('flashed');
+        }, 900);
+        flashTimers.add(handle);
+      });
+
+      bar.appendChild(button);
+    }
+
+    root.appendChild(bar);
+  }
+
   // Note line: the CPU auto-cap and configureScene refusals land here, so a
   // refused or clamped count is never silent.
   const note = document.createElement('div');
@@ -293,6 +366,8 @@ export function createSceneControls(
     },
 
     dispose() {
+      for (const handle of flashTimers) window.clearTimeout(handle);
+      flashTimers.clear();
       if (root.parentNode) root.parentNode.removeChild(root);
       countHandles.clear();
       rangeHandles.clear();

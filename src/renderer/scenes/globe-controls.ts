@@ -9,10 +9,13 @@
  * wrong. So the rig lives in ONE file that both globe scenes instantiate.
  *
  * Behavior:
- *   left-drag   orbit
- *   right-drag  pan (context menu suppressed on the canvas so this is clean)
- *   wheel       zoom, clamped to [1.15, 12] x GLOBE_RADIUS
- *   left CLICK  place a rally target via raycast -- a left DRAG never does
+ *   left-drag     orbit
+ *   right-drag    pan (context menu suppressed on the canvas so this is clean)
+ *   wheel         zoom, clamped to [1.15, 12] x GLOBE_RADIUS
+ *   left CLICK    place a rally marker via raycast -- a left DRAG never does
+ *   middle CLICK  place a rally marker instantly (no hold, no menu)
+ *   press + HOLD  bloom the radial command menu; wheel cycles it; release
+ *                 commits the highlighted behavior at the held point
  *
  * The click-vs-drag discrimination is the fiddly part. OrbitControls consumes
  * pointer events for the orbit, so "was that a click or the end of a drag?" has
@@ -20,12 +23,33 @@
  * 250 ms between down and up counts as a click, anything else is a drag. Both
  * thresholds are needed -- a slow careful drag stays under 5 px for a moment,
  * and a fast flick covers 40 px in 90 ms.
+ *
+ * The hold gesture (CONTRACTS section 8) layers onto that same pointer stream
+ * rather than forking it, which is what keeps the two from disagreeing. One
+ * press can end in exactly one of four ways and the state machine makes that
+ * explicit:
+ *
+ *   press -> moved >5 px before 300 ms   -> orbit (menu never opens)
+ *   press -> held still 300 ms           -> menu opens, orbit suppressed
+ *   press -> released before 300 ms      -> plain click (existing behavior)
+ *   menu open -> Esc / far drag          -> cancel, nothing placed
+ *
+ * Suppressing the orbit once the menu opens is the subtle part. OrbitControls
+ * has already started its rotate gesture by then (it began on pointerdown), so
+ * simply ignoring later moves is not enough -- the camera would keep the drag
+ * it accumulated. `controls.enabled = false` mid-gesture makes OrbitControls
+ * drop the gesture entirely, and re-enabling on release restores it cleanly.
+ * That is also what suppresses wheel zoom while the menu is open, which the
+ * contract requires in those words, without a second wheel handler racing the
+ * first.
  */
 
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { GLOBE_RADIUS } from '../../shared/protocol';
-import type { CameraState, Vec3 } from '../../shared/protocol';
+import { GLOBE_RADIUS, TARGET_BEHAVIOR } from '../../shared/protocol';
+import type { CameraState, TargetBehavior, Vec3 } from '../../shared/protocol';
+import { createRadialMenu } from '../ui/radial-menu';
+import type { RadialMenuApi } from '../ui/radial-menu';
 
 /** Distance clamp, in globe radii (CONTRACTS section 8). */
 const MIN_DISTANCE = 1.15 * GLOBE_RADIUS;
@@ -35,15 +59,41 @@ const MAX_DISTANCE = 12 * GLOBE_RADIUS;
 const CLICK_MAX_PX = 5;
 const CLICK_MAX_MS = 250;
 
+/**
+ * How long a stationary press waits before the radial menu blooms
+ * (CONTRACTS section 8). Long enough that a normal click never trips it --
+ * CLICK_MAX_MS is 250 -- and short enough that deliberately holding does not
+ * feel like waiting.
+ */
+const HOLD_MS = 300;
+
+/**
+ * How far the pointer may travel AFTER the menu opens before the gesture is
+ * treated as a cancel. Generous compared to CLICK_MAX_PX: once the ring is on
+ * screen the hand is allowed to drift over it, and only a decisive drag away
+ * means "I did not mean this".
+ */
+const MENU_CANCEL_PX = 190;
+
 /** How far the pan target may wander from the origin before it is reeled in. */
 const PAN_TETHER = 0.9 * GLOBE_RADIUS;
 
 /** Options for the rig. */
 export interface GlobeControlsOptions {
-  /** Called with the world-space hit point when a click lands on the globe. */
-  onPlaceTarget?: (pos: Vec3) => void;
+  /**
+   * Called with the world-space hit point and the chosen behavior when a
+   * placement commits -- a plain click, a middle click, or a menu release.
+   */
+  onPlaceTarget?: (pos: Vec3, behavior: TargetBehavior) => void;
   /** Radius the click raycast tests against. Defaults to the globe surface. */
   pickRadius?: number;
+  /**
+   * Element the radial menu's canvas is appended to. Defaults to the canvas's
+   * own parent, which is the scene root in both windows. Passing it
+   * explicitly matters only when the canvas is not the element the menu
+   * should be measured against.
+   */
+  menuHost?: HTMLElement | null;
 }
 
 /** Public surface of the mounted rig. */
@@ -97,22 +147,54 @@ export function createGlobeControls(
   // OrbitControls' natural mapping is already left-orbit / right-pan, but state
   // it explicitly: the defaults have changed across three.js releases and this
   // mapping is a contract, not a preference.
+  //
+  // MIDDLE is null rather than DOLLY: CONTRACTS section 8 gives the middle
+  // button to instant marker placement, and leaving OrbitControls' dolly bound
+  // to it would dolly the camera on every marker drop. Nothing is lost -- the
+  // wheel is the zoom, and it always was; middle-drag-to-dolly was a mapping
+  // nobody used because the wheel is right there.
   controls.mouseButtons = {
     LEFT: THREE.MOUSE.ROTATE,
-    MIDDLE: THREE.MOUSE.DOLLY,
+    MIDDLE: null,
     RIGHT: THREE.MOUSE.PAN,
   };
   // Touch: one finger orbits, two pinch-zoom and pan.
   controls.touches = { ONE: THREE.TOUCH.ROTATE, TWO: THREE.TOUCH.DOLLY_PAN };
 
-  /* ---- click vs drag ------------------------------------------------ */
+  /* ---- radial menu --------------------------------------------------- */
+
+  // Hosted on the canvas's parent (the scene root) rather than the canvas
+  // itself: a <canvas> cannot have DOM children, and the menu needs a box that
+  // covers the same region the scene does. In the HUD window that parent is
+  // the stage surface, which is exactly the cutout -- so the menu appears over
+  // the native surface at the cursor, in the window the cursor is actually in.
+  const menuHost: HTMLElement | null =
+    options?.menuHost ?? (canvas.parentElement instanceof HTMLElement ? canvas.parentElement : null);
+  const menu: RadialMenuApi = createRadialMenu(menuHost);
+
+  /* ---- press state machine ------------------------------------------- */
 
   let downX = 0;
   let downY = 0;
   let downTime = 0;
   let downButton = -1;
+  /** Pointer id of the press being tracked, so a second pointer cannot hijack it. */
+  let downPointerId = -1;
+
   /** True while a press is live and still qualifies as a potential click. */
   let pressActive = false;
+
+  /** setTimeout handle for the hold threshold; 0 when no press is pending. */
+  let holdTimer = 0;
+
+  /**
+   * True from the moment the menu opens until the press that opened it ends.
+   *
+   * Distinct from menu.isOpen(): the menu keeps animating for ~200 ms after it
+   * closes, and a pointerup arriving during that bloom-out must not be
+   * re-interpreted as a fresh commit.
+   */
+  let menuActive = false;
 
   const raycaster = new THREE.Raycaster();
   const ndc = new THREE.Vector2();
@@ -124,29 +206,160 @@ export function createGlobeControls(
     e.preventDefault();
   }
 
+  /** Cancel a pending hold timer. Safe to call when none is armed. */
+  function clearHoldTimer(): void {
+    if (holdTimer !== 0) {
+      window.clearTimeout(holdTimer);
+      holdTimer = 0;
+    }
+  }
+
+  /**
+   * Place a marker at a client coordinate, if the ray hits the globe.
+   *
+   * @returns true when a placement actually happened
+   */
+  function placeAtClient(clientX: number, clientY: number, behavior: TargetBehavior): boolean {
+    if (typeof onPlaceTarget !== 'function') return false;
+    if (!Number.isFinite(clientX) || !Number.isFinite(clientY)) return false;
+
+    const rect = canvas.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return false;
+
+    const nx = ((clientX - rect.left) / rect.width) * 2 - 1;
+    const ny = -(((clientY - rect.top) / rect.height) * 2 - 1);
+
+    if (!raycastGlobe(nx, ny, hitPoint)) return false;
+
+    onPlaceTarget([hitPoint.x, hitPoint.y, hitPoint.z], behavior);
+    return true;
+  }
+
+  /**
+   * The hold threshold fired: bloom the menu and take the camera out of the
+   * gesture.
+   */
+  function onHoldElapsed(): void {
+    holdTimer = 0;
+    if (!pressActive) return;
+
+    menuActive = true;
+
+    // Drop OrbitControls out of the gesture it already started. Without this
+    // the camera keeps whatever rotation the press accumulated, and the wheel
+    // would zoom while the menu is cycling -- both of which the contract
+    // forbids. Re-enabled in endPress().
+    controls.enabled = false;
+
+    // Opens showing rally: that is what a plain click places, so the menu
+    // blooms already on the action the user knows and the wheel moves away
+    // from it rather than toward it.
+    menu.open(downX, downY, TARGET_BEHAVIOR.RALLY);
+  }
+
+  /**
+   * Tear down whatever the current press was doing and hand the camera back.
+   *
+   * Every exit path funnels through here -- commit, cancel, pointercancel,
+   * Esc -- so `controls.enabled` cannot be left false by a path that forgot to
+   * restore it. A permanently disabled camera is the worst failure this
+   * gesture could produce, since nothing on screen would explain it.
+   */
+  function endPress(commit: boolean): void {
+    clearHoldTimer();
+    pressActive = false;
+    downPointerId = -1;
+
+    if (menuActive) {
+      menuActive = false;
+      menu.close(commit);
+      controls.enabled = true;
+    }
+  }
+
   function onPointerDown(e: PointerEvent): void {
-    // Only the left button can place a target; the right button is the pan
-    // gesture and the middle is dolly.
+    // A second pointer arriving mid-gesture (a stray touch, a chorded button)
+    // ends the first cleanly rather than interleaving two state machines.
+    if (pressActive) endPress(false);
+
     downButton = e.button;
     downX = e.clientX;
     downY = e.clientY;
     downTime = performance.now();
-    pressActive = e.button === 0;
+    downPointerId = e.pointerId;
+
+    // Left and middle both arm the hold. Right is the pan gesture and stays
+    // out of this entirely.
+    pressActive = e.button === 0 || e.button === 1;
+    if (!pressActive) return;
+
+    // Middle-click is dolly in OrbitControls' default mapping, which would
+    // fight the instant-rally gesture the contract assigns to it. The mapping
+    // is set to null for MIDDLE below, so there is nothing to suppress here.
+    clearHoldTimer();
+    holdTimer = window.setTimeout(onHoldElapsed, HOLD_MS);
   }
 
   function onPointerMove(e: PointerEvent): void {
     if (!pressActive) return;
-    // Once the pointer has travelled far enough, this is a drag for good --
-    // coming back under the threshold later must not re-arm the click.
+    if (downPointerId !== -1 && e.pointerId !== downPointerId) return;
+
     const dx = e.clientX - downX;
     const dy = e.clientY - downY;
-    if (dx * dx + dy * dy > CLICK_MAX_PX * CLICK_MAX_PX) pressActive = false;
+    const dist2 = dx * dx + dy * dy;
+
+    if (menuActive) {
+      // The menu is up. Only a decisive drag away cancels; small drift over
+      // the ring is expected and must not dismiss it.
+      if (dist2 > MENU_CANCEL_PX * MENU_CANCEL_PX) endPress(false);
+      return;
+    }
+
+    // Before the threshold: movement past 5 px means this was an orbit all
+    // along. Disarm the hold and let OrbitControls have the gesture, exactly
+    // as it did before the menu existed. Coming back under the threshold later
+    // must not re-arm either the click or the hold.
+    if (dist2 > CLICK_MAX_PX * CLICK_MAX_PX) {
+      clearHoldTimer();
+      pressActive = false;
+    }
   }
 
   function onPointerUp(e: PointerEvent): void {
+    if (downPointerId !== -1 && e.pointerId !== downPointerId) return;
+
+    // ---- menu release: commit the highlighted behavior ----
+    if (menuActive) {
+      const behavior = menu.selected();
+      // The marker lands at the point the press STARTED, not where the pointer
+      // ended up. The ring is a menu the hand travels over; the target was
+      // chosen when the press began.
+      if (behavior) placeAtClient(downX, downY, behavior);
+      endPress(true);
+      return;
+    }
+
     const wasActive = pressActive;
-    pressActive = false;
-    if (!wasActive || downButton !== 0) return;
+    const button = downButton;
+    endPress(false);
+
+    if (!wasActive) return;
+    if (button !== 0 && button !== 1) return;
+
+    // ---- middle click: instant rally, no timing gate ----
+    // Deliberately exempt from CLICK_MAX_MS. A middle press that outlasts
+    // 250 ms without moving has already opened the menu and taken the branch
+    // above, so reaching here means the user released early -- which is the
+    // instant-rally gesture, however long it took them to let go.
+    if (button === 1) {
+      const dx = e.clientX - downX;
+      const dy = e.clientY - downY;
+      if (dx * dx + dy * dy > CLICK_MAX_PX * CLICK_MAX_PX) return;
+      placeAtClient(e.clientX, e.clientY, TARGET_BEHAVIOR.RALLY);
+      return;
+    }
+
+    // ---- left click: the existing quick-place, now a rally-behavior marker ----
     if (performance.now() - downTime > CLICK_MAX_MS) return;
 
     // Final distance check: a pointerup can arrive without an intervening move.
@@ -154,21 +367,56 @@ export function createGlobeControls(
     const dy = e.clientY - downY;
     if (dx * dx + dy * dy > CLICK_MAX_PX * CLICK_MAX_PX) return;
 
-    if (typeof onPlaceTarget !== 'function') return;
-
-    const rect = canvas.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0) return;
-
-    const nx = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-    const ny = -(((e.clientY - rect.top) / rect.height) * 2 - 1);
-
-    if (raycastGlobe(nx, ny, hitPoint)) {
-      onPlaceTarget([hitPoint.x, hitPoint.y, hitPoint.z]);
-    }
+    placeAtClient(e.clientX, e.clientY, TARGET_BEHAVIOR.RALLY);
   }
 
   function onPointerCancel(): void {
-    pressActive = false;
+    endPress(false);
+  }
+
+  /**
+   * Wheel: cycles the menu selection while it is open, zooms otherwise.
+   *
+   * Bound in the CAPTURE phase so it runs before OrbitControls' own listener.
+   * `controls.enabled` is already false by the time the menu is open, so the
+   * zoom is suppressed either way -- but stopping propagation here as well
+   * means the wheel event never reaches a second consumer, which is what keeps
+   * a fast scroll from leaking a single zoom step through on the frame the
+   * menu opens.
+   */
+  function onWheel(e: WheelEvent): void {
+    if (!menuActive) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+
+    // One wedge per notch, regardless of how big the platform's delta is.
+    // A high-resolution trackpad reports dozens of small deltas per physical
+    // gesture, and stepping by the raw value would spin the ring uselessly.
+    const dir = e.deltaY > 0 ? 1 : e.deltaY < 0 ? -1 : 0;
+    if (dir !== 0) menu.step(dir);
+  }
+
+  /**
+   * Esc cancels an open menu (CONTRACTS section 8).
+   *
+   * On window rather than the canvas: a canvas that never takes focus never
+   * receives a keydown, and this has to work the instant the ring is visible.
+   */
+  function onKeyDown(e: KeyboardEvent): void {
+    if (e.key !== 'Escape') return;
+    if (!menuActive) return;
+    e.preventDefault();
+    endPress(false);
+  }
+
+  /**
+   * A window blur mid-hold would otherwise strand the menu open with the
+   * camera disabled, since no pointerup is ever delivered to a backgrounded
+   * window.
+   */
+  function onBlur(): void {
+    if (pressActive || menuActive) endPress(false);
   }
 
   canvas.addEventListener('contextmenu', onContextMenu);
@@ -176,6 +424,9 @@ export function createGlobeControls(
   canvas.addEventListener('pointermove', onPointerMove);
   canvas.addEventListener('pointerup', onPointerUp);
   canvas.addEventListener('pointercancel', onPointerCancel);
+  canvas.addEventListener('wheel', onWheel, { capture: true, passive: false });
+  window.addEventListener('keydown', onKeyDown);
+  window.addEventListener('blur', onBlur);
 
   /**
    * Ray/sphere intersection against the globe.
@@ -247,11 +498,20 @@ export function createGlobeControls(
     },
 
     dispose(): void {
+      // End any live gesture first: a scene unmounted mid-hold would otherwise
+      // leave the timer armed and fire onHoldElapsed() against a disposed rig.
+      endPress(false);
+
       canvas.removeEventListener('contextmenu', onContextMenu);
       canvas.removeEventListener('pointerdown', onPointerDown);
       canvas.removeEventListener('pointermove', onPointerMove);
       canvas.removeEventListener('pointerup', onPointerUp);
       canvas.removeEventListener('pointercancel', onPointerCancel);
+      canvas.removeEventListener('wheel', onWheel, { capture: true });
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('blur', onBlur);
+
+      menu.dispose();
       controls.dispose();
     },
   };

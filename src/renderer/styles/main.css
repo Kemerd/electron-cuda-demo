@@ -890,6 +890,82 @@ input[type='range']:active::-webkit-slider-thumb { transform: scale(1.06); }
 
 .scene-control-note.warn { color: var(--warn, #ffb454); }
 
+/* Action buttons (Clear markers). A row, so a second action later sits beside
+   the first rather than forcing a layout decision at that point. */
+.scene-control-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.scene-control-button {
+  flex: 1 1 auto;
+  padding: 6px 10px;
+  font: inherit;
+  font-size: var(--fs-small);
+  font-weight: 500;
+  color: var(--text-secondary);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  /* Same curve as every other control in the app. */
+  transition:
+    background var(--dur-fast) var(--spring),
+    border-color var(--dur-fast) var(--spring),
+    color var(--dur-fast) var(--spring),
+    transform var(--dur-fast) var(--spring);
+}
+
+.scene-control-button:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.08);
+  border-color: var(--hairline-strong);
+}
+
+/* A real press, not just a hover state -- the button's effect is off-screen,
+   so the click has to be felt. */
+.scene-control-button:active { transform: scale(0.97); }
+
+/* Post-click confirmation. Accent rather than a success green: the app has one
+   accent and clearing markers is a normal action, not an outcome. */
+.scene-control-button.flashed {
+  color: var(--accent);
+  background: var(--accent-dim);
+  border-color: var(--accent-glow);
+}
+
+/* ---------------------------------------------------------------------
+   Radial command menu (ui/radial-menu.ts)
+
+   One canvas covering the stage, painted only while a hold gesture is live.
+   Pointer-events are off unconditionally: the menu is driven by the SAME
+   press that opened it, and a canvas that swallowed pointer events would cut
+   that gesture off from the recognizer the instant the ring appeared.
+   ------------------------------------------------------------------- */
+
+.radial-menu-canvas {
+  position: absolute;
+  inset: 0;
+  /* Above the scene canvas, the CUDA blit canvas and the scene-controls strip
+     (z-index 5) -- a menu partially behind a slider panel is a menu with
+     unreachable options. Still below the z-index-10 overlay chrome. */
+  z-index: 8;
+  pointer-events: none;
+  /* Hidden until the first bloom so an idle canvas costs no compositing. The
+     class is toggled by the module, not by a media query. */
+  opacity: 0;
+  transition: opacity 120ms var(--spring);
+}
+
+.radial-menu-canvas.is-live { opacity: 1; }
+
+/* Reduced motion: the spring still runs (it IS the interaction -- the menu has
+   to follow the wheel), but the fade-in that layers on top of it goes away. */
+@media (prefers-reduced-motion: reduce) {
+  .radial-menu-canvas { transition-duration: 0.01ms; }
+}
+
 /* The controls would crowd a short stage; drop them below the fold instead of
    letting them overlap the scene on small windows. */
 @media (max-height: 620px), (max-width: 900px) {
@@ -1611,3 +1687,78 @@ input[type='range']:active::-webkit-slider-thumb { transform: scale(1.06); }
     transition-duration: 0.01ms !important;
   }
 }
+
+/* =====================================================================
+   BEGIN fps stat block (ui/fps-overlay.ts) -- appended lane, do not
+   interleave other rules inside this fence.
+
+   CONTRACTS section 8: avg / min / max / 1% low / 0.1% low in fps at the
+   bottom of the perf card. It is a distribution summary sitting under a
+   live counter, so it is deliberately the quietest thing on the card --
+   the eye should land on the headline first and find this when it goes
+   looking. Hairline above it to separate it from the sim/copy/draw grid
+   without a heavier divider, and micro type with the same tabular figures
+   every other number in this UI wears.
+   ===================================================================== */
+
+.fps-stat-block {
+  display: flex;
+  /* Wraps to a second line on the narrow card widths below rather than
+     needing a breakpoint to switch layouts -- five cells fit at 216px,
+     three or four at the responsive sizes. */
+  flex-wrap: wrap;
+  align-items: baseline;
+  /* Row gap is tighter than the column gap so a wrapped second line reads
+     as a continuation of the block, not a new section. */
+  gap: 2px 9px;
+  padding-top: 7px;
+  border-top: 1px solid var(--hairline);
+  /* The card's flex gap already spaces this from the stat grid; the border
+     wants to sit closer than that or it looks like a floating rule. */
+  margin-top: -2px;
+  font-size: 10px;
+  line-height: 1.35;
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1;
+}
+
+.fps-stat {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 3px;
+  white-space: nowrap;
+}
+
+/* Labels recede; they are fixed text that never changes and does not need
+   to be read twice. */
+.fps-stat-label {
+  color: var(--text-tertiary);
+  letter-spacing: 0.04em;
+}
+
+.fps-stat-value {
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+/* The two low cells are the interesting ones -- a 240 fps average with a
+   40 fps 1% low is a stuttering scene, and that fact should be visible
+   without reading every cell. Slightly brighter, nothing louder. */
+.fps-stat:nth-child(4) .fps-stat-value,
+.fps-stat:nth-child(5) .fps-stat-value {
+  color: rgba(255, 255, 255, 0.78);
+}
+
+/* Matched to the exact breakpoints where .fps-card itself narrows (216 ->
+   190 -> 176px above). Tighten the column gap and the type in lockstep so
+   the block still lands in two rows rather than three at 176px. */
+@media (max-height: 760px), (max-width: 900px) {
+  .fps-stat-block {
+    gap: 2px 7px;
+    font-size: 9.5px;
+    padding-top: 6px;
+  }
+}
+
+/* END fps stat block
+   ===================================================================== */

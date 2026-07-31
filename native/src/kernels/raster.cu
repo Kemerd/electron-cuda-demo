@@ -1223,6 +1223,179 @@ __device__ __forceinline__ float3 ToSrgb(const float3& c) {
   return gsMake(__powf(c.x, 1.0f / 2.2f), __powf(c.y, 1.0f / 2.2f), __powf(c.z, 1.0f / 2.2f));
 }
 
+/* ===================================================================== *
+ *  Marker glyphs
+ *
+ *  Values mirrored BY VALUE from src/renderer/marker-palette.ts
+ *  (MARKER_STYLES) - that module is the single renderer-side definition and
+ *  says so; this is the native copy it refers to. Colors are the same 0xRRGGBB
+ *  literals, normalised to 0..1 and left in DISPLAY space, because the marker
+ *  is composited onto the globe's display-space fragment exactly like the
+ *  three.js overlay does before the one global encode at the end.
+ *
+ *  form: 0 rally (pulsing rings), 1 avoid (dashed warning ring),
+ *        2 vortex (rotating swirl arms), 3 shoot-through (ring + arrow).
+ * ===================================================================== */
+
+/** @brief Palette entry for one behavior. Mirrors MarkerStyle. */
+struct MarkerStyleRef {
+  float3 color;    ///< display-space RGB, from MARKER_STYLES[*].color
+  float  ringScale; ///< footprint radius in globe radii
+  float  spinHz;    ///< animation rate, cycles/second
+};
+
+/**
+ * @brief Look up the style for a GS_BEHAVIOR_* code.
+ *
+ * A switch rather than a constant array: the four cases are compile-time
+ * constants the compiler folds into immediates, so there is no memory traffic
+ * and no risk of an out-of-range index reading garbage.
+ */
+__device__ __forceinline__ MarkerStyleRef MarkerStyleFor(int behavior) {
+  MarkerStyleRef s;
+  switch (behavior) {
+    case GS_BEHAVIOR_AVOID:  // 0xffb340
+      s.color = gsMake(1.0f, 0.702f, 0.251f);
+      s.ringScale = 0.19f;
+      s.spinHz = 0.5f;
+      break;
+    case GS_BEHAVIOR_VORTEX:  // 0xb98cff
+      s.color = gsMake(0.725f, 0.549f, 1.0f);
+      s.ringScale = 0.21f;
+      s.spinHz = 1.4f;
+      break;
+    case GS_BEHAVIOR_SHOOT_THROUGH:  // 0x7dff9b
+      s.color = gsMake(0.490f, 1.0f, 0.608f);
+      s.ringScale = 0.18f;
+      s.spinHz = 1.0f;
+      break;
+    case GS_BEHAVIOR_RALLY:
+    default:  // 0x6ff0d0
+      s.color = gsMake(0.435f, 0.941f, 0.816f);
+      s.ringScale = 0.17f;
+      s.spinHz = 0.85f;
+      break;
+  }
+  return s;
+}
+
+/**
+ * @brief Accumulate every live marker's glyph at one globe surface point.
+ *
+ * Runs per pixel that hit the globe, so it stays analytic and branch-light:
+ * each marker is a couple of dot products plus one ring falloff. Markers whose
+ * footprint does not contain this point cost a single reject test.
+ *
+ * The glyph is drawn in the surface tangent plane at the marker, which is what
+ * makes it sit ON the globe (rotating with it under the camera) rather than
+ * facing the viewer - the same "moving map" rule the dart glyph follows.
+ *
+ * @param n        unit surface normal at the shaded point
+ * @param in       uniforms carrying the marker array
+ * @param timeSec  scene clock, drives pulse/rotation
+ * @return additive display-space color contribution (zero when no marker is near)
+ */
+__device__ float3 MarkerOverlay(const float3& n, const InputUniforms& in, float timeSec) {
+  float3 acc = gsSplat(0.0f);
+
+  const int nTargets = min(in.targetCount, GS_MAX_TARGETS);
+  for (int t = 0; t < nTargets; ++t) {
+    const TargetUniform& tgt = in.targets[t];
+    if (tgt.ttl <= 0.0f) continue;
+
+    const float3 tp = gsMake(tgt.pos[0], tgt.pos[1], tgt.pos[2]);
+    const float tlen2 = gsDot(tp, tp);
+    if (tlen2 < 1e-8f) continue;
+    const float3 tdir = gsScale(tp, gsRsqrt(tlen2));
+
+    const MarkerStyleRef style = MarkerStyleFor(tgt.behavior);
+
+    // Angular distance from the marker centre, measured as chord length in the
+    // tangent plane. Cheaper than an acos and identical in shape over the small
+    // footprint a marker occupies.
+    const float3 offset = gsSub(n, tdir);
+    const float d2 = gsDot(offset, offset);
+    const float radius = style.ringScale;
+    if (d2 > radius * radius) continue;  // outside the footprint
+
+    // Reject the antipode: without this a marker would also draw on the far
+    // side of the globe, where the offset chord is short again.
+    if (gsDot(n, tdir) < 0.0f) continue;
+
+    const float dist = sqrtf(d2);
+    const float rNorm = dist / radius;  // 0 at centre .. 1 at the rim
+
+    // Same TTL fade the forces use, so the glyph dims exactly as its influence
+    // does (CONTRACTS section 8: fade both, no popping).
+    const float fade = gsSmoothstep(0.0f, GS_MARKER_FADE_SEC, tgt.ttl);
+    if (fade <= 0.0f) continue;
+
+    // Local tangent basis at the marker, for the forms that need an angle.
+    const float3 east = gsNormalize(gsCross(gsMake(0.0f, 1.0f, 0.0f), tdir));
+    const float3 north = gsCross(tdir, east);
+    const float ang = atan2f(gsDot(offset, north), gsDot(offset, east));
+
+    const float phase = timeSec * style.spinHz;
+    float intensity = 0.0f;
+
+    switch (tgt.behavior) {
+      case GS_BEHAVIOR_AVOID: {
+        // Dashed warning ring: one ring, chopped into 12 segments that creep
+        // slowly around it.
+        const float ring = 1.0f - gsSmoothstep(0.0f, 0.12f, fabsf(rNorm - 0.80f));
+        const float dash = 0.5f + 0.5f * __cosf((ang - phase * 6.2831853f) * 12.0f);
+        intensity = ring * gsSmoothstep(0.35f, 0.75f, dash);
+        break;
+      }
+
+      case GS_BEHAVIOR_VORTEX: {
+        // Three spiral arms. Adding rNorm to the angle is what curves them:
+        // the arm's angular position drifts with radius.
+        const float spiral =
+            0.5f + 0.5f * __cosf(3.0f * (ang + rNorm * 4.0f) - phase * 6.2831853f);
+        const float body = 1.0f - gsSmoothstep(0.25f, 1.0f, rNorm);
+        intensity = body * gsSmoothstep(0.45f, 0.95f, spiral);
+        break;
+      }
+
+      case GS_BEHAVIOR_SHOOT_THROUGH: {
+        // Ring plus a chevron pointing along the marker's local east axis, so
+        // the glyph reads as "through" rather than "at".
+        const float ring = 1.0f - gsSmoothstep(0.0f, 0.10f, fabsf(rNorm - 0.85f));
+        // Arrow: a bar along east, narrow in north, with the tip animated
+        // sliding through the ring.
+        const float along = gsDot(offset, east) / radius;   // -1 .. 1
+        const float across = gsDot(offset, north) / radius;
+        const float slide = __sinf(phase * 6.2831853f) * 0.35f;
+        const float bar = (1.0f - gsSmoothstep(0.0f, 0.10f, fabsf(across))) *
+                          (1.0f - gsSmoothstep(0.30f, 0.62f, fabsf(along - slide)));
+        intensity = fmaxf(ring, bar);
+        break;
+      }
+
+      case GS_BEHAVIOR_RALLY:
+      default: {
+        // Two concentric rings breathing in and out - a beacon.
+        const float pulse = 0.5f + 0.5f * __sinf(phase * 6.2831853f);
+        const float r0 = 0.55f + 0.18f * pulse;
+        const float r1 = 0.90f;
+        const float ringA = 1.0f - gsSmoothstep(0.0f, 0.10f, fabsf(rNorm - r0));
+        const float ringB = 1.0f - gsSmoothstep(0.0f, 0.07f, fabsf(rNorm - r1));
+        // A soft core dot so the exact placement point stays readable.
+        const float core = 1.0f - gsSmoothstep(0.0f, 0.14f, rNorm);
+        intensity = fmaxf(fmaxf(ringA, ringB * 0.8f), core * 0.9f);
+        break;
+      }
+    }
+
+    if (intensity > 0.0f) {
+      acc = gsAdd(acc, gsScale(style.color, intensity * fade * 0.85f));
+    }
+  }
+
+  return acc;
+}
+
 /**
  * @brief Shade one pixel: sky, globe, volumetrics, splats.
  *
@@ -1355,6 +1528,12 @@ __device__ float3 ShadePixel(int px, int py, int w, int h, const InputUniforms& 
         frag = gsAdd(frag, gsScale(gsMake(0.20f, 0.45f, 0.75f),
                                    fres * (0.25f + 0.55f * dayAmt)));
       }
+
+      // Marker glyphs ride on top of the finished surface, in the same display
+      // space the three.js overlay blends in - so the CUDA and WebGL markers
+      // land on the same colour rather than one being gamma-shifted.
+      // Additive, like every other emissive overlay in this pipeline.
+      frag = gsAdd(frag, MarkerOverlay(n, in, t));
 
       // frag is what three.js puts on screen; fold it into this pipeline's
       // linear working space so the final ToSrgb lands back on exactly frag.

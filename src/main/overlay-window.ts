@@ -680,6 +680,18 @@ function relayAction(payload: unknown): void {
     if (value !== undefined) {
       action = { kind: 'pointScale', value: Math.max(0.01, Math.min(100, value)) };
     }
+  } else if (kind === 'markerTtl') {
+    const value = num(body.value);
+    // Clamped to the slider's own range (interaction.ts MARKER_TTL_MIN/MAX).
+    // The bounds are repeated rather than imported because this file is
+    // main-side and importing a renderer module here would drag the renderer
+    // lane into the main bundle for two numbers.
+    if (value !== undefined) {
+      action = { kind: 'markerTtl', value: Math.max(2, Math.min(60, value)) };
+    }
+  } else if (kind === 'clearMarkers') {
+    // No payload to validate -- the kind IS the whole message.
+    action = { kind: 'clearMarkers' };
   }
 
   if (!action) return;
@@ -747,6 +759,7 @@ function readUiState(payload: unknown): HudUiState | null {
 
   const stormPointScale = num(body.stormPointScale);
   const weatherCoverage = num(body.weatherCoverage);
+  const markerTtlSec = num(body.markerTtlSec);
 
   const chips: HudChip[] = [];
   if (Array.isArray(body.chips)) {
@@ -780,6 +793,12 @@ function readUiState(payload: unknown): HudUiState | null {
     },
     stormPointScale: stormPointScale !== undefined ? stormPointScale : 1,
     weatherCoverage: weatherCoverage !== undefined ? Math.max(0, Math.min(1, weatherCoverage)) : 0,
+    // Absent rather than defaulted when the sender omitted it: the HUD reads
+    // an undefined here as "use the protocol default", which is a different
+    // statement from "the user set it to some number".
+    ...(markerTtlSec !== undefined
+      ? { markerTtlSec: Math.max(2, Math.min(60, markerTtlSec)) }
+      : {}),
     chips,
     note,
   };

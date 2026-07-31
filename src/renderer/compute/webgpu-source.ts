@@ -46,6 +46,7 @@ import {
   MAX_TARGETS,
   MAX_SHOCKWAVES,
   WEATHER_COVERAGE_DEFAULT,
+  TARGET_BEHAVIOR,
 } from '../../shared/protocol';
 import type {
   ComputeBackend,
@@ -54,6 +55,7 @@ import type {
   OkResult,
   SceneId,
   SceneParams,
+  TargetBehavior,
 } from '../../shared/protocol';
 
 import { isFiniteNumber } from '../types';
@@ -81,8 +83,28 @@ import weatherWgsl from './shaders/weather.wgsl?raw';
  *  (vec4 alignment for anything in an array).
  * ------------------------------------------------------------------ */
 
-/** SwarmUniforms: counts(vec4u=16) + timing(vec4f=16) + 8 * Target(32) = 288. */
+/** SwarmUniforms: counts(vec4u=16) + timing(vec4f=16) + 8 * Target(32) = 288.
+ *  Unchanged by the marker system: behavior and id took over padding lanes
+ *  that the Target struct already carried. */
 const SWARM_UNIFORM_BYTES = 16 + 16 + MAX_TARGETS * 32;
+
+/**
+ * TargetPoint.behavior (a protocol.ts string) -> the integer the shaders
+ * compare against. The numbering is defined by GS_BEHAVIOR_* in
+ * native/src/kernels/common.cuh and mirrored by the kBehavior* constants in
+ * swarm.wgsl; addon.cc performs the identical mapping for the CUDA path, so
+ * all three backends agree on what "vortex" means.
+ */
+const BEHAVIOR_CODE: Readonly<Record<TargetBehavior, number>> = Object.freeze({
+  [TARGET_BEHAVIOR.RALLY]: 0,
+  [TARGET_BEHAVIOR.AVOID]: 1,
+  [TARGET_BEHAVIOR.VORTEX]: 2,
+  [TARGET_BEHAVIOR.SHOOT_THROUGH]: 3,
+});
+
+/** Behavior code for anything missing or unrecognised -- matches the addon's
+ *  "absent behavior -> rally" rule. */
+const BEHAVIOR_FALLBACK = BEHAVIOR_CODE[TARGET_BEHAVIOR.RALLY];
 
 /** StormUniforms: counts+timing+pointer+cam (4 * 16) + 8 * Shockwave(16) = 192. */
 const STORM_UNIFORM_BYTES = 16 * 4 + MAX_SHOCKWAVES * 16;
@@ -180,6 +202,20 @@ interface SwarmResources {
   cellCursor: GPUBuffer;
   sortedPos: GPUBuffer;
   sortedVel: GPUBuffer;
+  /**
+   * Shoot-through visited bits, one u32 per agent (bit t = "passed through
+   * marker slot t"). Mirrors SwarmScratch::visited in native/src/kernels/
+   * swarm.cu; the shader clears recycled slots on read via the uniform's
+   * clearMask lane.
+   */
+  visited: GPUBuffer;
+  /**
+   * Last TargetPoint.id seen in each marker slot. A slot whose id changed was
+   * recycled for a different marker, so its visited bits are stale -- the
+   * difference drives clearMask for exactly one frame. Mirrors the
+   * lastTargetId array the CUDA launcher keeps for the same purpose.
+   */
+  lastTargetIds: Float64Array;
   /** Bind group [p] reads records[p] and writes records[1-p]. */
   bindGroups: [GPUBindGroup, GPUBindGroup];
   /** Scratch CPU mirror of the uniform block; written once per frame. */
@@ -454,6 +490,8 @@ export class WebGpuDataSource implements DataSource {
         { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
         { binding: 8, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
         { binding: 9, visibility: GPUShaderStage.COMPUTE, sampler: { type: 'filtering' } },
+        // Shoot-through visited bitmask; read_write, one u32 per agent.
+        { binding: 10, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
       ],
     });
     this.layouts.set('swarm', swarmLayout);
@@ -619,6 +657,15 @@ export class WebGpuDataSource implements DataSource {
       usage: GPUBufferUsage.STORAGE,
     });
 
+    // Shoot-through visited bits: 4 bytes per agent, zero-initialised (a fresh
+    // swarm has passed through nothing). WebGPU zeroes new buffers for us, so
+    // no explicit clear is needed here.
+    const visited = device.createBuffer({
+      label: 'swarm-visited',
+      size: count * 4,
+      usage: GPUBufferUsage.STORAGE,
+    });
+
     const layout = this.layouts.get('swarm');
     if (!layout) throw new Error('swarm bind group layout missing');
 
@@ -648,6 +695,7 @@ export class WebGpuDataSource implements DataSource {
           { binding: 7, resource: { buffer: sortedVel } },
           { binding: 8, resource: windView },
           { binding: 9, resource: windSampler },
+          { binding: 10, resource: { buffer: visited } },
         ],
       });
     };
@@ -662,6 +710,10 @@ export class WebGpuDataSource implements DataSource {
       cellCursor,
       sortedPos,
       sortedVel,
+      visited,
+      // The buffer above starts zeroed, so no slot carries history yet. Ids
+      // start at 0, which is also the "empty slot" value the packer emits.
+      lastTargetIds: new Float64Array(MAX_TARGETS),
       bindGroups: [makeGroup(0), makeGroup(1)],
       uniformStage: new ArrayBuffer(SWARM_UNIFORM_BYTES),
       seeded: false,
@@ -877,6 +929,7 @@ export class WebGpuDataSource implements DataSource {
           { binding: 7, resource: { buffer: s.sortedVel } },
           { binding: 8, resource: windView },
           { binding: 9, resource: windSampler },
+          { binding: 10, resource: { buffer: s.visited } },
         ],
       });
     };
@@ -1127,11 +1180,28 @@ export class WebGpuDataSource implements DataSource {
     const targets = Array.isArray(input?.targets) ? input.targets : [];
     const nTargets = Math.min(targets.length, MAX_TARGETS);
 
+    // Marker slot generations. A slot whose TargetPoint.id differs from the id
+    // seen last frame was recycled, so its shoot-through visited bits describe
+    // a marker that no longer exists; the shader drops exactly those bits on
+    // its next read. Slots past the live count collapse to id 0, so retiring a
+    // marker also retires its bits rather than leaving them for whichever
+    // marker lands in the slot next.
+    let clearMask = 0;
+    const lastIds = s.lastTargetIds;
+    for (let i = 0; i < MAX_TARGETS; i++) {
+      const t = i < nTargets ? targets[i] : undefined;
+      const id = t && isFiniteNumber(t.id) && t.id > 0 ? t.id : 0;
+      if (id !== lastIds[i]) {
+        clearMask |= 1 << i;
+        lastIds[i] = id;
+      }
+    }
+
     // counts : vec4<u32> at byte 0
     u32[0] = count;
     u32[1] = nTargets;
     u32[2] = hasField ? 1 : 0;
-    u32[3] = 0;
+    u32[3] = clearMask;
 
     // timing : vec4<f32> at byte 16 (float index 4)
     f32[4] = dtSec;
@@ -1151,15 +1221,21 @@ export class WebGpuDataSource implements DataSource {
         // ttl <= 0 is the shader's "inactive" test, so a malformed entry
         // deactivates rather than pulling with an undefined weight.
         f32[base + 4] = isFiniteNumber(t.ttl) ? t.ttl : 0;
+
+        // An unknown or absent behavior string falls back to rally, exactly as
+        // the addon's parser does for the CUDA path.
+        const code = t.behavior === undefined ? undefined : BEHAVIOR_CODE[t.behavior];
+        f32[base + 5] = code === undefined ? BEHAVIOR_FALLBACK : code;
+        f32[base + 6] = isFiniteNumber(t.id) ? t.id : 0;
       } else {
         f32[base + 0] = 0;
         f32[base + 1] = 0;
         f32[base + 2] = 0;
         f32[base + 3] = 0;
         f32[base + 4] = 0;
+        f32[base + 5] = BEHAVIOR_FALLBACK;
+        f32[base + 6] = 0;
       }
-      f32[base + 5] = 0;
-      f32[base + 6] = 0;
       f32[base + 7] = 0;
     }
 
@@ -1901,7 +1977,7 @@ export class WebGpuDataSource implements DataSource {
     const s = this.swarm;
     this.swarm = null;
     if (!s) return;
-    for (const b of [s.records[0], s.records[1], s.uniform, s.cellCount, s.cellStart, s.cellCursor, s.sortedPos, s.sortedVel]) {
+    for (const b of [s.records[0], s.records[1], s.uniform, s.cellCount, s.cellStart, s.cellCursor, s.sortedPos, s.sortedVel, s.visited]) {
       try {
         b.destroy();
       } catch (err) {

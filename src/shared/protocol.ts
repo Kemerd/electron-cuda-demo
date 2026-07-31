@@ -212,10 +212,32 @@ export interface MouseState {
   mode: MouseForceMode;
 }
 
+/** What a placed marker asks the swarm to do. */
+export const TARGET_BEHAVIOR = Object.freeze({
+  RALLY: 'rally',                // converge and hold
+  AVOID: 'avoid',                // repel within the influence radius
+  VORTEX: 'vortex',              // orbit the marker axis (tangential swirl)
+  SHOOT_THROUGH: 'shootThrough', // converge once; passing within the capture
+                                 // radius marks the agent visited and releases it
+} as const);
+export type TargetBehavior = (typeof TARGET_BEHAVIOR)[keyof typeof TARGET_BEHAVIOR];
+
+/** Default marker lifetime (seconds) — user-configurable per scene. */
+export const MARKER_TTL_DEFAULT_SEC = 10;
+/** Markers fade (visually AND in force strength) over their final seconds. */
+export const MARKER_FADE_SEC = 2;
+
 export interface TargetPoint {
   pos: Vec3;
   strength: number;
-  ttl: number;          // seconds remaining
+  ttl: number;               // seconds remaining
+  behavior: TargetBehavior;
+  /**
+   * Monotonic placement id. Doubles as the slot-generation key: when a slot
+   * is reused, the sims clear that slot's per-agent visited bits (the
+   * shoot-through memory) exactly once.
+   */
+  id: number;
 }
 
 export interface Shockwave {

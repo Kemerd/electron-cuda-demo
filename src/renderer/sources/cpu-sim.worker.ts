@@ -41,6 +41,7 @@ import {
   MAX_SHOCKWAVES,
   SCENES,
   WEATHER_COVERAGE_DEFAULT,
+  TARGET_BEHAVIOR,
 } from '../../shared/protocol';
 import type { InputState, SceneId, SceneParams } from '../../shared/protocol';
 
@@ -264,6 +265,100 @@ const SWARM_MIN_SPEED = 0.06;
 const SWARM_MAX_SPEED = 0.42;
 const PHASE_PER_UNIT = 42.0;
 const AMBIENT_WEIGHT = 0.35;
+
+/* ---- marker behavior tunables (CONTRACTS section 8) ---------------- *
+ *
+ * The three non-rally behaviors are expressed as multiples of TARGET_WEIGHT
+ * rather than as independent absolute weights. That is deliberate: it means
+ * the four behaviors keep their relative feel automatically if the base pull
+ * is ever retuned, and it makes "avoid is a repulsion with the same falloff"
+ * literally true in the code rather than a claim about two numbers that
+ * happen to match today.
+ */
+
+/** Avoid: repulsion with the SAME falloff as rally, per the contract. */
+const AVOID_WEIGHT_MUL = 1.15;
+
+/** Vortex: tangential swirl strength. */
+const VORTEX_SWIRL_MUL = 1.35;
+
+/**
+ * Vortex: mild centripetal pull, so agents orbit rather than spiral away.
+ * Well under the swirl -- an inward pull that competes with the tangential
+ * term collapses the orbit into a rally point, which is a different behavior.
+ */
+const VORTEX_PULL_MUL = 0.28;
+
+/**
+ * Shoot through: how close an agent must pass, in world units, before it is
+ * marked visited and released. Small relative to the marker's visual ring so
+ * the swarm visibly converges to a point before scattering.
+ */
+const SHOOT_CAPTURE_RADIUS = 0.045;
+
+/**
+ * Shoot through: pull multiplier while still inbound. Stronger than a rally
+ * because the agent only gets one pass -- a soft pull would let the boids
+ * forces deflect the approach and half the swarm would never trigger.
+ */
+const SHOOT_WEIGHT_MUL = 1.5;
+
+/* ------------------------------------------------------------------ *
+ *  Shoot-through visited memory
+ * ------------------------------------------------------------------ */
+
+/**
+ * Per-agent, per-slot visited bits for the shoot-through behavior.
+ *
+ * Laid out as MAX_TARGETS bytes per agent (slot-major within an agent), one
+ * Uint8Array of count * MAX_TARGETS. A bitfield would be 8x smaller, but the
+ * inner loop touches exactly one slot per agent per marker and a byte write
+ * is one store where a bit write is a load-modify-store with a mask -- at two
+ * million agents the memory saved is not worth the read-modify-write on the
+ * hot path, and the array is only 16 MB at the Ultra preset either way.
+ *
+ * Indexing is `agent * MAX_TARGETS + slot`, so an agent's eight slots share a
+ * cache line and the per-marker loop for one agent hits it once.
+ */
+let visitedMask: Uint8Array | null = null;
+
+/**
+ * The TargetPoint.id whose visited bits currently occupy each slot.
+ *
+ * This is the generation key CONTRACTS section 8 describes. When a marker in
+ * slot k has an id different from what this array remembers, the slot has been
+ * reused and its column of visited bytes is stale -- so it is cleared once and
+ * the id recorded. Keying on the id rather than on the index is what makes
+ * this survive interaction.ts's compacting sweep, which moves live markers
+ * between indices whenever an earlier one expires.
+ *
+ * Zero-initialized, and interaction.ts starts its ids at 1, so a fresh array
+ * correctly reads as "no marker has ever occupied this slot".
+ */
+const visitedSlotId = new Int32Array(MAX_TARGETS);
+
+/**
+ * Clear one slot's visited column.
+ *
+ * A strided walk rather than a fill(): the bytes for one slot are
+ * MAX_TARGETS apart, so there is no contiguous run to memset. This runs once
+ * per marker placement, not per frame -- at 2M agents it is a 2M-element
+ * strided write, roughly a millisecond, and it happens only when the user
+ * actually drops a marker into a full set of slots.
+ *
+ * @param slot which of the MAX_TARGETS columns to clear
+ * @param count how many agents are live
+ */
+function clearVisitedSlot(slot: number, count: number): void {
+  const mask = visitedMask;
+  if (!mask) return;
+  if (slot < 0 || slot >= MAX_TARGETS) return;
+
+  const limit = Math.min(count, Math.floor(mask.length / MAX_TARGETS));
+  for (let i = 0; i < limit; i++) {
+    mask[i * MAX_TARGETS + slot] = 0;
+  }
+}
 
 /**
  * Counting-sort scratch for the spatial hash.
@@ -595,6 +690,13 @@ function configure(cmd: ConfigureCmd): void {
   agentAltitude = new Float32Array(count);
   agentSpeedMul = new Float32Array(count);
 
+  // Shoot-through memory. Reallocated with the swarm because it is sized by
+  // agent count; the slot-generation keys are reset alongside it so a marker
+  // that survived the reconfigure re-clears its column against a fresh mask
+  // rather than trusting bits that belonged to a different agent population.
+  visitedMask = new Uint8Array(count * MAX_TARGETS);
+  visitedSlotId.fill(0);
+
   cellCounts = new Int32Array(GRID_CELLS + 1);
   cellCursor = new Int32Array(GRID_CELLS + 1);
   sortedIdx = new Int32Array(count);
@@ -631,6 +733,8 @@ function releaseSwarm(): void {
   swarmCount = 0;
   agentAltitude = null;
   agentSpeedMul = null;
+  visitedMask = null;
+  visitedSlotId.fill(0);
   cellCounts = null;
   cellCursor = null;
   sortedIdx = null;
@@ -1039,6 +1143,33 @@ function stepSwarm(dt: number, input: InputState, useWind: boolean): void {
   const targets = Array.isArray(input.targets) ? input.targets : [];
   const nTargets = Math.min(targets.length, MAX_TARGETS);
 
+  /* --- slot-generation pass (CONTRACTS section 8) ---------------------
+   *
+   * Before any agent is stepped, reconcile each slot's remembered marker id
+   * against what actually occupies it. A mismatch means the slot was reused
+   * since the last step, so its shoot-through visited column is stale and gets
+   * cleared exactly once -- here, outside the agent loop, rather than being
+   * re-detected two million times inside it.
+   *
+   * Slots past nTargets are reset to 0 so that a slot which empties and later
+   * refills is treated as a reuse even if the new marker somehow carried a
+   * matching id.
+   */
+  const mask = visitedMask;
+  if (mask) {
+    for (let k = 0; k < MAX_TARGETS; k++) {
+      const tgt = k < nTargets ? targets[k] : null;
+      const id = tgt && Number.isFinite(tgt.id) ? tgt.id : 0;
+      if (visitedSlotId[k] === id) continue;
+      visitedSlotId[k] = id;
+      // A slot going empty needs no clear -- nothing will read it until it
+      // refills, and that refill is itself a generation change.
+      if (id !== 0) clearVisitedSlot(k, count);
+    }
+  }
+
+  const captureSq = SHOOT_CAPTURE_RADIUS * SHOOT_CAPTURE_RADIUS;
+
   for (let i = 0; i < count; i++) {
     const b = i * SWARM_FLOATS;
 
@@ -1189,7 +1320,14 @@ function stepSwarm(dt: number, input: InputState, useWind: boolean): void {
     const ry = py / plen;
     const rz = pz / plen;
 
-    /* --- targets --- */
+    /* --- markers ---
+     *
+     * Four behaviors over one shared setup (CONTRACTS section 8). The reach,
+     * the fade and the shell-projected direction are identical for all of
+     * them -- only what is done with `to` differs -- which is what makes
+     * "avoid is a repulsion with the same falloff" true by construction
+     * rather than by two constants agreeing.
+     */
     for (let k = 0; k < nTargets; k++) {
       const tgt = targets[k];
       if (!tgt || tgt.ttl <= 0) continue;
@@ -1201,23 +1339,23 @@ function stepSwarm(dt: number, input: InputState, useWind: boolean): void {
       const tz0 = tp[2] ?? 0;
 
       const tlen = Math.hypot(tx0, ty0, tz0);
-      if (tlen < 1e-4) continue; // degenerate target at the globe centre
+      if (tlen < 1e-4) continue; // degenerate marker at the globe centre
 
       const tdx = tx0 / tlen;
       const tdy = ty0 / tlen;
       const tdz = tz0 / tlen;
 
-      // Angular reach on the shell, not euclidean distance: a rally point on
+      // Angular reach on the shell, not euclidean distance: a marker on
       // the far side of the globe must not drag agents through the core.
       const facing = rx * tdx + ry * tdy + rz * tdz;
       const reach = smoothstep(TARGET_REACH_DOT, 1, facing);
       if (reach <= 0) continue;
 
-      // Fade as the target expires so formations dissolve rather than snapping
+      // Fade as the marker expires so formations dissolve rather than snapping
       // apart the instant ttl crosses zero.
       const ttlFade = smoothstep(0, 0.75, tgt.ttl);
 
-      // Steer along the shell toward the target, not straight at it -- a direct
+      // Steer along the shell toward the marker, not straight at it -- a direct
       // pull would drive agents into the globe surface.
       const toX = tdx * altitude - px;
       const toY = tdy * altitude - py;
@@ -1225,7 +1363,74 @@ function stepSwarm(dt: number, input: InputState, useWind: boolean): void {
       const len2 = toX * toX + toY * toY + toZ * toZ;
       if (len2 < 1e-12) continue;
 
-      const k2 = (tgt.strength * TARGET_WEIGHT * reach * ttlFade) / Math.sqrt(len2);
+      const dist = Math.sqrt(len2);
+      const base = tgt.strength * TARGET_WEIGHT * reach * ttlFade;
+      const behavior = tgt.behavior;
+
+      /* ---- AVOID: repulsion, same falloff, opposite sign ---- */
+      if (behavior === TARGET_BEHAVIOR.AVOID) {
+        const k2 = (base * AVOID_WEIGHT_MUL) / dist;
+        accX -= toX * k2;
+        accY -= toY * k2;
+        accZ -= toZ * k2;
+        continue;
+      }
+
+      /* ---- VORTEX: tangential swirl + mild centripetal pull ---- */
+      if (behavior === TARGET_BEHAVIOR.VORTEX) {
+        // The swirl axis is the marker's own radial direction (its surface
+        // normal), so agents orbit the marker within the shell rather than
+        // around some world axis that would look wrong everywhere but the
+        // equator. cross(axis, to) is the tangential direction.
+        const swX = tdy * toZ - tdz * toY;
+        const swY = tdz * toX - tdx * toZ;
+        const swZ = tdx * toY - tdy * toX;
+
+        const swLen = Math.hypot(swX, swY, swZ);
+        if (swLen > 1e-9) {
+          const k2 = (base * VORTEX_SWIRL_MUL) / swLen;
+          accX += swX * k2;
+          accY += swY * k2;
+          accZ += swZ * k2;
+        }
+
+        // Centripetal component: without it the tangential force alone lets
+        // agents drift outward until they leave the reach cone entirely, and
+        // the vortex quietly evaporates.
+        const kp = (base * VORTEX_PULL_MUL) / dist;
+        accX += toX * kp;
+        accY += toY * kp;
+        accZ += toZ * kp;
+        continue;
+      }
+
+      /* ---- SHOOT THROUGH: converge once, then release ---- */
+      if (behavior === TARGET_BEHAVIOR.SHOOT_THROUGH) {
+        // An agent that has already transited this marker ignores it for the
+        // rest of the marker's life -- momentum carries it clear, which is
+        // the whole point of the behavior.
+        if (mask) {
+          const mi = i * MAX_TARGETS + k;
+          if ((mask[mi] ?? 0) !== 0) continue;
+
+          // Inside the capture radius: mark visited and release THIS frame.
+          // No force is applied on the capture frame, so the agent leaves
+          // with exactly the velocity it arrived with.
+          if (len2 <= captureSq) {
+            mask[mi] = 1;
+            continue;
+          }
+        }
+
+        const k2 = (base * SHOOT_WEIGHT_MUL) / dist;
+        accX += toX * k2;
+        accY += toY * k2;
+        accZ += toZ * k2;
+        continue;
+      }
+
+      /* ---- RALLY (and anything unrecognized): the original attraction ---- */
+      const k2 = base / dist;
       accX += toX * k2;
       accY += toY * k2;
       accZ += toZ * k2;
