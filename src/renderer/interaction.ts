@@ -204,9 +204,22 @@ export function placeTarget(
     return null;
   }
 
-  // An unrecognized behavior resolves to rally rather than reaching a kernel
-  // that would index a jump table with it.
-  const kind: TargetBehavior = isTargetBehavior(behavior) ? behavior : TARGET_BEHAVIOR.RALLY;
+  // An unrecognized behavior resolves to the INERT pin rather than reaching a
+  // kernel that would index a jump table with it. Not rally: CONTRACTS
+  // section 8 requires an unknown behavior to produce zero force in every
+  // backend, and a garbled value that quietly becomes an attractor is the
+  // exact failure the rule exists to prevent. A caller that passes nothing at
+  // all still gets rally -- that is the documented default for a plain click,
+  // and it is a different case from a value that arrived and was rejected.
+  const kind: TargetBehavior =
+    behavior === null || behavior === undefined
+      ? TARGET_BEHAVIOR.RALLY
+      : isTargetBehavior(behavior)
+        ? behavior
+        : TARGET_BEHAVIOR.MARKER;
+  if (kind === TARGET_BEHAVIOR.MARKER && behavior !== TARGET_BEHAVIOR.MARKER) {
+    console.warn('[interaction] unrecognized marker behavior; placing an inert pin');
+  }
 
   const entry: TargetPoint = {
     pos: [x, y, z],
@@ -254,13 +267,60 @@ export function clearTargets(input: InputState): number {
   return removed;
 }
 
+/**
+ * Delete one marker by id (the context picker's "Remove").
+ *
+ * Keyed on the id rather than the array index for the same reason the sims
+ * are: ageInteractions() compacts the array every frame, so an index captured
+ * when the picker opened can point at a different marker 300 ms later when the
+ * user releases. The id cannot drift.
+ *
+ * @param input shared input struct, mutated in place
+ * @param id the TargetPoint.id to remove
+ * @returns true when a marker was actually removed
+ */
+export function removeTargetById(input: InputState, id: number): boolean {
+  if (!input || !Array.isArray(input.targets)) return false;
+  if (!Number.isFinite(id)) return false;
+
+  for (let i = 0; i < input.targets.length; i++) {
+    const t = input.targets[i];
+    if (!t || t.id !== id) continue;
+    input.targets.splice(i, 1);
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Find a live marker by id, or null.
+ *
+ * The Info chip needs the marker's CURRENT ttl rather than the value it had
+ * when the picker opened, so it re-reads through this on every frame it is
+ * visible -- which is also how the chip notices the marker expiring underneath
+ * it and dismisses itself.
+ */
+export function findTargetById(
+  input: InputState | null | undefined,
+  id: number,
+): TargetPoint | null {
+  if (!input || !Array.isArray(input.targets)) return null;
+  if (!Number.isFinite(id)) return null;
+
+  for (const t of input.targets) {
+    if (t && t.id === id) return t;
+  }
+  return null;
+}
+
 /** Runtime guard for a behavior arriving from outside TypeScript's reach. */
 function isTargetBehavior(value: unknown): value is TargetBehavior {
   return (
     value === TARGET_BEHAVIOR.RALLY ||
     value === TARGET_BEHAVIOR.AVOID ||
     value === TARGET_BEHAVIOR.VORTEX ||
-    value === TARGET_BEHAVIOR.SHOOT_THROUGH
+    value === TARGET_BEHAVIOR.SHOOT_THROUGH ||
+    value === TARGET_BEHAVIOR.MARKER
   );
 }
 

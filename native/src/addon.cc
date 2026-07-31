@@ -18,6 +18,7 @@
 #include <napi.h>
 
 #include <cstring>
+#include <set>
 #include <string>
 
 #include "engine.h"
@@ -84,12 +85,22 @@ bool GetBoolOr(const Napi::Object& obj, const char* key, bool fallback) {
  * mapping lives here so it happens once per marker per frame rather than once
  * per marker per agent.
  *
- * Every failure mode - key absent, wrong type, empty, an unrecognised verb
- * from a newer renderer talking to an older addon - resolves to RALLY, which
- * is the documented fallback and also the least surprising force to apply.
+ * The two failure modes resolve DIFFERENTLY, and the distinction is the whole
+ * point of the function (common.cuh carries the same note next to the enum):
+ *
+ *   ABSENT / not a string -> RALLY. This is the backward-compatibility path. A
+ *   renderer that predates the marker system sends targets with no behavior
+ *   field at all, and those were rally points; making them anything else would
+ *   silently change the behaviour of an older client.
+ *
+ *   PRESENT but unrecognised -> MARKER (inert). Someone is sending a verb this
+ *   build does not implement, which means the input is wrong. CONTRACTS
+ *   section 8 requires that case to produce zero force: a swarm that converges
+ *   because of a typo is a far worse outcome than one that ignores it, and the
+ *   inert code is the one value guaranteed to do nothing in every backend.
  *
  * @param obj the marker object from InputState.targets[]
- * @return one of GS_BEHAVIOR_RALLY / AVOID / VORTEX / SHOOT_THROUGH
+ * @return one of the GS_BEHAVIOR_* codes; never an out-of-range value
  */
 int GetBehaviorOr(const Napi::Object& obj, const char* key) {
   if (!obj.Has(key)) return GS_BEHAVIOR_RALLY;
@@ -101,12 +112,23 @@ int GetBehaviorOr(const Napi::Object& obj, const char* key) {
   if (s == "avoid") return GS_BEHAVIOR_AVOID;
   if (s == "vortex") return GS_BEHAVIOR_VORTEX;
   if (s == "shootThrough") return GS_BEHAVIOR_SHOOT_THROUGH;
+  if (s == "marker") return GS_BEHAVIOR_MARKER;
 
-  // Unknown verb: not worth failing the frame over, but worth saying once so a
-  // protocol drift does not silently behave as a rally point forever.
-  fprintf(stderr, "[cuda_engine] setInput: unknown target behavior '%s', using rally.\n",
-          s.c_str());
-  return GS_BEHAVIOR_RALLY;
+  // Unknown verb. Worth saying out loud so a protocol drift does not just
+  // manifest as markers that mysteriously do nothing - but setInput runs every
+  // frame, so an unconditional print would put 60 lines a second on the console
+  // for as long as the bad marker lives. One line per distinct verb is enough
+  // to diagnose it; the static set is only ever touched from the Node main
+  // thread, which is where every N-API call is serialised.
+  static std::set<std::string> warned;
+  if (warned.insert(s).second) {
+    fprintf(stderr,
+            "[cuda_engine] setInput: unknown target behavior '%s' - treating it as inert "
+            "(no force). Known: rally|avoid|vortex|shootThrough|marker.\n",
+            s.c_str());
+    fflush(stderr);
+  }
+  return GS_BEHAVIOR_MARKER;
 }
 
 /**

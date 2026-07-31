@@ -1234,7 +1234,8 @@ __device__ __forceinline__ float3 ToSrgb(const float3& c) {
  *  three.js overlay does before the one global encode at the end.
  *
  *  form: 0 rally (pulsing rings), 1 avoid (dashed warning ring),
- *        2 vortex (rotating swirl arms), 3 shoot-through (ring + arrow).
+ *        2 vortex (rotating swirl arms), 3 shoot-through (ring + arrow),
+ *        4 marker (static neutral pin - the passive annotation).
  * ===================================================================== */
 
 /** @brief Palette entry for one behavior. Mirrors MarkerStyle. */
@@ -1268,6 +1269,16 @@ __device__ __forceinline__ MarkerStyleRef MarkerStyleFor(int behavior) {
       s.color = gsMake(0.490f, 1.0f, 0.608f);
       s.ringScale = 0.18f;
       s.spinHz = 1.0f;
+      break;
+    case GS_BEHAVIOR_MARKER:  // 0xc8d2e0
+      // Neutral slate, deliberately outside the accent (cyan) and warning
+      // (amber) families that marker-palette.ts reserves for behaviors which
+      // actually DO something - a passive pin should not read as an action.
+      // spinHz 0: the pin is static, which is itself the visual cue that this
+      // marker exerts no force. Every other glyph moves.
+      s.color = gsMake(0.784f, 0.824f, 0.878f);
+      s.ringScale = 0.14f;
+      s.spinHz = 0.0f;
       break;
     case GS_BEHAVIOR_RALLY:
     default:  // 0x6ff0d0
@@ -1370,6 +1381,26 @@ __device__ float3 MarkerOverlay(const float3& n, const InputUniforms& in, float 
         const float bar = (1.0f - gsSmoothstep(0.0f, 0.10f, fabsf(across))) *
                           (1.0f - gsSmoothstep(0.30f, 0.62f, fabsf(along - slide)));
         intensity = fmaxf(ring, bar);
+        break;
+      }
+
+      case GS_BEHAVIOR_MARKER: {
+        // Passive pin: a solid centre dot inside one thin, STATIC ring, with a
+        // short cross hair breaking the gap so the exact annotated point is
+        // readable at small projected sizes. Nothing here uses `phase` - the
+        // complete absence of motion is the cue that this marker exerts no
+        // force, which is the one thing a viewer needs to infer from it.
+        const float core = 1.0f - gsSmoothstep(0.16f, 0.26f, rNorm);
+        const float ring = 1.0f - gsSmoothstep(0.0f, 0.06f, fabsf(rNorm - 0.78f));
+
+        // Tick marks at the four cardinal directions of the local basis. The
+        // abs(cos) term is 1 on the axes and 0 between them; raising it to the
+        // 16th power narrows each tick to a short spur.
+        const float axis = fmaxf(fabsf(__cosf(ang * 2.0f)), 0.0f);
+        const float spur = __powf(axis, 16.0f) *
+                           (1.0f - gsSmoothstep(0.34f, 0.66f, fabsf(rNorm - 0.50f)));
+
+        intensity = fmaxf(fmaxf(core, ring * 0.85f), spur * 0.55f);
         break;
       }
 

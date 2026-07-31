@@ -690,6 +690,31 @@ export function createBenchRunner(host: BenchHost, hooks: BenchCallbacks): Bench
 
     samples.reset();
     applyResult = null;
+
+    // A cell the plan already ruled out never reaches the router.
+    //
+    // The 'configuring' case in tick() records the skip correctly, but it only
+    // runs on the NEXT tick -- by which time this function has already asked the
+    // host to switch into a mode the environment cannot support. In the browser
+    // build that meant a CUDA cell really did drive `mode -> cuda/cuda/native*`,
+    // build a blit presenter, and fail to create a source, once per skipped
+    // cell, before being recorded as unsupported. Nothing crashed, but the app
+    // was walked through four impossible mode changes for rows whose outcome was
+    // decided at plan time, and it logged an error for each.
+    //
+    // Entering 'configuring' WITHOUT setting configureInFlight is what makes the
+    // hand-off clean: tick() sees the skipReason first, publishes the row and
+    // advances, and the no-configure path it takes is the one that was already
+    // written for exactly this case.
+    if (planned.skipReason !== null) {
+      configureInFlight = false;
+      // Retire any reply still owed by a previous cell, so a late resolution
+      // cannot land on this one's state.
+      applyToken++;
+      enterPhase('configuring', nowMs);
+      return;
+    }
+
     configureInFlight = true;
     const token = ++applyToken;
 

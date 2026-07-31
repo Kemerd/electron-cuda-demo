@@ -64,6 +64,10 @@ const kBehaviorRally        : f32 = 0.0;
 const kBehaviorAvoid        : f32 = 1.0;
 const kBehaviorVortex       : f32 = 2.0;
 const kBehaviorShootThrough : f32 = 3.0;
+// Passive pin: no force, in any backend. It is also where every unrecognised
+// code lands -- see the force loop, which applies a force only on an EXACT
+// match against a known behavior. Bad input must never move the swarm.
+const kBehaviorMarker       : f32 = 4.0;
 
 // Marker fade window, seconds. protocol.ts: MARKER_FADE_SEC = 2.
 const kMarkerFadeSec : f32 = 2.0;
@@ -764,6 +768,12 @@ fn force(@builtin(global_invocation_id) gid : vec3<u32>) {
     let ttl = tgt.ttlPad.x;
     if (ttl <= 0.0) { continue; }              // expired
 
+    // Force-free codes are rejected before the expensive part, so an inert pin
+    // costs one compare rather than a normalize, a smoothstep and two
+    // inverseSqrts per agent per frame. The dispatch below still applies force
+    // only on an exact match, so this is an optimisation, not the guarantee.
+    if (tgt.ttlPad.y == kBehaviorMarker) { continue; }
+
     let tp = tgt.posStrength.xyz;
     let tlen2 = dot(tp, tp);
     if (tlen2 < 1e-8) { continue; }            // degenerate target at the centre
@@ -792,7 +802,11 @@ fn force(@builtin(global_invocation_id) gid : vec3<u32>) {
     let gain = tgt.posStrength.w * kTargetWeight * reach * ttlFade;
     let behavior = tgt.ttlPad.y;
 
-    if (behavior == kBehaviorAvoid) {
+    if (behavior == kBehaviorRally) {
+      // The original attraction. Steer along the shell toward the marker.
+      accel = accel + toTarget * (gain * invLen);
+
+    } else if (behavior == kBehaviorAvoid) {
       // Same falloff as rally with the sign flipped.
       accel = accel - toTarget * (gain * invLen);
 
@@ -820,8 +834,11 @@ fn force(@builtin(global_invocation_id) gid : vec3<u32>) {
       }
 
     } else {
-      // Rally, and the safe landing spot for an unrecognised behavior value.
-      accel = accel + toTarget * (gain * invLen);
+      // kBehaviorMarker and anything this build does not recognise: no force at
+      // all. The chain tests for rally EXPLICITLY rather than letting it be the
+      // trailing else, which is the whole point -- CONTRACTS section 8 makes
+      // zero force the defensive default so a garbled uniform cannot pull the
+      // entire swarm across the globe while looking like a working feature.
     }
   }
 

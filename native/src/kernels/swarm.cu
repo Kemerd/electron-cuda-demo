@@ -653,6 +653,12 @@ void SwarmForceKernel(float* __restrict__ records, unsigned int count, float dtS
       const TargetUniform& tgt = input->targets[t];
       if (tgt.ttl <= 0.0f) continue;  // expired
 
+      // Force-free codes are rejected here rather than at the switch below, so
+      // an inert pin costs one compare instead of a normalize, a smoothstep and
+      // two rsqrts per agent per frame. The switch still defaults to no force -
+      // this is an optimisation, not the guarantee.
+      if (tgt.behavior == GS_BEHAVIOR_MARKER) continue;
+
       const float3 tp = gsMake(tgt.pos[0], tgt.pos[1], tgt.pos[2]);
       const float tlen2 = gsDot(tp, tp);
       if (tlen2 < 1e-8f) continue;  // degenerate target at the globe centre
@@ -726,11 +732,21 @@ void SwarmForceKernel(float* __restrict__ records, unsigned int count, float dtS
           break;
         }
 
-        case GS_BEHAVIOR_RALLY:
-        default: {
-          // Rally, and the safe landing spot for any behavior integer this
-          // build does not know about.
+        case GS_BEHAVIOR_RALLY: {
+          // The original attraction. Steer along the shell toward the marker.
           accel = gsAdd(accel, gsScale(toTarget, gain * invLen));
+          break;
+        }
+
+        case GS_BEHAVIOR_MARKER:
+        default: {
+          // Inert. A passive pin contributes nothing to the solver, and so does
+          // any behavior integer this build does not recognise - CONTRACTS
+          // section 8 makes zero force the defensive default precisely so bad
+          // input cannot command the swarm. Falling through to rally here
+          // (which is what this switch used to do) would mean a garbled uniform
+          // pulls two million agents across the globe, which looks exactly like
+          // a working feature and is the hardest possible failure to notice.
           break;
         }
       }

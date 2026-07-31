@@ -784,6 +784,89 @@ function runSmoke() {
     `${reuseAfter.toFixed(5)}\n`
   );
 
+  /* --- inert behaviors ------------------------------------------------ */
+  // CONTRACTS section 8: the 'marker' behavior exerts NO force, and an
+  // UNRECOGNISED behavior value must not exert one either. Both are checked the
+  // same way, and the check is much stronger than a distance comparison.
+  //
+  // The solver is deterministic: same seed, same dt, same step count, same
+  // input -> bit-identical records. So "exerts no force" is testable exactly.
+  // Run a reference with an EMPTY target list, then re-seed and run the same
+  // number of identical steps with the marker planted, and require the two
+  // checksums to match. A behavior that leaked even one agent's worth of
+  // acceleration would change the hash.
+  //
+  // This is the assertion that catches the specific regression the spec is
+  // guarding against: a behavior switch whose default branch falls through to
+  // rally. A distance test could not - a rally marker at the pole moves the
+  // mean distance in the same direction the flock drifts on its own.
+  const idleSteps = 45;
+
+  /**
+   * Drive `idleSteps` identical steps with a fixed target list and hash the
+   * resulting records.
+   *
+   * @param {Array<object>} targets InputState.targets for every step
+   * @returns {{hash:number, nonFinite:number}} checksum of the final records
+   */
+  const runInert = (targets) => {
+    for (let i = 0; i < idleSteps; i++) {
+      engine.setInput({
+        mouse: { x: 0.5, y: 0.5, down: false, mode: 0 },
+        pointerWorld: null,
+        targets,
+        shockwaves: [],
+        camera: { pos: [0, 0, 3], quat: [0, 0, 0, 1], fovYDeg: 50, aspect: 16 / 9 },
+        timeSec: i * 0.016,
+      });
+      engine.step('swarm', 16.0, out);
+    }
+    return checksum(view);
+  };
+
+  if (!reseed()) {
+    fail('markers', 'could not re-seed before the no-target reference run.');
+    return;
+  }
+  const reference = runInert([]);
+  if (reference.nonFinite > 0) {
+    fail('markers', 'the no-target reference run produced non-finite floats.');
+    return;
+  }
+
+  // Each case pairs a label with the target list to plant. The bogus verb also
+  // exercises addon.cc's unknown-string path, which must map to the inert code
+  // rather than to rally.
+  const inertCases = [
+    ['marker (passive pin)', 'marker'],
+    ['unknown behavior', 'notARealBehavior'],
+  ];
+
+  for (const [label, behavior] of inertCases) {
+    if (!reseed()) {
+      fail('markers', `could not re-seed before the ${label} probe.`);
+      return;
+    }
+    const got = runInert([
+      { pos: MARKER_POS, strength: 1.0, ttl: 30.0, behavior, id: 7 },
+    ]);
+
+    if (got.nonFinite > 0) {
+      fail('markers', `${label} produced ${got.nonFinite} non-finite floats.`);
+      return;
+    }
+    if (got.hash !== reference.hash) {
+      fail('markers',
+           `${label} changed the simulation (hash ${got.hash} vs no-target ` +
+           `reference ${reference.hash}) - it must exert zero force.`);
+      return;
+    }
+
+    process.stdout.write(
+      `[smoke] inert ${label.padEnd(21)} hash ${got.hash} == no-target reference (zero force)\n`
+    );
+  }
+
   /* --- renderFrame --------------------------------------------------- */
   const RW = 320;
   const RH = 180;

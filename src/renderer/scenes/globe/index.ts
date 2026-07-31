@@ -201,7 +201,7 @@ export default function createScene(): Scene {
 
       // ---- camera rig ----
       // The rig owns marker placement: it runs the whole gesture state machine
-      // (click discrimination, middle-click, the press-and-hold radial menu)
+      // (click discrimination, middle-click, the press-and-hold wheel picker)
       // and hands us a world position plus the behavior the user chose.
       rig = createGlobeControls(renderer.domElement, {
         onPlaceTarget: (pos, behavior) => {

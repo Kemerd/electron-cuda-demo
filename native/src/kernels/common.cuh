@@ -87,15 +87,28 @@
  *  Marker behaviors - mirrors TARGET_BEHAVIOR in src/shared/protocol.ts.
  *
  *  protocol.ts carries these as STRINGS ('rally' | 'avoid' | 'vortex' |
- *  'shootThrough'); addon.cc maps the string to the integer below once, at
- *  parse time, so the kernels compare ints instead of chasing chars. The
- *  numbering is this file's own contract with addon.cc - protocol.ts does not
- *  name the integers, so it must not be reordered casually.
+ *  'shootThrough' | 'marker'); addon.cc maps the string to the integer below
+ *  once, at parse time, so the kernels compare ints instead of chasing chars.
+ *  The numbering is this file's own contract with addon.cc - protocol.ts does
+ *  not name the integers, so it must not be reordered casually.
+ *
+ *  Two DIFFERENT defaults live in this system and they are easy to confuse:
+ *
+ *    - A marker whose behavior FIELD IS ABSENT (an older renderer that predates
+ *      the marker system) parses to RALLY. That is the compatibility default:
+ *      those targets were rally points and must keep behaving as rally points.
+ *
+ *    - A behavior integer the KERNEL DOES NOT RECOGNISE resolves to ZERO FORCE,
+ *      not to rally. CONTRACTS section 8 states this explicitly, and the reason
+ *      is worth keeping written down: an unknown value means the input is
+ *      wrong, and the failure mode of "wrong input silently attracts two
+ *      million agents" is far worse than "wrong input does nothing visible".
+ *      Bad data must never be able to command the swarm.
  * ---------------------------------------------------------------------- */
 
-/** Converge and hold - the original attraction force. Also the fallback for
- *  an absent/unrecognised behavior string, matching the doc's "missing ->
- *  rally" rule. */
+/** Converge and hold - the original attraction force. Also the parse-time
+ *  fallback for an ABSENT behavior string (see the note above; an unknown
+ *  behavior INTEGER is a different case and yields no force at all). */
 #define GS_BEHAVIOR_RALLY 0
 /** Repulsion: identical falloff to rally with the sign flipped. */
 #define GS_BEHAVIOR_AVOID 1
@@ -105,6 +118,10 @@
 /** Attraction that releases once the agent has passed within the capture
  *  radius; the per-agent visited bit for the slot remembers that it did. */
 #define GS_BEHAVIOR_SHOOT_THROUGH 3
+/** Passive reference pin. Exerts NO force in any backend - it exists purely so
+ *  a spot can be annotated. Still drawn, still ages out on its TTL, but the
+ *  solver's behavior switch treats it exactly like an unknown code. */
+#define GS_BEHAVIOR_MARKER 4
 
 /** Marker lifetime defaults. protocol.ts: MARKER_TTL_DEFAULT_SEC = 10,
  *  MARKER_FADE_SEC = 2. Only the fade window is read by the kernels (the TTL

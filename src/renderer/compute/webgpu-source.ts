@@ -100,11 +100,28 @@ const BEHAVIOR_CODE: Readonly<Record<TargetBehavior, number>> = Object.freeze({
   [TARGET_BEHAVIOR.AVOID]: 1,
   [TARGET_BEHAVIOR.VORTEX]: 2,
   [TARGET_BEHAVIOR.SHOOT_THROUGH]: 3,
+  [TARGET_BEHAVIOR.MARKER]: 4,
 });
 
-/** Behavior code for anything missing or unrecognised -- matches the addon's
- *  "absent behavior -> rally" rule. */
-const BEHAVIOR_FALLBACK = BEHAVIOR_CODE[TARGET_BEHAVIOR.RALLY];
+/**
+ * Code for a marker whose behavior field is ABSENT.
+ *
+ * Rally, matching GetBehaviorOr() in addon.cc: a caller that predates the
+ * marker system sends targets with no behavior at all, and those were rally
+ * points. Changing what they do would silently break an older client.
+ */
+const BEHAVIOR_ABSENT = BEHAVIOR_CODE[TARGET_BEHAVIOR.RALLY];
+
+/**
+ * Code for a behavior string this build does not recognise.
+ *
+ * Deliberately NOT rally. CONTRACTS section 8 requires an unrecognised value to
+ * produce zero force in every backend, on the reasoning that a swarm which
+ * converges because of a typo is a much worse failure than one that ignores it
+ * -- the first looks like a working feature. The inert marker code is the one
+ * value guaranteed to do nothing everywhere.
+ */
+const BEHAVIOR_UNKNOWN = BEHAVIOR_CODE[TARGET_BEHAVIOR.MARKER];
 
 /** StormUniforms: counts+timing+pointer+cam (4 * 16) + 8 * Shockwave(16) = 192. */
 const STORM_UNIFORM_BYTES = 16 * 4 + MAX_SHOCKWAVES * 16;
@@ -1222,18 +1239,26 @@ export class WebGpuDataSource implements DataSource {
         // deactivates rather than pulling with an undefined weight.
         f32[base + 4] = isFiniteNumber(t.ttl) ? t.ttl : 0;
 
-        // An unknown or absent behavior string falls back to rally, exactly as
-        // the addon's parser does for the CUDA path.
-        const code = t.behavior === undefined ? undefined : BEHAVIOR_CODE[t.behavior];
-        f32[base + 5] = code === undefined ? BEHAVIOR_FALLBACK : code;
+        // Absent -> rally (compatibility), present-but-unrecognised -> inert.
+        // The same two-default split addon.cc applies for the CUDA path; see
+        // BEHAVIOR_ABSENT / BEHAVIOR_UNKNOWN for why they differ.
+        if (t.behavior === undefined || t.behavior === null) {
+          f32[base + 5] = BEHAVIOR_ABSENT;
+        } else {
+          const code = BEHAVIOR_CODE[t.behavior];
+          f32[base + 5] = typeof code === 'number' ? code : BEHAVIOR_UNKNOWN;
+        }
         f32[base + 6] = isFiniteNumber(t.id) ? t.id : 0;
       } else {
+        // Nothing in this slot. ttl 0 already deactivates it; the inert code is
+        // belt and braces so the slot cannot exert force even if a future edit
+        // changes what the shader treats as active.
         f32[base + 0] = 0;
         f32[base + 1] = 0;
         f32[base + 2] = 0;
         f32[base + 3] = 0;
         f32[base + 4] = 0;
-        f32[base + 5] = BEHAVIOR_FALLBACK;
+        f32[base + 5] = BEHAVIOR_UNKNOWN;
         f32[base + 6] = 0;
       }
       f32[base + 7] = 0;

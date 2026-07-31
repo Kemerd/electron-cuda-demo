@@ -936,19 +936,24 @@ input[type='range']:active::-webkit-slider-thumb { transform: scale(1.06); }
 }
 
 /* ---------------------------------------------------------------------
-   Radial command menu (ui/radial-menu.ts)
+   Wheel picker (ui/wheel-picker.ts)
 
    One canvas covering the stage, painted only while a hold gesture is live.
-   Pointer-events are off unconditionally: the menu is driven by the SAME
+   Pointer-events are off unconditionally: the picker is driven by the SAME
    press that opened it, and a canvas that swallowed pointer events would cut
-   that gesture off from the recognizer the instant the ring appeared.
+   that gesture off from the recognizer the instant the panel appeared.
+
+   The panel itself -- glass, rounded rect, lens hairlines, drum shading -- is
+   drawn in the canvas rather than styled here, because every one of those
+   values is animated by a spring at up to 240 Hz. CSS owns only what does not
+   change per frame: where the canvas sits and whether it composites at all.
    ------------------------------------------------------------------- */
 
-.radial-menu-canvas {
+.wheel-picker-canvas {
   position: absolute;
   inset: 0;
   /* Above the scene canvas, the CUDA blit canvas and the scene-controls strip
-     (z-index 5) -- a menu partially behind a slider panel is a menu with
+     (z-index 5) -- a picker partially behind a slider panel is a picker with
      unreachable options. Still below the z-index-10 overlay chrome. */
   z-index: 8;
   pointer-events: none;
@@ -958,12 +963,12 @@ input[type='range']:active::-webkit-slider-thumb { transform: scale(1.06); }
   transition: opacity 120ms var(--spring);
 }
 
-.radial-menu-canvas.is-live { opacity: 1; }
+.wheel-picker-canvas.is-live { opacity: 1; }
 
-/* Reduced motion: the spring still runs (it IS the interaction -- the menu has
+/* Reduced motion: the spring still runs (it IS the interaction -- the drum has
    to follow the wheel), but the fade-in that layers on top of it goes away. */
 @media (prefers-reduced-motion: reduce) {
-  .radial-menu-canvas { transition-duration: 0.01ms; }
+  .wheel-picker-canvas { transition-duration: 0.01ms; }
 }
 
 /* The controls would crowd a short stage; drop them below the fold instead of

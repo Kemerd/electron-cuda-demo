@@ -146,7 +146,7 @@ const MARKER_FRAGMENT = /* glsl */ `
       // Bright eye at the centre.
       a += (1.0 - smoothstep(0.0, 0.13, r)) * 0.8;
 
-    } else {
+    } else if (uForm < 3.5) {
       /* ---- form 3: SHOOT THROUGH -- ring with a pass-through arrow ---- */
       // The ring is the capture radius; the arrow says the swarm transits it
       // rather than stopping in it.
@@ -172,6 +172,34 @@ const MARKER_FRAGMENT = /* glsl */ `
       // Four capture ticks on the ring itself.
       a += step(0.93, abs(cos(ang * 2.0))) *
            (1.0 - smoothstep(0.0, 0.10, abs(r - 0.62))) * 0.5;
+
+    } else {
+      /* ---- form 4: MARKER -- the passive reference pin ---- */
+      // Deliberately the only form with no phase term anywhere in it. The
+      // other four animate because something is happening to the swarm; this
+      // one is an annotation, and a pin that pulsed would be claiming an
+      // effect it does not have. Stillness IS the signal here.
+
+      // A crosshair rather than a ring: a ring is the shared vocabulary of the
+      // four force behaviors (they all enclose an area of influence), and the
+      // pin has no area. Two thin bars crossing at a point say "this exact
+      // spot" without implying a radius.
+      vec2 q = d * 2.0;
+      float barX = (1.0 - smoothstep(0.0, 0.035, abs(q.y))) *
+                   (1.0 - smoothstep(0.30, 0.62, abs(q.x)));
+      float barY = (1.0 - smoothstep(0.0, 0.035, abs(q.x))) *
+                   (1.0 - smoothstep(0.30, 0.62, abs(q.y)));
+      a += (barX + barY) * 0.8;
+
+      // A small open ring at the centre so the crosshair has a focus and does
+      // not read as a plus sign. Open, not filled -- the point it marks stays
+      // visible through it, which is what a surveyor's mark does.
+      a += (1.0 - smoothstep(0.0, 0.05, abs(r - 0.20))) * 0.95;
+
+      // Faint outer bracket ticks at the diagonals: enough structure to read
+      // as a deliberate mark at a glance, far too little to read as a zone.
+      a += step(0.986, abs(cos((ang - 0.7854) * 2.0))) *
+           (1.0 - smoothstep(0.0, 0.09, abs(r - 0.80))) * 0.45;
     }
 
     gl_FragColor = vec4(uColor, clamp(a, 0.0, 1.0) * uFade * 0.85);

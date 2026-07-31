@@ -1429,11 +1429,29 @@ function stepSwarm(dt: number, input: InputState, useWind: boolean): void {
         continue;
       }
 
-      /* ---- RALLY (and anything unrecognized): the original attraction ---- */
-      const k2 = base / dist;
-      accX += toX * k2;
-      accY += toY * k2;
-      accZ += toZ * k2;
+      /* ---- RALLY: the original attraction ---- */
+      if (behavior === TARGET_BEHAVIOR.RALLY) {
+        const k2 = base / dist;
+        accX += toX * k2;
+        accY += toY * k2;
+        accZ += toZ * k2;
+        continue;
+      }
+
+      /* ---- MARKER, and anything unrecognized: ZERO force ----
+       *
+       * Falling through with no acceleration is the whole implementation, and
+       * it is deliberately the LAST branch rather than an early `continue` at
+       * the top: written this way, a behavior added to protocol.ts that nobody
+       * teaches this loop about lands here automatically instead of silently
+       * inheriting whichever branch happened to be the default.
+       *
+       * CONTRACTS section 8 makes the inert default binding -- "never let bad
+       * input attract a swarm". The reach/fade work above is wasted on these
+       * markers, which is fine: the alternative is a behavior test before the
+       * geometry, and paying a string compare per agent per marker to skip
+       * eight floats is the wrong trade in the hot loop.
+       */
     }
 
     /* --- wind advection (weather scene only) --- */

@@ -22,7 +22,7 @@
  * as its source of truth -- the same discipline protocol.ts uses for
  * MAX_TARGETS (CONTRACTS section 3).
  *
- * Anything derived (three.js Colors, CSS rgb() strings for the radial menu)
+ * Anything derived (three.js Colors, CSS rgb() strings for the wheel picker)
  * is computed FROM these numbers at the bottom of this module, so there is
  * exactly one place a color is chosen.
  */
@@ -56,15 +56,16 @@ export interface MarkerStyle {
    *   1 = dashed warning ring, counter-rotating (avoid)
    *   2 = rotating swirl arms (vortex)
    *   3 = ring with a pass-through arrow (shoot through)
+   *   4 = static pin, no motion (marker -- the passive reference pin)
    */
-  readonly form: 0 | 1 | 2 | 3;
+  readonly form: 0 | 1 | 2 | 3 | 4;
   /**
    * Animation rate in cycles per second. Rally pulses slowly enough to read
    * as a beacon; the vortex spins fast enough to read as rotation without
    * strobing at 240 Hz.
    */
   readonly spinHz: number;
-  /** Short label for the radial menu wedge. */
+  /** Short label for the wheel picker row. */
   readonly label: string;
   /**
    * One-line description shown under the menu. Written to say what the swarm
@@ -114,6 +115,22 @@ export const MARKER_STYLES: Readonly<Record<TargetBehavior, MarkerStyle>> = Obje
     label: 'Shoot Through',
     hint: 'Pass through once, then scatter',
   }),
+  // The passive pin is the only entry that is deliberately NOT a hue. Every
+  // other color in this table means "the swarm does something here", and a
+  // fifth saturated color would be read as a fifth force. A near-white pin
+  // reads as annotation -- the same distinction a map makes between a route
+  // and a label.
+  [TARGET_BEHAVIOR.MARKER]: Object.freeze({
+    color: 0xe8eef7,
+    ringScale: 0.13,
+    form: 4,
+    // Zero, not "slow". The pin exerts no force, so it gets no motion either:
+    // anything animating on the globe implies something is happening, and
+    // nothing is.
+    spinHz: 0,
+    label: 'Marker',
+    hint: 'Reference pin only -- no force',
+  }),
 });
 
 /**
@@ -130,6 +147,11 @@ export const MARKER_ORDER: readonly TargetBehavior[] = Object.freeze([
   TARGET_BEHAVIOR.AVOID,
   TARGET_BEHAVIOR.VORTEX,
   TARGET_BEHAVIOR.SHOOT_THROUGH,
+  // Last, and top-to-bottom that is exactly where CONTRACTS section 8 puts it.
+  // It also happens to be the right place on its own merits: the passive pin is
+  // the one option that does nothing to the swarm, so it sits at the end of the
+  // list of things that do.
+  TARGET_BEHAVIOR.MARKER,
 ]);
 
 /* ------------------------------------------------------------------ *
@@ -150,35 +172,58 @@ export const BEHAVIOR_CODE: Readonly<Record<TargetBehavior, number>> = Object.fr
   [TARGET_BEHAVIOR.AVOID]: 1,
   [TARGET_BEHAVIOR.VORTEX]: 2,
   [TARGET_BEHAVIOR.SHOOT_THROUGH]: 3,
+  [TARGET_BEHAVIOR.MARKER]: 4,
 });
+
+/**
+ * The code every backend must fall back to when it cannot recognize a
+ * behavior.
+ *
+ * This is MARKER (inert), not RALLY, and the distinction is a safety rule
+ * rather than a preference. CONTRACTS section 8 states it directly: "an
+ * unrecognized behavior value must ALSO default to zero force -- never let bad
+ * input attract a swarm." A stale message, a truncated uniform or a future
+ * behavior this build predates all arrive here, and the failure mode of
+ * defaulting to rally is two million agents converging on a point nobody
+ * chose. The failure mode of defaulting to the pin is a marker that sits
+ * there doing nothing, which is visible, harmless and obviously wrong.
+ */
+export const BEHAVIOR_CODE_INERT = 4;
 
 /**
  * Encode a behavior for a GPU uniform slot.
  *
  * Defensive on purpose: this value crosses into kernels that index arrays with
  * it, and an unrecognized string arriving from a stale message must resolve to
- * a real behavior rather than to NaN or to an out-of-range index. Rally is the
- * safe default -- it is the existing force every backend already implements.
+ * a real code rather than to NaN or to an out-of-range index. The safe landing
+ * spot is the INERT code -- see BEHAVIOR_CODE_INERT for why it is deliberately
+ * not rally.
  *
  * @param behavior behavior string, possibly from an untrusted/stale source
- * @returns 0..3, always
+ * @returns 0..4, always
  */
 export function behaviorCode(behavior: TargetBehavior | null | undefined): number {
-  if (!behavior) return 0;
+  if (!behavior) return BEHAVIOR_CODE_INERT;
   const code = BEHAVIOR_CODE[behavior];
-  return typeof code === 'number' ? code : 0;
+  return typeof code === 'number' ? code : BEHAVIOR_CODE_INERT;
 }
 
 /**
- * Look up a style, falling back to rally for anything unrecognized.
+ * Look up a style, falling back to the inert pin for anything unrecognized.
  *
- * Same defensive reasoning as behaviorCode(): the frame path calls this per
- * marker per frame and must never hand a renderer an undefined style.
+ * Same defensive reasoning as behaviorCode(), and the same fallback for the
+ * same reason: the sims give an unrecognized behavior zero force, so drawing
+ * it as a rally ring would put a pulsing "converge here" beacon on a marker
+ * that does nothing. The picture has to agree with the physics even in the
+ * failure case, so both resolve to the pin.
+ *
+ * The frame path calls this per marker per frame and must never hand a
+ * renderer an undefined style.
  */
 export function markerStyle(behavior: TargetBehavior | null | undefined): MarkerStyle {
-  if (!behavior) return MARKER_STYLES[TARGET_BEHAVIOR.RALLY];
+  if (!behavior) return MARKER_STYLES[TARGET_BEHAVIOR.MARKER];
   const style = MARKER_STYLES[behavior];
-  return style ?? MARKER_STYLES[TARGET_BEHAVIOR.RALLY];
+  return style ?? MARKER_STYLES[TARGET_BEHAVIOR.MARKER];
 }
 
 /* ------------------------------------------------------------------ *
@@ -188,9 +233,9 @@ export function markerStyle(behavior: TargetBehavior | null | undefined): Marker
 /**
  * A 0xRRGGBB integer as a CSS `rgb()` / `rgba()` string.
  *
- * The radial menu is DOM/canvas and needs CSS colors; deriving them here
- * rather than writing hex strings alongside the integers means the menu can
- * never disagree with the three.js marker it is about to place.
+ * The wheel picker is canvas and needs CSS colors; deriving them here rather
+ * than writing hex strings alongside the integers means the picker can never
+ * disagree with the three.js marker it is about to place.
  *
  * @param rgb packed color
  * @param alpha 0..1; omitted or >=1 yields an rgb() string

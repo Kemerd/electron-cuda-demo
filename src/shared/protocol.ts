@@ -219,6 +219,8 @@ export const TARGET_BEHAVIOR = Object.freeze({
   VORTEX: 'vortex',              // orbit the marker axis (tangential swirl)
   SHOOT_THROUGH: 'shootThrough', // converge once; passing within the capture
                                  // radius marks the agent visited and releases it
+  MARKER: 'marker',              // passive reference pin — exerts NO force in
+                                 // any backend; purely a visual annotation
 } as const);
 export type TargetBehavior = (typeof TARGET_BEHAVIOR)[keyof typeof TARGET_BEHAVIOR];
 

@@ -14,8 +14,9 @@
  *   wheel         zoom, clamped to [1.15, 12] x GLOBE_RADIUS
  *   left CLICK    place a rally marker via raycast -- a left DRAG never does
  *   middle CLICK  place a rally marker instantly (no hold, no menu)
- *   press + HOLD  bloom the radial command menu; wheel cycles it; release
- *                 commits the highlighted behavior at the held point
+ *   press + HOLD  bloom the wheel picker; the scroll wheel steps it one detent
+ *                 per notch; release commits the option in the lens at the
+ *                 held point
  *
  * The click-vs-drag discrimination is the fiddly part. OrbitControls consumes
  * pointer events for the orbit, so "was that a click or the end of a drag?" has
@@ -29,17 +30,17 @@
  * press can end in exactly one of four ways and the state machine makes that
  * explicit:
  *
- *   press -> moved >5 px before 300 ms   -> orbit (menu never opens)
- *   press -> held still 300 ms           -> menu opens, orbit suppressed
+ *   press -> moved >5 px before 300 ms   -> orbit (picker never opens)
+ *   press -> held still 300 ms           -> picker opens, orbit suppressed
  *   press -> released before 300 ms      -> plain click (existing behavior)
- *   menu open -> Esc / far drag          -> cancel, nothing placed
+ *   picker open -> Esc / far drag        -> cancel, nothing placed
  *
- * Suppressing the orbit once the menu opens is the subtle part. OrbitControls
+ * Suppressing the orbit once the picker opens is the subtle part. OrbitControls
  * has already started its rotate gesture by then (it began on pointerdown), so
  * simply ignoring later moves is not enough -- the camera would keep the drag
  * it accumulated. `controls.enabled = false` mid-gesture makes OrbitControls
  * drop the gesture entirely, and re-enabling on release restores it cleanly.
- * That is also what suppresses wheel zoom while the menu is open, which the
+ * That is also what suppresses wheel zoom while the picker is open, which the
  * contract requires in those words, without a second wheel handler racing the
  * first.
  */
@@ -48,8 +49,14 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLOBE_RADIUS, TARGET_BEHAVIOR } from '../../shared/protocol';
 import type { CameraState, TargetBehavior, Vec3 } from '../../shared/protocol';
-import { createRadialMenu } from '../ui/radial-menu';
-import type { RadialMenuApi } from '../ui/radial-menu';
+import {
+  CONTEXT_ACTION,
+  CONTEXT_DEFAULT_INDEX,
+  CONTEXT_OPTIONS,
+  PLACEMENT_OPTIONS,
+  createWheelPicker,
+} from '../ui/wheel-picker';
+import type { WheelPickerApi } from '../ui/wheel-picker';
 
 /** Distance clamp, in globe radii (CONTRACTS section 8). */
 const MIN_DISTANCE = 1.15 * GLOBE_RADIUS;
@@ -60,7 +67,7 @@ const CLICK_MAX_PX = 5;
 const CLICK_MAX_MS = 250;
 
 /**
- * How long a stationary press waits before the radial menu blooms
+ * How long a stationary press waits before the wheel picker blooms
  * (CONTRACTS section 8). Long enough that a normal click never trips it --
  * CLICK_MAX_MS is 250 -- and short enough that deliberately holding does not
  * feel like waiting.
@@ -68,12 +75,13 @@ const CLICK_MAX_MS = 250;
 const HOLD_MS = 300;
 
 /**
- * How far the pointer may travel AFTER the menu opens before the gesture is
- * treated as a cancel. Generous compared to CLICK_MAX_PX: once the ring is on
+ * How far the pointer may travel AFTER the picker opens before the gesture is
+ * treated as a cancel. Generous compared to CLICK_MAX_PX: once the panel is on
  * screen the hand is allowed to drift over it, and only a decisive drag away
- * means "I did not mean this".
+ * means "I did not mean this". Sized past the picker's own footprint so
+ * wandering across the panel never cancels the gesture that opened it.
  */
-const MENU_CANCEL_PX = 190;
+const MENU_CANCEL_PX = 220;
 
 /** How far the pan target may wander from the origin before it is reeled in. */
 const PAN_TETHER = 0.9 * GLOBE_RADIUS;
@@ -88,12 +96,34 @@ export interface GlobeControlsOptions {
   /** Radius the click raycast tests against. Defaults to the globe surface. */
   pickRadius?: number;
   /**
-   * Element the radial menu's canvas is appended to. Defaults to the canvas's
+   * Element the wheel picker's canvas is appended to. Defaults to the canvas's
    * own parent, which is the scene root in both windows. Passing it
-   * explicitly matters only when the canvas is not the element the menu
+   * explicitly matters only when the canvas is not the element the picker
    * should be measured against.
    */
   menuHost?: HTMLElement | null;
+  /**
+   * Hit-test an existing marker at a client coordinate.
+   *
+   * Supplied by the scene rather than implemented here because the rig has no
+   * marker list -- the scene owns InputState. Returning a marker id switches
+   * the hold gesture into CONTEXT mode (CONTRACTS section 8); returning null
+   * means the hold places a new marker.
+   *
+   * @returns the TargetPoint.id under the cursor, or null
+   */
+  hitTestMarker?: (clientX: number, clientY: number) => number | null;
+  /** Context picker: "Remove" was committed on this marker. */
+  onRemoveMarker?: (id: number) => void;
+  /** Context picker: "Info" was committed on this marker. */
+  onShowMarkerInfo?: (id: number) => void;
+  /**
+   * A click landed that was not a placement -- used to dismiss the info chip
+   * on "the next click" (CONTRACTS section 8). Fired for plain clicks and for
+   * the press that opens any picker, so the chip never outlives the next
+   * deliberate interaction.
+   */
+  onDismissInfo?: () => void;
 }
 
 /** Public surface of the mounted rig. */
@@ -127,6 +157,10 @@ export function createGlobeControls(
 ): GlobeControlsApi {
   const onPlaceTarget = options?.onPlaceTarget;
   const pickRadius = options?.pickRadius ?? GLOBE_RADIUS;
+  const hitTestMarker = options?.hitTestMarker;
+  const onRemoveMarker = options?.onRemoveMarker;
+  const onShowMarkerInfo = options?.onShowMarkerInfo;
+  const onDismissInfo = options?.onDismissInfo;
 
   const camera = new THREE.PerspectiveCamera(50, 1.6, 0.01, 100);
   camera.position.set(0, 0.75, 3.0);
@@ -161,16 +195,17 @@ export function createGlobeControls(
   // Touch: one finger orbits, two pinch-zoom and pan.
   controls.touches = { ONE: THREE.TOUCH.ROTATE, TWO: THREE.TOUCH.DOLLY_PAN };
 
-  /* ---- radial menu --------------------------------------------------- */
+  /* ---- wheel picker -------------------------------------------------- */
 
   // Hosted on the canvas's parent (the scene root) rather than the canvas
-  // itself: a <canvas> cannot have DOM children, and the menu needs a box that
-  // covers the same region the scene does. In the HUD window that parent is
-  // the stage surface, which is exactly the cutout -- so the menu appears over
-  // the native surface at the cursor, in the window the cursor is actually in.
+  // itself: a <canvas> cannot have DOM children, and the picker needs a box
+  // that covers the same region the scene does. In the HUD window that parent
+  // is the stage surface, which is exactly the cutout -- so the picker appears
+  // over the native surface at the cursor, in the window the cursor is
+  // actually in.
   const menuHost: HTMLElement | null =
     options?.menuHost ?? (canvas.parentElement instanceof HTMLElement ? canvas.parentElement : null);
-  const menu: RadialMenuApi = createRadialMenu(menuHost);
+  const menu: WheelPickerApi = createWheelPicker(menuHost);
 
   /* ---- press state machine ------------------------------------------- */
 
@@ -188,13 +223,25 @@ export function createGlobeControls(
   let holdTimer = 0;
 
   /**
-   * True from the moment the menu opens until the press that opened it ends.
+   * True from the moment the picker opens until the press that opened it ends.
    *
-   * Distinct from menu.isOpen(): the menu keeps animating for ~200 ms after it
-   * closes, and a pointerup arriving during that bloom-out must not be
+   * Distinct from menu.isOpen(): the picker keeps animating for ~200 ms after
+   * it closes, and a pointerup arriving during that bloom-out must not be
    * re-interpreted as a fresh commit.
    */
   let menuActive = false;
+
+  /**
+   * Marker id the open picker is acting ON, or -1 when the picker is placing a
+   * new marker.
+   *
+   * This is what distinguishes the two modes for the whole rest of the
+   * gesture, and it is captured at the moment the hold fires rather than
+   * re-tested on release: the marker under the cursor can expire during the
+   * hold, and a picker that opened saying "Remove" must not commit a
+   * PLACEMENT because the marker vanished while the user was reading it.
+   */
+  let contextMarkerId = -1;
 
   const raycaster = new THREE.Raycaster();
   const ndc = new THREE.Vector2();
@@ -236,7 +283,7 @@ export function createGlobeControls(
   }
 
   /**
-   * The hold threshold fired: bloom the menu and take the camera out of the
+   * The hold threshold fired: bloom the picker and take the camera out of the
    * gesture.
    */
   function onHoldElapsed(): void {
@@ -247,11 +294,11 @@ export function createGlobeControls(
 
     // Drop OrbitControls out of the gesture it already started. Without this
     // the camera keeps whatever rotation the press accumulated, and the wheel
-    // would zoom while the menu is cycling -- both of which the contract
+    // would zoom while the picker is stepping -- both of which the contract
     // forbids. Re-enabled in endPress().
     controls.enabled = false;
 
-    // Opens showing rally: that is what a plain click places, so the menu
+    // Opens showing rally: that is what a plain click places, so the picker
     // blooms already on the action the user knows and the wheel moves away
     // from it rather than toward it.
     menu.open(downX, downY, TARGET_BEHAVIOR.RALLY);
@@ -309,16 +356,16 @@ export function createGlobeControls(
     const dist2 = dx * dx + dy * dy;
 
     if (menuActive) {
-      // The menu is up. Only a decisive drag away cancels; small drift over
-      // the ring is expected and must not dismiss it.
+      // The picker is up. Only a decisive drag away cancels; small drift over
+      // the panel is expected and must not dismiss it.
       if (dist2 > MENU_CANCEL_PX * MENU_CANCEL_PX) endPress(false);
       return;
     }
 
     // Before the threshold: movement past 5 px means this was an orbit all
     // along. Disarm the hold and let OrbitControls have the gesture, exactly
-    // as it did before the menu existed. Coming back under the threshold later
-    // must not re-arm either the click or the hold.
+    // as it did before the picker existed. Coming back under the threshold
+    // later must not re-arm either the click or the hold.
     if (dist2 > CLICK_MAX_PX * CLICK_MAX_PX) {
       clearHoldTimer();
       pressActive = false;
@@ -328,11 +375,11 @@ export function createGlobeControls(
   function onPointerUp(e: PointerEvent): void {
     if (downPointerId !== -1 && e.pointerId !== downPointerId) return;
 
-    // ---- menu release: commit the highlighted behavior ----
+    // ---- picker release: commit the option in the lens ----
     if (menuActive) {
       const behavior = menu.selected();
       // The marker lands at the point the press STARTED, not where the pointer
-      // ended up. The ring is a menu the hand travels over; the target was
+      // ended up. The panel is chrome the hand rests over; the target was
       // chosen when the press began.
       if (behavior) placeAtClient(downX, downY, behavior);
       endPress(true);
@@ -348,7 +395,7 @@ export function createGlobeControls(
 
     // ---- middle click: instant rally, no timing gate ----
     // Deliberately exempt from CLICK_MAX_MS. A middle press that outlasts
-    // 250 ms without moving has already opened the menu and taken the branch
+    // 250 ms without moving has already opened the picker and taken the branch
     // above, so reaching here means the user released early -- which is the
     // instant-rally gesture, however long it took them to let go.
     if (button === 1) {
@@ -375,14 +422,14 @@ export function createGlobeControls(
   }
 
   /**
-   * Wheel: cycles the menu selection while it is open, zooms otherwise.
+   * Wheel: steps the picker while it is open, zooms otherwise.
    *
    * Bound in the CAPTURE phase so it runs before OrbitControls' own listener.
-   * `controls.enabled` is already false by the time the menu is open, so the
+   * `controls.enabled` is already false by the time the picker is open, so the
    * zoom is suppressed either way -- but stopping propagation here as well
    * means the wheel event never reaches a second consumer, which is what keeps
    * a fast scroll from leaking a single zoom step through on the frame the
-   * menu opens.
+   * picker opens.
    */
   function onWheel(e: WheelEvent): void {
     if (!menuActive) return;
@@ -390,18 +437,24 @@ export function createGlobeControls(
     e.preventDefault();
     e.stopPropagation();
 
-    // One wedge per notch, regardless of how big the platform's delta is.
-    // A high-resolution trackpad reports dozens of small deltas per physical
-    // gesture, and stepping by the raw value would spin the ring uselessly.
+    // Exactly ONE detent per notch, regardless of how big the platform's delta
+    // is. A high-resolution trackpad reports dozens of small deltas per
+    // physical gesture, and stepping by the raw value would blur the list past
+    // several options at once -- the contract asks for one detent, and the
+    // sign is all this needs from the event.
+    //
+    // Positive deltaY (scrolling down) moves DOWN the list, which is the whole
+    // reason the menu is linear: the gesture and the motion match with no
+    // mapping to learn.
     const dir = e.deltaY > 0 ? 1 : e.deltaY < 0 ? -1 : 0;
     if (dir !== 0) menu.step(dir);
   }
 
   /**
-   * Esc cancels an open menu (CONTRACTS section 8).
+   * Esc cancels an open picker (CONTRACTS section 8).
    *
    * On window rather than the canvas: a canvas that never takes focus never
-   * receives a keydown, and this has to work the instant the ring is visible.
+   * receives a keydown, and this has to work the instant the panel is visible.
    */
   function onKeyDown(e: KeyboardEvent): void {
     if (e.key !== 'Escape') return;
@@ -411,7 +464,7 @@ export function createGlobeControls(
   }
 
   /**
-   * A window blur mid-hold would otherwise strand the menu open with the
+   * A window blur mid-hold would otherwise strand the picker open with the
    * camera disabled, since no pointerup is ever delivered to a backgrounded
    * window.
    */
