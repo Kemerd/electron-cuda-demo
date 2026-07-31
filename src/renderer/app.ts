@@ -116,6 +116,7 @@ import type {
 
 import { createSidebar } from './ui/sidebar';
 import { createHudPickerMirror } from './ui/hud-picker-mirror';
+import type { HudPickerMirrorApi } from './ui/hud-picker-mirror';
 import { createSceneControls } from './ui/scene-controls';
 import type {
   ActionButtonOptions,
@@ -171,6 +172,15 @@ interface SceneRegistryEntry {
   readonly title: string;
   readonly subtitle: string;
   readonly engineScene: SceneId;
+  /**
+   * True when the scene builds the globe-controls rig, whose press-and-hold
+   * gesture blooms the marker wheel picker. The HUD cutout window reads this
+   * to decide whether its display-only picker mirror should arm at all: the
+   * mirror is a pure echo of that recognizer, and a scene with no rig (storm,
+   * benchmark) has nothing to echo -- blooming a rally drum over the particle
+   * storm would promise a placement the release can never perform.
+   */
+  readonly markerPicker: boolean;
   readonly load: () => Promise<SceneModule>;
 }
 
@@ -179,24 +189,28 @@ const SCENE_REGISTRY: Readonly<Record<string, SceneRegistryEntry>> = Object.free
     title: 'Globe + Swarm',
     subtitle: 'Drone swarm over a unit sphere, stepping on the GPU.',
     engineScene: SCENES.SWARM,
+    markerPicker: true,
     load: () => import('./scenes/globe/index'),
   },
   weather: {
     title: 'Weather',
     subtitle: 'Equirectangular wind, density and temperature field driving the swarm.',
     engineScene: SCENES.WEATHER,
+    markerPicker: true,
     load: () => import('./scenes/weather/index'),
   },
   storm: {
     title: 'Particle Storm',
     subtitle: 'Free-space particle system, mouse-driven vortex and shockwaves.',
     engineScene: SCENES.STORM,
+    markerPicker: false,
     load: () => import('./scenes/storm/index'),
   },
   benchmark: {
     title: 'Benchmark',
     subtitle: 'Frame-time comparison across the compute and raster matrix.',
     engineScene: SCENES.SWARM,
+    markerPicker: false,
     load: () => import('./scenes/benchmark/index'),
   },
 });
@@ -2625,7 +2639,22 @@ let overlayInputUnsub: (() => void) | null = null;
 function relayTarget(): HTMLElement | null {
   const host = document.getElementById('stage-surface');
   if (!host) return null;
-  return host.querySelector<HTMLElement>('.scene-canvas') ?? host;
+  // Scoped to .scene-root, NOT the first .scene-canvas in the stage: the CUDA
+  // blit presenter's canvas carries the same class and sits as a DIRECT child
+  // of #stage-surface, created lazily the first time mode 5 runs and never
+  // removed. Any scene mounted after that point appends its root AFTER the
+  // blit canvas, so a bare '.scene-canvas' query returns the inert blit
+  // surface -- and every relayed wheel/orbit/click dispatches onto a canvas
+  // whose only listeners are none. It bubbles to the stage (so the pointer
+  // force tracking half-survives), but the rig bound to the REAL canvas never
+  // fires, which reads as "camera dead in modes 6/7 after visiting mode 5".
+  // The rig canvas always lives inside the active scene's .scene-root; the
+  // presenter canvases never do.
+  return (
+    host.querySelector<HTMLElement>('.scene-root .scene-canvas') ??
+    host.querySelector<HTMLElement>('.scene-canvas') ??
+    host
+  );
 }
 
 /**
@@ -3388,6 +3417,14 @@ async function uploadEarthTexture(): Promise<void> {
 const HUD_STATS_INTERVAL_MS = 500;
 
 /**
+ * The cutout window's display-only picker mirror, held at module level so the
+ * snapshot path can reach it: a scene change arriving mid-hold must close an
+ * open drum, because the recognizer it mirrors just got unmounted with the
+ * scene and nothing else would ever tell this window to let go.
+ */
+let hudPickerMirror: HudPickerMirrorApi | null = null;
+
+/**
  * Apply one UI snapshot from the main renderer to the HUD chrome.
  *
  * Everything is applied through the modules' silent setters (setMode,
@@ -3443,6 +3480,9 @@ function applyHudUiState(state: HudUiState): void {
     if (entry) setStageText(entry.title, entry.subtitle);
     if (ui.sidebar) ui.sidebar.select(sceneId, true);
     mountSceneControls(sceneId);
+    // The recognizer this mirror echoes was unmounted with the old scene; a
+    // drum left open here would commit to nothing on release.
+    if (hudPickerMirror) hudPickerMirror.cancel();
   }
 
   resyncSceneControls();
@@ -3511,6 +3551,17 @@ function installHudCutoutInput(): void {
   // the same events, display-only; see hud-picker-mirror.ts for why the two
   // cannot drift.
   const pickerMirror = createHudPickerMirror(stage);
+  hudPickerMirror = pickerMirror;
+
+  /**
+   * The mirror echoes the rig's recognizer, so it must only arm where a rig
+   * exists to echo. activeSceneId is kept current by applyHudUiState(), which
+   * mirrors every scene change the main renderer commits -- so a middle-hold
+   * over the storm or benchmark stage relays the gesture (the storm's own
+   * handlers still want it) but blooms nothing.
+   */
+  const mirrorArmed = (): boolean =>
+    SCENE_REGISTRY[activeSceneId]?.markerPicker === true;
 
   /**
    * One reusable payload. A pointermove during a drag fires at the device's
@@ -3583,7 +3634,9 @@ function installHudCutoutInput(): void {
       }
     }
     if (fillPointer('down', e)) send();
-    pickerMirror.down(e.clientX, e.clientY, e.button);
+    // Gated per press rather than at install time: the scene can change while
+    // this window stays up, and the gate must follow it.
+    if (mirrorArmed()) pickerMirror.down(e.clientX, e.clientY, e.button);
   });
 
   stage.addEventListener('pointermove', (e) => {
