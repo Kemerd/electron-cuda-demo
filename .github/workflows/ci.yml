@@ -71,10 +71,10 @@ jobs:
       # The action caches the installer itself; `use-github-cache: true` is
       # what makes the second run skip the download.
       - name: Install the CUDA toolkit
-        uses: Jimver/cuda-toolkit@v0.2.19
+        uses: Jimver/cuda-toolkit@v0.2.35
         id: cuda-toolkit
         with:
-          cuda: '12.9.0'
+          cuda: '12.9.1'
           method: 'network'
           # nvcc plus the runtime headers/libs the addon actually links. The
           # full toolkit would add profilers and samples this build never
