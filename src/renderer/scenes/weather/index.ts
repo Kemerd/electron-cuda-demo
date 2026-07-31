@@ -49,7 +49,8 @@ import {
 } from '../../../shared/protocol';
 import type { EntityFrame, FieldFrame, FrameState, Scene, SceneMountContext } from '../../types';
 import { createGlobeControls } from '../globe-controls';
-import { createMarkerField } from '../markers';
+import { createMarkerField, createMarkerInteraction } from '../markers';
+import type { MarkerInteractionApi } from '../markers';
 import type { MarkerFieldApi } from '../markers';
 import { placeTarget } from '../../interaction';
 import type { GlobeControlsApi } from '../globe-controls';
@@ -205,6 +206,7 @@ export default function createScene(): Scene {
 
   /** Behavior-aware marker rings, shared with the globe scene. */
   let markerField: MarkerFieldApi | null = null;
+  let markerInteraction: MarkerInteractionApi | null = null;
 
   /**
    * Grid spec handed to the analyzer. Mutated in place every rebuild rather
@@ -876,11 +878,19 @@ export default function createScene(): Scene {
       // Same rig, same gesture state machine, same behaviors as the globe
       // scene: CONTRACTS section 8 puts the marker system on BOTH globe
       // scenes, and the swarm flying this weather obeys the same commands.
+      markerInteraction = createMarkerInteraction({
+        canvas: renderer.domElement,
+        host: root,
+        getCamera: () => (rig ? rig.camera : null),
+        getInput: () => (lastState ? lastState.input : null),
+      });
+
       rig = createGlobeControls(renderer.domElement, {
         onPlaceTarget: (pos, behavior) => {
           if (!lastState) return;
           placeTarget(lastState.input, pos, behavior);
         },
+        ...markerInteraction.controlOptions,
       });
 
       console.log('[weather] EFB radar scene mounted');
@@ -900,6 +910,9 @@ export default function createScene(): Scene {
       // Its eight meshes share one geometry; disposing here keeps that
       // ownership explicit rather than leaving it to the traversal below.
       if (markerField) markerField.dispose();
+      // Before the DOM teardown, so the info chip detaches from a host that
+      // still exists.
+      if (markerInteraction) markerInteraction.dispose();
       if (fieldTexture) fieldTexture.dispose();
 
       if (scene) {
@@ -937,6 +950,7 @@ export default function createScene(): Scene {
       cells = null;
       labels = null;
       markerField = null;
+      markerInteraction = null;
       uHasField = null;
       fieldTexture = null;
       fieldData = null;
@@ -1075,6 +1089,9 @@ export default function createScene(): Scene {
 
       // Markers animate on the scene clock, same as the globe scene's.
       if (markerField) markerField.update(state ? state.input : null, timeSec);
+
+      // Info chip re-projects after the camera settled for this frame.
+      if (markerInteraction) markerInteraction.update(state ? state.input : null, dt);
 
       renderer.render(scene, rig.camera);
     },

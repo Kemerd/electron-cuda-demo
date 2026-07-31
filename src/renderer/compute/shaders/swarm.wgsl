@@ -802,6 +802,13 @@ fn force(@builtin(global_invocation_id) gid : vec3<u32>) {
     let gain = tgt.posStrength.w * kTargetWeight * reach * ttlFade;
     let behavior = tgt.ttlPad.y;
 
+    // Note the shape of this chain: every arm tests for a KNOWN behavior, and
+    // there is no trailing else. Rally is matched explicitly rather than being
+    // the fallthrough, so a value this build does not recognise contributes no
+    // acceleration at all -- CONTRACTS section 8 makes zero force the defensive
+    // default so a garbled uniform cannot drag the entire swarm across the
+    // globe while looking exactly like a working feature. kBehaviorMarker takes
+    // the same path and is additionally skipped above, before the setup math.
     if (behavior == kBehaviorRally) {
       // The original attraction. Steer along the shell toward the marker.
       accel = accel + toTarget * (gain * invLen);
@@ -832,13 +839,6 @@ fn force(@builtin(global_invocation_id) gid : vec3<u32>) {
           accel = accel + toTarget * (gain * invLen);
         }
       }
-
-    } else {
-      // kBehaviorMarker and anything this build does not recognise: no force at
-      // all. The chain tests for rally EXPLICITLY rather than letting it be the
-      // trailing else, which is the whole point -- CONTRACTS section 8 makes
-      // zero force the defensive default so a garbled uniform cannot pull the
-      // entire swarm across the globe while looking like a working feature.
     }
   }
 

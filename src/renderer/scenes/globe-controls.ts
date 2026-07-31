@@ -18,6 +18,14 @@
  *                 per notch; release commits the option in the lens at the
  *                 held point
  *
+ * The hold has TWO modes, decided by what is under the cursor when the
+ * threshold fires (CONTRACTS section 8). On empty globe it is a PLACEMENT
+ * picker offering the five marker behaviors; on an existing marker it is a
+ * CONTEXT picker offering OK / Info / Remove for that marker. The rig does not
+ * own the marker list, so the scene supplies the hit test and the two action
+ * callbacks -- which also keeps this file free of any InputState knowledge, in
+ * the same way it stays free of scene geometry.
+ *
  * The click-vs-drag discrimination is the fiddly part. OrbitControls consumes
  * pointer events for the orbit, so "was that a click or the end of a drag?" has
  * to be answered from the raw pointer stream: under 5 px of travel AND under
@@ -57,6 +65,25 @@ import {
   createWheelPicker,
 } from '../ui/wheel-picker';
 import type { WheelPickerApi } from '../ui/wheel-picker';
+
+/**
+ * Narrow a picker option id to a placement behavior.
+ *
+ * The picker returns a plain string because it serves two option sets whose
+ * ids are not the same type -- the placement set's ids are behaviors, the
+ * context set's are actions. This guard is the boundary where the placement
+ * side gets its type back, and it also means a context id can never reach
+ * placeAtClient() by a routing mistake: it would simply fail the test.
+ */
+function isTargetBehavior(value: string | null): value is TargetBehavior {
+  return (
+    value === TARGET_BEHAVIOR.RALLY ||
+    value === TARGET_BEHAVIOR.AVOID ||
+    value === TARGET_BEHAVIOR.VORTEX ||
+    value === TARGET_BEHAVIOR.SHOOT_THROUGH ||
+    value === TARGET_BEHAVIOR.MARKER
+  );
+}
 
 /** Distance clamp, in globe radii (CONTRACTS section 8). */
 const MIN_DISTANCE = 1.15 * GLOBE_RADIUS;
@@ -298,10 +325,26 @@ export function createGlobeControls(
     // forbids. Re-enabled in endPress().
     controls.enabled = false;
 
-    // Opens showing rally: that is what a plain click places, so the picker
-    // blooms already on the action the user knows and the wheel moves away
-    // from it rather than toward it.
-    menu.open(downX, downY, TARGET_BEHAVIOR.RALLY);
+    // Which picker this is depends on what is under the cursor. The scene
+    // answers that; the rig only needs to know whether it got an id.
+    contextMarkerId = -1;
+    if (typeof hitTestMarker === 'function') {
+      const hit = hitTestMarker(downX, downY);
+      if (typeof hit === 'number' && Number.isFinite(hit)) contextMarkerId = hit;
+    }
+
+    if (contextMarkerId >= 0) {
+      // CONTEXT mode: acting on an existing marker. Opens on OK, which is the
+      // centered default the contract specifies -- releasing immediately does
+      // nothing, so opening this picker by accident is free.
+      menu.open(downX, downY, CONTEXT_OPTIONS, CONTEXT_DEFAULT_INDEX);
+      return;
+    }
+
+    // PLACEMENT mode: opens showing rally, which is what a plain click places,
+    // so the picker blooms already on the action the user knows and the wheel
+    // moves away from it rather than toward it.
+    menu.open(downX, downY, PLACEMENT_OPTIONS, 0);
   }
 
   /**
@@ -319,6 +362,7 @@ export function createGlobeControls(
 
     if (menuActive) {
       menuActive = false;
+      contextMarkerId = -1;
       menu.close(commit);
       controls.enabled = true;
     }
@@ -334,6 +378,12 @@ export function createGlobeControls(
     downY = e.clientY;
     downTime = performance.now();
     downPointerId = e.pointerId;
+
+    // "Dismisses on the next click" (CONTRACTS section 8), and the next click
+    // is THIS one -- fired on pointerdown for every button, including the
+    // right-drag pan, because any deliberate interaction with the globe means
+    // the user has moved on from reading the chip.
+    if (typeof onDismissInfo === 'function') onDismissInfo();
 
     // Left and middle both arm the hold. Right is the pan gesture and stays
     // out of this entirely.
@@ -377,11 +427,26 @@ export function createGlobeControls(
 
     // ---- picker release: commit the option in the lens ----
     if (menuActive) {
-      const behavior = menu.selected();
-      // The marker lands at the point the press STARTED, not where the pointer
-      // ended up. The panel is chrome the hand rests over; the target was
-      // chosen when the press began.
-      if (behavior) placeAtClient(downX, downY, behavior);
+      const choice = menu.selected();
+      // Captured before endPress() clears it.
+      const contextId = contextMarkerId;
+
+      if (contextId >= 0) {
+        // CONTEXT mode. OK is deliberately a no-op beyond closing -- that is
+        // the contract's wording and it is what makes the default safe.
+        if (choice === CONTEXT_ACTION.REMOVE) {
+          if (typeof onRemoveMarker === 'function') onRemoveMarker(contextId);
+        } else if (choice === CONTEXT_ACTION.INFO) {
+          if (typeof onShowMarkerInfo === 'function') onShowMarkerInfo(contextId);
+        }
+        endPress(true);
+        return;
+      }
+
+      // PLACEMENT mode. The marker lands at the point the press STARTED, not
+      // where the pointer ended up. The panel is chrome the hand rests over;
+      // the target was chosen when the press began.
+      if (isTargetBehavior(choice)) placeAtClient(downX, downY, choice);
       endPress(true);
       return;
     }

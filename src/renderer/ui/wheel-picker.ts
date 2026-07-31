@@ -651,7 +651,17 @@ export function createWheelPicker(host: HTMLElement | null | undefined): WheelPi
 
     // Draw from the far rows inward so the lens row paints last and on top of
     // its neighbours -- the near side of a real drum occludes the far side.
-    for (let ring = VISIBLE_SIDE; ring >= 0; ring--) {
+    // How many neighbours this SET can show without repeating itself.
+    //
+    // The drum wraps, so on a short list a far-side row is the same option as
+    // one already on screen. With the three-entry context set and the full
+    // VISIBLE_SIDE of 2, offsets +2 and -2 both land back on the selected row
+    // and the panel draws "OK" three times -- which reads as a rendering bug,
+    // not as a wheel. Half the set size (rounded down) is the largest fan-out
+    // where every visible row is a distinct option.
+    const sideLimit = Math.min(VISIBLE_SIDE, Math.max(0, Math.floor((count - 1) / 2)));
+
+    for (let ring = sideLimit; ring >= 0; ring--) {
       for (let side = -1; side <= 1; side += 2) {
         // ring 0 is the center row and exists once, not twice.
         if (ring === 0 && side === 1) continue;

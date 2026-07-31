@@ -1270,14 +1270,16 @@ __device__ __forceinline__ MarkerStyleRef MarkerStyleFor(int behavior) {
       s.ringScale = 0.18f;
       s.spinHz = 1.0f;
       break;
-    case GS_BEHAVIOR_MARKER:  // 0xc8d2e0
-      // Neutral slate, deliberately outside the accent (cyan) and warning
-      // (amber) families that marker-palette.ts reserves for behaviors which
-      // actually DO something - a passive pin should not read as an action.
+    case GS_BEHAVIOR_MARKER:  // 0xe8eef7
+      // Near-white, deliberately outside the accent (cyan) and warning (amber)
+      // families that marker-palette.ts reserves for behaviors which actually
+      // DO something - a passive pin should not read as an action. It is the
+      // one entry in the table that is not a hue at all, which is the same
+      // distinction a map draws between a route and a label.
       // spinHz 0: the pin is static, which is itself the visual cue that this
       // marker exerts no force. Every other glyph moves.
-      s.color = gsMake(0.784f, 0.824f, 0.878f);
-      s.ringScale = 0.14f;
+      s.color = gsMake(0.910f, 0.933f, 0.969f);
+      s.ringScale = 0.13f;
       s.spinHz = 0.0f;
       break;
     case GS_BEHAVIOR_RALLY:

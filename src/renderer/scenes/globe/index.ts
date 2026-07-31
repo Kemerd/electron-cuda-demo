@@ -27,7 +27,8 @@ import { createDartSwarm } from '../dart-swarm';
 import type { DartSwarmApi } from '../dart-swarm';
 import { createEarth } from '../earth';
 import type { EarthApi } from '../earth';
-import { createMarkerField } from '../markers';
+import { createMarkerField, createMarkerInteraction } from '../markers';
+import type { MarkerInteractionApi } from '../markers';
 import type { MarkerFieldApi } from '../markers';
 import { placeTarget } from '../../interaction';
 
@@ -53,6 +54,7 @@ export default function createScene(): Scene {
    * differently.
    */
   let markerField: MarkerFieldApi | null = null;
+  let markerInteraction: MarkerInteractionApi | null = null;
 
   /** Set once real backend records have been drawn. */
   let sawEngineData = false;
@@ -203,11 +205,22 @@ export default function createScene(): Scene {
       // The rig owns marker placement: it runs the whole gesture state machine
       // (click discrimination, middle-click, the press-and-hold wheel picker)
       // and hands us a world position plus the behavior the user chose.
+      // The context picker (hold ON a marker) needs a hit test and an info
+      // chip. Both come from the shared bundle so the weather scene gets the
+      // identical behavior from the identical code.
+      markerInteraction = createMarkerInteraction({
+        canvas: renderer.domElement,
+        host: root,
+        getCamera: () => (rig ? rig.camera : null),
+        getInput: () => (lastState ? lastState.input : null),
+      });
+
       rig = createGlobeControls(renderer.domElement, {
         onPlaceTarget: (pos, behavior) => {
           if (!lastState) return;
           placeTarget(lastState.input, pos, behavior);
         },
+        ...markerInteraction.controlOptions,
       });
 
       console.log('[globe] scene mounted (three.js WebGLRenderer)');
@@ -215,6 +228,9 @@ export default function createScene(): Scene {
 
     unmount() {
       if (rig) rig.dispose();
+      // Before the DOM teardown below, so the chip removes itself from a host
+      // that still exists rather than being orphaned with the root.
+      if (markerInteraction) markerInteraction.dispose();
       if (swarm) swarm.dispose();
       // Before the graph walk below: the field shares ONE geometry across its
       // eight meshes, and letting the traversal dispose it eight times is
@@ -262,6 +278,7 @@ export default function createScene(): Scene {
       swarm = null;
       earth = null;
       markerField = null;
+      markerInteraction = null;
       sawEngineData = false;
       lastState = null;
     },
@@ -323,6 +340,10 @@ export default function createScene(): Scene {
       // Behavior-aware marker rings, driven off the same scene clock so every
       // marker of a given kind animates in phase.
       if (markerField) markerField.update(state ? state.input : null, timeSec);
+
+      // The info chip follows its marker across the screen, so it re-projects
+      // after the camera has been updated for this frame.
+      if (markerInteraction) markerInteraction.update(state ? state.input : null, dt);
 
       renderer.render(scene, rig.camera);
     },
