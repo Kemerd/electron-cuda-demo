@@ -1,14 +1,41 @@
 # GeoSwarm
 
+[![CI](https://github.com/Kemerd/electron-cuda-demo/actions/workflows/ci.yml/badge.svg)](https://github.com/Kemerd/electron-cuda-demo/actions/workflows/ci.yml)
+
 **Real CUDA kernels inside an Electron app — benchmarked honestly against WebGPU and JavaScript.**
 
 ![Project Screenshot](preview.png)
 
-A 3D globe. A two-million-agent drone swarm. Live procedural weather. Four million GPU particles reacting to your cursor. All of it simulated and drawn through your choice of backend, switchable live, with the frame-time receipts on screen.
+Two million simulated drones over a live globe. The usual web stack draws them at **10 fps**. The same GPU, addressed properly, draws them at **195 fps** — and the difference isn't compute, it's *data motion*. This repo is the receipts: seven pipeline configurations, one uninterrupted 61-cell benchmark sweep, every number reproducible from the in-app Benchmark tab.
 
-The point: Electron doesn't have to mean slow. A Node-API native module puts CUDA one `require()` away from your renderer process, and this repo measures exactly what that buys you — no hand-waving, no rigged comparisons.
+**▶ Live demo:** [**kemerd.github.io/electron-cuda-demo**](https://kemerd.github.io/electron-cuda-demo/) — the same renderer built for the browser, running the **full WebGPU compute + raster paths** (plus the CPU baseline) on whatever GPU you have. The CUDA and native present modes grey out with *"requires the desktop build"* — not a missing feature, the point: a browser sandbox has no path to a GPU driver, and measuring exactly what that costs is what this repo is for. Clone it for the other half of the ladder.
 
-**Live demo:** [kemerd.github.io/electron-cuda-demo](https://kemerd.github.io/electron-cuda-demo/) — the same renderer built for the browser. It serves **modes 1–3** (CPU and WebGPU); the CUDA compute, CUDA raster and both native present modes grey out with "requires the desktop build", because they do. *(Requires Pages to be enabled for the repo: Settings → Pages → Source: GitHub Actions.)*
+## Why this exists
+
+Most GPU-adjacent web apps stop at three.js with the simulation on the CPU — one JavaScript thread doing physics while thousands of GPU cores idle. Electron apps inherit that ceiling by default, but they don't have to: a Node-API native module puts CUDA one `require()` away from your renderer. This project builds the *entire ladder* from that default to true zero-copy native rendering, measures every rung on the same scenes with the same glyphs and the same camera, and reports where the time actually goes.
+
+A 3D globe. A two-million-agent drone swarm flying live weather. Four million GPU particles bending around your cursor. Every backend switchable at runtime, with the frame-time receipts on screen.
+
+## Quick start
+
+```bash
+npm install
+npm run build:native   # compiles the CUDA addon against Electron's ABI
+npm start
+```
+
+| You need | Version | Notes |
+|----------|---------|-------|
+| Windows | 10/11 x64 | Zero-copy path uses D3D11 + Win32 |
+| NVIDIA driver | 570+ | |
+| CUDA Toolkit | 12.8+ (12.9 tested) | Build-time only |
+| Visual Studio 2022 | Desktop C++ workload | Host compiler for nvcc |
+| CMake | 3.24+ | |
+| Node.js | 22.18+ (24 tested) | The unit suite runs `.ts` files directly via Node's built-in type stripping |
+
+**No NVIDIA GPU?** The app still runs — CUDA cells grey out with a reason badge, and the CPU/WebGPU paths work anywhere Chromium does.
+
+The addon builds for Blackwell (`sm_120`) by default. Older card? Set `CMAKE_CUDA_ARCHITECTURES` in `native/CMakeLists.txt` to your arch (e.g. `"89"` for RTX 40-series) — the kernels are arch-agnostic. If CUDA lives outside its default install path, adjust `CUDAToolkit_ROOT` in the same file. If you change CMake compiler configuration, run `npm run clean:native` first — a stale CMake cache will silently keep the old settings.
 
 ## The matrix
 
@@ -25,6 +52,89 @@ Instead of *claiming* native is faster, the app runs every legal combination of 
 | 7 | CUDA | CUDA | **Zero-copy, unlocked** | Same, vsync off. Raw throughput mode |
 
 Illegal cells grey out with a tooltip explaining the data-locality reason — the constraints are physics, not product decisions.
+
+## What your hardware is actually doing
+
+Seven modes, but really one question asked seven ways: **where does the data live, and who makes it move?** Here's each mode as the silicon sees it, at 2M swarm agents (61 MiB of state per frame):
+
+**Mode 1 — CPU sim, WebGL draw.** One JavaScript worker thread runs the boids — neighbor grid, flocking, integration — on a single core, then the positions upload to the GPU for drawing. The GPU contributes a few microseconds of rasterization per frame while 21,760 CUDA cores sit idle one PCIe slot away. This is what "we use three.js" usually means in practice, and it caps itself at 20k agents to avoid freezing outright. Not a strawman — the honest starting point.
+
+**Mode 2 — WebGPU sim, WebGL draw.** The sim moves to the GPU (WGSL compute, ping-ponged storage buffers) and immediately hits the classic trap: WebGPU and WebGL are two APIs on the *same GPU* that cannot share memory. So every frame maps the result back to the CPU (`mapAsync`) and re-uploads it into the WebGL context — GPU → CPU → same GPU, a round trip across PCIe to move data between two contexts inches apart. The readback is on the clock in the tables below.
+
+**Mode 3 — WebGPU end-to-end.** One device owns both compute and draw, so the sim's storage buffer is *rebound as the vertex buffer* — zero readback, zero copies. The CPU's whole job is recording command buffers. This is the web platform's ceiling, and it's genuinely respectable: the data never moves, so nothing is wasted.
+
+**Mode 4 — CUDA sim, WebGL draw.** The interesting failure. CUDA steps 2M agents in **3.1 ms** — the fastest sim in the table — then pays for it: device→host copy (4.3 ms), a 61 MiB structured clone across the Electron process boundary (~640 MB/s, ≈93 ms), then a WebGL upload back to the very GPU that computed it. The data crosses PCIe twice and gets memcpy'd once, per frame, so the fastest kernel posts the slowest GPU number: 10 fps. **The lesson of the whole repo in one row: compute didn't lose — the commute did.**
+
+**Mode 5 — CUDA sim + CUDA raster, blitted.** Fix the commute by changing *what* travels: entities stay resident on the GPU, CUDA renders the whole frame itself (volumetric ray-march + splatted glyphs — the workloads fixed-function hardware can't help with anyway), and only the finished ~8 MiB framebuffer crosses to Chromium. An 8× cut in traffic, and the mode starts beating the web paths on volumetric work.
+
+**Modes 6 & 7 — zero-copy.** Fix the commute by deleting it. CUDA writes a shared D3D11 texture; DWM lifts it to the screen; Chromium never touches a pixel and *nothing* crosses a process boundary per frame — the UI rides a transparent overlay window, input flows down as a few bytes of uniforms. The CPU's per-frame contribution collapses to a `Present()` call and event handling. Mode 7 removes vsync and shows raw throughput.
+
+The whole argument, one table:
+
+| Mode | Leaves the GPU / frame | Crosses process boundary | Effective fps @ 2M |
+|---|---|---|---|
+| 1 · CPU | — (never on the GPU) | — | 43 *(at its 20k cap)* |
+| 2 · WebGPU→WebGL | 61 MiB readback | — | 48 |
+| 3 · WebGPU pure | **nothing** | — | 46 |
+| 4 · CUDA→WebGL | 61 MiB | 61 MiB clone | **10** |
+| 5 · CUDA blit | 8 MiB pixels | 8 MiB clone | 36 |
+| 6 · zero-copy vsync | **nothing** | **nothing** | **190** |
+| 7 · zero-copy unlocked | **nothing** | **nothing** | **195** |
+
+Read down the sim columns in the benchmark tables and they barely move. Read down the *data movement* column here and it predicts every ranking. That's the architecture thesis: **at this scale, compute is nearly free — data motion is the product.**
+
+## The native module, demystified
+
+The piece most web teams have never touched, and the reason this app gets to talk to a GPU driver at all.
+
+**A `.node` file is just a DLL with manners.** `require('cuda_engine.node')` ends in the OS loader (`LoadLibrary` on Windows) pulling a compiled shared library into the Node process, where it registers its exported functions. From that moment `engine.step(...)` is an ordinary JavaScript call landing in compiled C++ — no serialization, no socket, no subprocess. Arguments arrive through **Node-API**, a stable C interface into the JS engine; an `ArrayBuffer` crosses as a *pointer to your JS heap memory*, which is how the engine writes two million agent records directly into a buffer JavaScript already owns.
+
+**This is not FFI in the `libffi` sense.** Generic FFI builds calls at runtime through a marshalling trampoline — fine for calling `libsqlite` occasionally, wrong for a per-frame hot path. A native module is compiled against the API; the call overhead is nanoseconds, which is why the engine can be called every frame without appearing anywhere in the profile.
+
+**Node-API is the part that makes it shippable.** Older addons compiled against V8's internal headers and broke on every runtime upgrade (the `electron-rebuild` treadmill). Node-API is an ABI-stable contract: this addon compiles once and loads in any Electron or Node new enough, across major upgrades, unchanged. Combined with a statically linked CUDA runtime and hash-based RNG instead of cuRAND, the built `.node` depends on exactly three system DLLs — it ships **zero** CUDA DLLs.
+
+**The Electron wrinkle:** Electron embeds its own Node with its own ABI, so the addon is built against Electron's headers (`cmake-js --runtime=electron`) and lives in the **main process**. The renderer talks to it over a `MessagePort` — and in the zero-copy modes, the addon runs its own render thread that never touches the JavaScript event loop at all.
+
+**What it buys you**, concretely: the entire native world inside your app's process — the CUDA runtime, D3D11, Win32 windowing, NVML (the GPU telemetry in the overlay is the same source `nvidia-smi` reads) — with shared memory and microsecond dispatch. The alternatives all fail the per-frame test: WASM is sandboxed away from GPU drivers entirely; a helper child process pays serialization per message (this repo *measured* that cost — it's the mode 4 row); generic FFI pays marshalling per call.
+
+## Three windows deep: how zero-copy reaches the screen
+
+Chromium will not hand its compositor to anyone — there is no supported way to blend a foreign GPU surface into a web page. Modes 6/7 route around the compositor entirely, with a **three-layer window sandwich**:
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  LAYER 3  transparent, frameless Electron window          │  ← the entire UI
+│           same renderer bundle in HUD mode; the stage     │    (sidebar, matrix,
+│           region is a transparent CUTOUT                  │     sliders, FPS card)
+├──────────────────────────────────────────────────────────┤
+│  LAYER 2  borderless Win32 child window                   │  ← CUDA's pixels
+│           D3D11 flip-model swapchain; CUDA writes the     │
+│           shared texture via cudaGraphicsD3D11Register…   │
+├──────────────────────────────────────────────────────────┤
+│  LAYER 1  the ordinary Electron window                    │  ← app shell
+└──────────────────────────────────────────────────────────┘
+         DWM composites the stack; Chromium never sees layer 2
+```
+
+**Layer 2** is a borderless child HWND parented into the app window, sized to exactly the stage rect the composite layout computes. CUDA renders straight into a registered D3D11 texture (one VRAM→VRAM copy to the backbuffer — ~30 µs — then `Present`). No PCIe crossing, no process boundary, no compositor.
+
+**Layer 3** exists because HTML cannot blend over a native child window inside the same window — they are two OS windows, and z-order in the overlap is all-or-nothing. So a transparent, frameless Electron window parented above runs the *same renderer bundle* in HUD mode: it draws the complete UI with the stage punched out, and the CUDA surface shows through the hole. Pointer events over the cutout drive the same orbit controller and flow down to the kernels as uniforms; UI actions relay over IPC so both windows stay state-synced.
+
+The payoff is that **the UI is identical across all seven modes**. Toggling Composite ↔ Native moves nothing, hides nothing, shrinks nothing — same panels, same positions, same camera before and after. The overlay is destroyed (not hidden) on leaving the mode, on minimize, and on quit; any native failure falls back to composite cleanly.
+
+The two native modes differ only in `Present()`'s sync interval, and the measured rates show exactly what that buys. **Mode 6 (vsync)** pins to the panel — 240 fps on this 240 Hz display — right up until the kernel can no longer fill a 4.2 ms budget, at which point it reports the truth (190 fps at 2M agents, 109 at the 2048 weather grid). **Mode 7 (unlocked, `DXGI_PRESENT_ALLOW_TEARING`)** removes the ceiling and shows the actual throughput: **1250 fps** on 50k storm particles, **910** on 50k swarm agents, **478** at 4M particles. Where the GPU is already saturated the two converge — 190 vs 195 at 2M agents, both at 95% utilization, and weather is a dead heat at 97%. Unlocking a present path that is kernel-bound buys nothing, and the numbers say so rather than pretending otherwise.
+
+## If you build one of these for real
+
+The production shape this project argues for, in three rules:
+
+1. **Ship native GPU compute where you control the hardware.** Ops consoles, ground stations, sim rigs — anywhere the deployment spec says "NVIDIA," the CUDA path is a build script away and the ladder above says what you get back: 4–20× at scale, plus access to everything the sandbox forbids (driver telemetry, D3D interop, real thread control).
+
+2. **Keep WebGPU as the portable fallback behind the same seam.** This repo's compute backends all implement one `DataSource` interface; the scenes never learn which one is feeding them, and swapping is a registry entry. WebGPU is genuinely good — mode 3 *beats* naive CUDA integration — so it's not a grudging fallback; it's the correct answer wherever the hardware is unknown. Design the seam first and the backend becomes a deployment decision instead of a rewrite.
+
+3. **Whoever computes should also draw — never let results commute.** Every slow row in the benchmark is a row where data crossed a boundary per frame. Every fast row is a row where it didn't. The corollary rule for interaction: inputs go *down* to the compute as a few bytes of uniforms; results never come back up except as pixels.
+
+And keep a CPU baseline in the tree — not to ship, but as a test oracle and a reminder of what the default costs.
 
 ## Scenes
 
@@ -43,7 +153,7 @@ Everything is live in every backend:
 
 Input travels *down* to the kernels as a few bytes of uniforms per frame — interaction never forces a GPU→CPU sync, which is why it stays free at two million agents.
 
-## Architecture
+## Architecture notes
 
 ```
 ┌─ Electron main process ────────────────────────────────────┐
@@ -70,39 +180,6 @@ Design decisions worth stealing:
   **What that copy costs, measured.** Subtract the engine's own reported work from the observed frame interval in mode 4 and what remains is the clone plus the IPC hop: 61 MiB/frame (2M agents × 32 B, or 4M storm particles × 16 B) costs **93–99 ms**, and the residual tracks payload size at a steady **620–660 MB/s** regardless of scene or record layout. At 2M agents that is 3.07 ms of sim and 4.31 ms of device→host copy buried under ~93 ms of transport — the reason mode 4 reads 10 effective fps while the page is still spinning at 46. **This is why modes 6/7 exist**: they move no frame data across the boundary at all.
 - **Zero-copy present** — a Win32 child window with a flip-model DXGI swapchain; CUDA writes an intermediate D3D11 texture via `cudaGraphicsD3D11RegisterResource`, one VRAM→VRAM copy to the backbuffer, `Present`. Chromium never touches the pixels.
 - **Raw WGSL for the WebGPU path** — no framework transpiler between the benchmark and the shader, so the comparison stays defensible. Sim storage buffers bind directly as vertex buffers for the draw.
-
-### The native present modes (6 and 7)
-
-HTML cannot blend over a native child HWND inside the same window — they are two OS windows and z-order in the overlap is all-or-nothing. So the native modes get a **full-window cutout overlay**: a frameless transparent window, parented to the main one and tracking its bounds, running the *same renderer bundle* in HUD mode. It draws the entire UI — sidebar, matrix, presets, scene controls, badges, the FPS/GPU card — with the stage region rendered fully transparent, and the CUDA surface shows through the hole at exactly the rect the composite layout computes.
-
-The point of that machinery is that **the UI is identical across all seven modes**. Toggling Composite ↔ Native moves nothing, hides nothing, and shrinks nothing: same panels, same positions, same text. Camera gestures over the cutout drive the same orbit controller and feed the same `InputState`, so switching back and forth preserves your view in both directions. The native view is destroyed — not hidden — on leaving the mode, on minimize, and on quit; any failure falls back to composite cleanly.
-
-The two modes differ only in `Present()`'s sync interval, and the measured rates show exactly what that buys. **Mode 6 (vsync)** pins to the panel — 240 fps on this 240 Hz display — right up until the kernel can no longer fill a 4.2 ms budget, at which point it reports the truth (190 fps at 2M agents, 109 at the 2048 weather grid). **Mode 7 (unlocked, `DXGI_PRESENT_ALLOW_TEARING`)** removes the ceiling and shows the actual throughput: **1250 fps** on 50k storm particles, **910** on 50k swarm agents, **478** at 4M particles. Where the GPU is already saturated the two converge — 190 vs 195 at 2M agents, both at 95% utilization, and weather is a dead heat at 97%. Unlocking a present path that is kernel-bound buys nothing, and the numbers say so rather than pretending otherwise.
-
-## Requirements
-
-| You need | Version | Notes |
-|----------|---------|-------|
-| Windows | 10/11 x64 | Zero-copy path uses D3D11 + Win32 |
-| NVIDIA driver | 570+ | |
-| CUDA Toolkit | 12.8+ (12.9 tested) | Build-time only |
-| Visual Studio 2022 | Desktop C++ workload | Host compiler for nvcc |
-| CMake | 3.24+ | |
-| Node.js | 22.18+ (24 tested) | The unit suite runs `.ts` files directly via Node's built-in type stripping |
-
-**No NVIDIA GPU?** The app still runs — CUDA cells grey out with a reason badge, and the CPU/WebGPU paths work anywhere Chromium does.
-
-The addon builds for Blackwell (`sm_120`) by default. Older card? Set `CMAKE_CUDA_ARCHITECTURES` in `native/CMakeLists.txt` to your arch (e.g. `"89"` for RTX 40-series) — the kernels are arch-agnostic. If CUDA lives outside its default install path, adjust `CUDAToolkit_ROOT` in the same file.
-
-## Build & run
-
-```bash
-npm install
-npm run build:native   # compiles the CUDA addon against Electron's ABI
-npm start
-```
-
-If you change CMake compiler configuration, run `npm run clean:native` first — a stale CMake cache will silently keep the old settings.
 
 ## Benchmarks
 
