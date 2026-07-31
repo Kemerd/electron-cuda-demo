@@ -115,6 +115,7 @@ import type {
 } from './bench/index';
 
 import { createSidebar } from './ui/sidebar';
+import { createHudPickerMirror } from './ui/hud-picker-mirror';
 import { createSceneControls } from './ui/scene-controls';
 import type {
   ActionButtonOptions,
@@ -2681,7 +2682,12 @@ function applyRelayedInput(event: OverlayInputEvent): void {
   // Dispatched on window, which is where the storm scene listens for them
   // (a canvas that never has focus would never receive a keydown).
   if (kind === 'key') {
-    if (event.key !== '1' && event.key !== '2' && event.key !== '3') return;
+    // Escape is the picker's cancel (CONTRACTS section 8). It reaches the rig
+    // through the same window-level keydown listener the in-page gesture uses,
+    // so a cancel from the overlay is indistinguishable from a local one.
+    if (event.key !== 'Escape' && event.key !== '1' && event.key !== '2' && event.key !== '3') {
+      return;
+    }
     try {
       window.dispatchEvent(
         new KeyboardEvent('keydown', { key: event.key, bubbles: true, cancelable: true }),
@@ -3488,6 +3494,14 @@ function installHudCutoutInput(): void {
     return;
   }
 
+  // The picker has to be drawn in THIS window. The relay below carries the
+  // gesture to the main renderer, whose rig owns marker placement -- but that
+  // window's DOM is behind the native surface in these modes, so its panel
+  // would bloom where nobody can see it. This mirror draws the same drum off
+  // the same events, display-only; see hud-picker-mirror.ts for why the two
+  // cannot drift.
+  const pickerMirror = createHudPickerMirror(stage);
+
   /**
    * One reusable payload. A pointermove during a drag fires at the device's
    * full report rate, and allocating per event would make the relay itself a
@@ -3559,11 +3573,13 @@ function installHudCutoutInput(): void {
       }
     }
     if (fillPointer('down', e)) send();
+    pickerMirror.down(e.clientX, e.clientY, e.button);
   });
 
   stage.addEventListener('pointermove', (e) => {
     if (overControl(e)) return;
     if (fillPointer('move', e)) send();
+    pickerMirror.move(e.clientX, e.clientY);
   });
 
   stage.addEventListener('pointerup', (e) => {
@@ -3576,10 +3592,14 @@ function installHudCutoutInput(): void {
     }
     if (overControl(e)) return;
     if (fillPointer('up', e)) send();
+    // After the relay, so the recognizer sees the release that commits the
+    // marker before this panel animates away.
+    pickerMirror.up();
   });
 
   stage.addEventListener('pointercancel', (e) => {
     if (fillPointer('cancel', e)) send();
+    pickerMirror.cancel();
   });
 
   // A pointer leaving with no button held ends any hover state cleanly; with a
@@ -3611,6 +3631,7 @@ function installHudCutoutInput(): void {
       payload.altKey = e.altKey;
       payload.metaKey = e.metaKey;
       send();
+      pickerMirror.wheel(e.deltaY);
     },
     { passive: false },
   );
@@ -3621,13 +3642,30 @@ function installHudCutoutInput(): void {
   // Storm force keys, best-effort: this window is focusable:false so the OS
   // rarely routes keys here (the main window keeps focus and its own handlers
   // fire directly), but an OS-level focus quirk should not orphan the keys.
+  //
+  // Escape rides the same relay so the picker's cancel works in native modes:
+  // the recognizer lives in the other window and would otherwise never hear
+  // it, leaving a held gesture that only a release could end -- and a release
+  // after an unheard Esc would PLACE, which is precisely what the contract
+  // says a cancel must prevent.
   document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      pickerMirror.cancel();
+      resetExtras();
+      payload.kind = 'key';
+      payload.key = e.key;
+      send();
+      return;
+    }
     if (e.key !== '1' && e.key !== '2' && e.key !== '3') return;
     resetExtras();
     payload.kind = 'key';
     payload.key = e.key;
     send();
   });
+
+  // A window losing focus mid-hold must not strand the panel on screen.
+  window.addEventListener('blur', () => pickerMirror.cancel());
 }
 
 /**

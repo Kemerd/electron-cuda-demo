@@ -56,6 +56,52 @@ interface MarkerSlot {
    * on frames where nothing about the marker changed.
    */
   lastId: number;
+  /**
+   * Scene-clock timestamp at which the marker currently in this slot first
+   * appeared, or -1 when the slot is empty.
+   *
+   * Drives the landing overshoot below. Stored per slot rather than on the
+   * TargetPoint because the landing is a purely visual concern -- the sims
+   * and the CUDA/WGSL rasterizers share TargetPoint and have no business
+   * carrying a three.js animation clock through the protocol.
+   */
+  bornAt: number;
+}
+
+/**
+ * Landing animation (CONTRACTS section 8).
+ *
+ * A placed marker must be visible AT FULL PRESENCE on the very first frame
+ * after release -- the contract is explicit that a grow-from-zero or any
+ * delayed appear is a defect, because the marker is the feedback for the
+ * release and anything that ramps in reads as latency.
+ *
+ * So this is not an entrance; it is a SETTLE. The marker starts oversized and
+ * relaxes to its resting size, which gives the placement a sense of impact
+ * without ever making the user wait to see it. Opacity is deliberately not
+ * animated here at all -- only scale.
+ */
+const LAND_SEC = 0.15;
+const LAND_OVERSHOOT = 1.15;
+
+/**
+ * Landing scale multiplier at `age` seconds after placement.
+ *
+ * Decays LAND_OVERSHOOT -> 1 on a smoothstep, so the size arrives with its
+ * rate of change going to zero rather than stopping abruptly.
+ *
+ * @param age seconds since the marker appeared; negative or non-finite values
+ *        are treated as "already settled" so a clock glitch can never inflate
+ *        a marker permanently
+ * @returns multiplier in [1, LAND_OVERSHOOT]
+ */
+function landingScale(age: number): number {
+  if (!Number.isFinite(age) || age <= 0) return LAND_OVERSHOOT;
+  if (age >= LAND_SEC) return 1;
+  const t = age / LAND_SEC;
+  // smoothstep(0,1,t), then invert so t=0 -> overshoot, t=1 -> 1.
+  const eased = t * t * (3 - 2 * t);
+  return LAND_OVERSHOOT + (1 - LAND_OVERSHOOT) * eased;
 }
 
 /**
@@ -417,7 +463,7 @@ export function createMarkerField(quadSize: number = 0.34): MarkerFieldApi {
     // edge. Eight quads do not need culling anyway.
     mesh.frustumCulled = false;
 
-    slots.push({ mesh, material, uTime, uFade, uForm, uColor, uSpin, lastId: -1 });
+    slots.push({ mesh, material, uTime, uFade, uForm, uColor, uSpin, lastId: -1, bornAt: -1 });
   }
 
   return {
@@ -474,9 +520,19 @@ export function createMarkerField(quadSize: number = 0.34): MarkerFieldApi {
           slot.uColor.value.setHex(style.color);
           slot.uForm.value = style.form;
           slot.uSpin.value = style.spinHz;
-          const size = quadSize * (style.ringScale / 0.17);
-          slot.mesh.scale.set(size, size, 1);
+          // A new id in this slot is a newly placed marker -- including the
+          // case where an expiring marker's slot was recycled -- so the
+          // landing starts now.
+          slot.bornAt = clock;
         }
+
+        // Resting size for this behavior, then the landing overshoot on top.
+        // Recomputed per frame because it genuinely varies for ~150 ms after
+        // placement; once landingScale() returns 1 this is a constant write of
+        // the same three numbers, which costs nothing for eight slots.
+        const restSize = quadSize * (style.ringScale / 0.17);
+        const land = landingScale(clock - slot.bornAt);
+        slot.mesh.scale.set(restSize * land, restSize * land, 1);
 
         // Sit the quad just above the surface so it never z-fights the globe.
         const k = (GLOBE_RADIUS * 1.004) / len;

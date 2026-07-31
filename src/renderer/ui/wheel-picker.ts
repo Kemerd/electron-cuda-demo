@@ -221,6 +221,24 @@ const BLOOM_STIFFNESS = 420;
 const BLOOM_DAMPING = 32;
 
 /**
+ * Committed-close duration, seconds. The contract's hard ceiling is 50 ms and
+ * it is a FEEL requirement, not a style note: on release the marker is already
+ * on the globe, so every millisecond this panel is still visible reads as the
+ * click having lagged.
+ *
+ * This is deliberately NOT the bloom spring. Letting the spring relax to zero
+ * takes ~180 ms even when the close is given a head-start velocity, because a
+ * stiff spring washes that velocity out almost immediately -- measured, not
+ * assumed. So a commit leaves the spring behind entirely and runs a linear
+ * opacity ramp instead: predictable, interruptible, and provably under the
+ * ceiling regardless of frame rate.
+ *
+ * A cancel keeps the spring. Nothing is waiting on a cancel, and the softer
+ * retreat is what distinguishes "you called it off" from "it fired".
+ */
+const COMMIT_SNAP_SEC = 0.045;
+
+/**
  * Detent spring -- deliberately softer than the bloom.
  *
  * This is the spring the user actually feels, once per notch. Stiff enough
@@ -397,6 +415,17 @@ export function createWheelPicker(host: HTMLElement | null | undefined): WheelPi
   let bloomTarget = 0;
 
   /**
+   * Per-second rate of the committed-close ramp, or 0 when no commit-snap is
+   * running (the ordinary spring case).
+   *
+   * Held as a rate rather than a deadline so the ramp is frame-rate
+   * independent and so a snap that begins from a partly-bloomed panel -- a
+   * release during the bloom-in, which is common on a fast gesture -- still
+   * finishes within COMMIT_SNAP_SEC rather than taking proportionally longer.
+   */
+  let commitSnapRate = 0;
+
+  /**
    * Drum position, in DETENTS.
    *
    * Continuous and unwrapped, exactly like the ring version's angle: stepping
@@ -509,9 +538,18 @@ export function createWheelPicker(host: HTMLElement | null | undefined): WheelPi
     lastTs = ts;
 
     // ---- bloom ----
-    spring(bloom, bloomVel, bloomTarget, BLOOM_STIFFNESS, BLOOM_DAMPING, dt);
-    bloom = springOut[0] ?? bloom;
-    bloomVel = springOut[1] ?? 0;
+    // A committed close is a linear ramp, not a spring: the marker is already
+    // visible and the panel must be gone inside COMMIT_SNAP_SEC. The spring
+    // still owns the open and the cancel.
+    if (commitSnapRate > 0) {
+      bloom -= commitSnapRate * dt;
+      if (bloom <= 0) bloom = 0;
+      bloomVel = 0;
+    } else {
+      spring(bloom, bloomVel, bloomTarget, BLOOM_STIFFNESS, BLOOM_DAMPING, dt);
+      bloom = springOut[0] ?? bloom;
+      bloomVel = springOut[1] ?? 0;
+    }
 
     // ---- drum rotation ----
     spring(detentPos, detentVel, detentTarget, DETENT_STIFFNESS, DETENT_DAMPING, dt);
@@ -528,6 +566,12 @@ export function createWheelPicker(host: HTMLElement | null | undefined): WheelPi
     if (Math.abs(detentPos - detentTarget) > SETTLE_EPSILON) settled = false;
     if (Math.abs(lens - (open ? 1 : 0)) > SETTLE_EPSILON) settled = false;
 
+    // A finished commit-snap is settled by definition: bloom is 0, so nothing
+    // is on screen and a detent or lens spring still ringing underneath is
+    // invisible. Without this the drum's settle would keep the rAF alive for
+    // another ~200 ms after every placement, drawing frames nobody can see.
+    if (commitSnapRate > 0 && bloom <= 0) settled = true;
+
     draw();
 
     // Fully closed and settled: clear once, drop the canvas out of the
@@ -535,6 +579,7 @@ export function createWheelPicker(host: HTMLElement | null | undefined): WheelPi
     if (!open && settled && bloom < SETTLE_EPSILON) {
       bloom = 0;
       bloomVel = 0;
+      commitSnapRate = 0;
       g.clearRect(0, 0, canvas.width, canvas.height);
       canvas.classList.remove('is-live');
       lastTs = 0;
@@ -1025,6 +1070,11 @@ export function createWheelPicker(host: HTMLElement | null | undefined): WheelPi
 
       open = true;
       bloomTarget = 1;
+      // Hand the bloom back to the spring. A hold started while a previous
+      // commit-snap was still running would otherwise keep ramping DOWN with
+      // the panel nominally open -- rare, but it is exactly the fast repeated
+      // placement a confident user does.
+      commitSnapRate = 0;
       canvas.classList.add('is-live');
       ensureLoop();
     },
@@ -1052,10 +1102,12 @@ export function createWheelPicker(host: HTMLElement | null | undefined): WheelPi
       if (!open && bloomTarget === 0) return;
       open = false;
       bloomTarget = 0;
-      // A committed close snaps out slightly faster than a cancel: the marker
-      // is already on the globe by the time this runs, and lingering chrome
-      // over a placed marker reads as lag.
-      bloomVel = commit ? Math.min(bloomVel, -1.2) : bloomVel;
+      // A commit leaves the spring and runs the linear snap; a cancel relaxes
+      // on the spring, since nothing is waiting on it. Deriving the rate from
+      // the CURRENT bloom is what keeps a release during the bloom-in just as
+      // fast as one from a fully open panel.
+      commitSnapRate = commit ? Math.max(bloom, SETTLE_EPSILON) / COMMIT_SNAP_SEC : 0;
+      if (commit) bloomVel = 0;
       ensureLoop();
     },
 

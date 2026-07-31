@@ -98,6 +98,12 @@ const CLICK_MAX_MS = 250;
  * (CONTRACTS section 8). Long enough that a normal click never trips it --
  * CLICK_MAX_MS is 250 -- and short enough that deliberately holding does not
  * feel like waiting.
+ *
+ * Mirrored in ui/hud-picker-mirror.ts, which runs a display-only copy of this
+ * gesture in the cutout HUD window (that window mounts no scene, so it has no
+ * rig of its own). HOLD_MS, CLICK_MAX_PX and MENU_CANCEL_PX must agree across
+ * the two or the visible panel and the panel that actually commits would open
+ * and cancel at different moments.
  */
 const HOLD_MS = 300;
 
