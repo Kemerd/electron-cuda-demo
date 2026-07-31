@@ -309,7 +309,9 @@ export function createGlobeControls(
     const nx = ((clientX - rect.left) / rect.width) * 2 - 1;
     const ny = -(((clientY - rect.top) / rect.height) * 2 - 1);
 
-    if (!raycastGlobe(nx, ny, hitPoint)) return false;
+    if (!raycastGlobe(nx, ny, hitPoint)) {
+      return false;
+    }
 
     onPlaceTarget([hitPoint.x, hitPoint.y, hitPoint.z], behavior);
     return true;
