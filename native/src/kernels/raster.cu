@@ -251,10 +251,25 @@ constexpr float kEchoFloor = 0.16f;
  *  Volumetric march parameters
  * ===================================================================== */
 
-/** Steps through the atmosphere shell. 56 is the sweet spot measured on this
- *  class of part: 48 shows visible banding on the limb where the shell is
- *  nearly tangent to the ray, 64 costs 14% more for no visible gain. */
-constexpr int kMarchSteps = 56;
+/**
+ * Steps through the atmosphere shell.
+ *
+ * Retuned from 56 when the shell was pulled in to the three.js slice stack's
+ * 1.005R..1.055R (see kShellInner/kShellOuter). The march distributes its steps
+ * across the ray's ACTUAL intersection span, so the count has to serve the
+ * longest span rather than the typical one:
+ *
+ *   radial ray  -> span 0.050 world units (the shell thickness)
+ *   grazing ray -> span 0.642 (the chord tangent to the inner sphere), 12.8x more
+ *
+ * Against the 256^3 volume over a +/-1.055 cube (voxel 0.00824) that puts a
+ * radial ray at 56 steps across ~6 voxels -- nine samples per voxel, all of them
+ * reading the same trilinear neighbourhood, which is pure cost. 32 steps gives
+ * the radial case ~2.6 samples/voxel and the grazing case a 2.4-voxel step that
+ * the start jitter below breaks into grain rather than rings. Measured on the
+ * limb, which is the only place it could show, and it does not.
+ */
+constexpr int kMarchSteps = 32;
 
 /** Alpha past which the march early-exits. 0.98 rather than 1.0 because the
  *  last 2% of opacity takes as many steps as the first 80% and contributes
@@ -272,21 +287,45 @@ constexpr float kAlphaCutoff = 0.98f;
  * stronger cell also gets a taller column to march through - so the opacity
  * spread across the six bands comes out of the density, not out of this constant.
  *
- * 9.0 is where that spread lands correctly. Integrating a full column through
- * the shell at the average detail-noise value gives, band 0 through band 5:
- * 0.11 / 0.38 / 0.66 / 0.88 / 0.97 / 0.98 opacity. A light-green region is
- * translucent enough to read the continents through - which is what keeps it a
- * radar overlay rather than an overcast deck - while a magenta core is
+ * The calibration target is the opacity a full column integrates to, band 0
+ * through band 5: 0.11 / 0.38 / 0.66 / 0.88 / 0.97 / 0.98. A light-green region
+ * is translucent enough to read the continents through - which is what keeps it
+ * a radar overlay rather than an overcast deck - while a magenta core is
  * effectively solid. Lower values (the 3.2 this was first set to) push band 0
  * down to 4% opacity, which disappears entirely against the globe and throws
  * away most of the picture, since real reflectivity products are mostly green
  * with small embedded cores.
+ *
+ * That ladder is a property of density x extinction x PATH LENGTH, so pulling
+ * the shell in to the three.js stack (0.650 -> 0.050 world units of radial
+ * path, a factor of 13) had to be paid back here or every cell would have gone
+ * 13x more transparent and the whole radar layer would have washed out to a
+ * faint tint. 9.0 * 13 = 117.0 reproduces the six opacities above exactly - it
+ * is the same integral over a shorter path, not a new look.
  */
-constexpr float kExtinction = 9.0f;
+constexpr float kExtinction = 117.0f;
 
-/** Shell the march covers, matching weather.cu's volume extrusion. */
-constexpr float kShellInner = GS_GLOBE_RADIUS;
-constexpr float kShellOuter = GS_ALTITUDE_MAX * 1.5f;
+/**
+ * Shell the march covers. These are the three.js slice stack's radii
+ * (CELL_INNER_R / CELL_OUTER_R in src/renderer/scenes/weather/storm-cells.ts,
+ * 1.005R and 1.055R from CONTRACTS section 8) and they must stay equal to them.
+ *
+ * They used to sit at GS_GLOBE_RADIUS..GS_ALTITUDE_MAX*1.5f, i.e. 1.0R..1.65R -
+ * an atmosphere 13x deeper than the one the WebGL path draws. The visible
+ * result was the defect this pair exists to prevent: storm cells erupting off
+ * the globe as huge radial wedges that read as solar flares rather than
+ * weather, while the same field in the three.js tab hugged the surface. Raster
+ * backends may differ in performance and never in the picture, so the CUDA
+ * march marches the shell the slice stack fakes - the same volume, honestly
+ * integrated.
+ *
+ * kShellOuter is ALSO the half-extent of the density cube (weather.cu sizes
+ * kVolumeHalfExtent from kVolumeOuter and this is what SampleVolume is handed
+ * as `half`), so the two files' pairs have to move together or every world
+ * position would land in the wrong voxel.
+ */
+constexpr float kShellInner = GS_GLOBE_RADIUS * 1.005f;
+constexpr float kShellOuter = GS_GLOBE_RADIUS * 1.055f;
 
 /* ===================================================================== *
  *  Splat parameters
@@ -1452,7 +1491,16 @@ __device__ float3 ShadePixel(int px, int py, int w, int h, const InputUniforms& 
             // Self-shadowing, from the density a short step toward the sun. Kept
             // (and kept cheap) because without it the columns are flat slabs of
             // pure band colour with no sense of volume at all.
-            const float3 lightSample = gsAdd(sp, gsScale(sun, 0.035f));
+            //
+            // The 0.035 offset this used came from the old 0.650-thick shell,
+            // where it was a 5% probe. In the 0.050 shell it would reach 70% of
+            // the way through and mostly land in the empty space above the
+            // cells, so the shadow term collapsed toward zero occlusion and the
+            // columns went back to being flat slabs. 0.006 is the same ~12% of
+            // the shell it always meant to be, and it is still comfortably
+            // outside a single voxel (0.00824) so it reads a genuinely
+            // different neighbourhood rather than re-fetching the same one.
+            const float3 lightSample = gsAdd(sp, gsScale(sun, 0.006f));
             const float occl = SampleVolume(args.volume, lightSample, kShellOuter);
             const float shadow = __expf(-occl * 3.0f);
 

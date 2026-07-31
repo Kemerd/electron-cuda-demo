@@ -1,17 +1,23 @@
 /**
- * scenes/benchmark -- Benchmark.
+ * scenes/benchmark -- the Benchmark tab's scene slot.
  *
- * Phase 1 placeholder that is already doing something honest: it plots the live
- * frame-time history of the running app as a scrolling bar chart against the
- * 60Hz and 120Hz budget lines. No synthetic numbers -- every bar is a frame this
- * process actually rendered.
+ * Deliberately thin, and the reason is worth stating plainly: the tab's real UI
+ * -- controls, progress, table, charts -- is NOT here. It lives at application
+ * scope in bench/index.ts and mounts as an overlay on #stage-surface.
  *
- * Next phase turns this into the real harness: sweep the backend matrix, hold
- * each combination for a fixed sample window, and emit a comparison table of
- * sim / copy / draw across CPU, WebGPU and CUDA at each preset.
+ * That split is forced by what a sweep does. Running one MOUNTS the other
+ * scenes: the globe under five modes, then the storm, then weather. Each of
+ * those mounts unmounts whatever scene was there before, so any UI owned by
+ * this module would be destroyed by the first transition of its own sweep and
+ * take the progress readout with it.
+ *
+ * What is left here is the idle backdrop: the live frame-time trace of the
+ * running process, which is exactly what should be behind the panel when the
+ * tab is open and nothing is sweeping. Every bar is a frame this process really
+ * rendered -- no synthetic numbers, same as before.
  */
 
-import { createBackdrop, createCaption } from '../placeholder';
+import { createBackdrop } from '../placeholder';
 import type { Backdrop } from '../placeholder';
 import type { FrameState, Scene, SceneMountContext } from '../../types';
 
@@ -24,7 +30,6 @@ const CHART_MAX_MS = 40;
 export default function createScene(): Scene {
   let root: HTMLElement | null = null;
   let backdrop: Backdrop | null = null;
-  let caption: HTMLElement | null = null;
   let timeSec = 0;
 
   // Preallocated history ring -- this scene must not be the thing that causes
@@ -34,8 +39,10 @@ export default function createScene(): Scene {
   let filled = 0;
 
   return {
-    // The drifting backdrop wash and the rolling frame-time chart both advance
-    // off timeSec, so this scene redraws something different every single tick.
+    // The wash and the rolling trace both advance off timeSec, so this scene
+    // redraws something different every tick. That matters for more than looks:
+    // the effective-FPS headline reads this flag, and a tab whose backdrop
+    // genuinely animates should count its ticks as fresh.
     selfAnimates: true,
 
     mount(ctx: SceneMountContext) {
@@ -44,23 +51,14 @@ export default function createScene(): Scene {
 
       backdrop = createBackdrop(root, { tint: '118,185,0', accent: '79,209,255' });
 
-      caption = createCaption(root, {
-        tag: 'Benchmark',
-        title: 'Live frame-time trace',
-        body:
-          'Every bar is one real frame from this process, plotted against the 60 and 120 Hz budgets. Next phase drives the full backend matrix through fixed sample windows and reports sim / copy / draw per combination.',
-      });
-
       if (ctx && ctx.host) ctx.host.appendChild(root);
     },
 
     unmount() {
       if (backdrop) backdrop.dispose();
-      if (caption && caption.parentNode) caption.parentNode.removeChild(caption);
       if (root && root.parentNode) root.parentNode.removeChild(root);
       root = null;
       backdrop = null;
-      caption = null;
       head = 0;
       filled = 0;
     },
@@ -90,24 +88,21 @@ export default function createScene(): Scene {
       const H = backdrop.height();
       if (W <= 0 || H <= 0) return;
 
-      drawChart(ctx, W, H, state);
+      drawChart(ctx, W, H);
     },
   };
 
   /**
    * Render the bar chart plus budget guides.
-   * @param state shared app state (used for the mode label)
+   *
+   * Drawn across the full surface rather than inset: the panel that sits over
+   * this is near-opaque while the tab is idle, so the trace reads as texture
+   * behind the glass rather than as a chart competing with the real ones.
    */
-  function drawChart(
-    ctx: CanvasRenderingContext2D,
-    W: number,
-    H: number,
-    state: FrameState,
-  ): void {
-    // Inset so the chart does not collide with the bottom-left caption.
+  function drawChart(ctx: CanvasRenderingContext2D, W: number, H: number): void {
     const padX = W * 0.08;
     const padTop = H * 0.16;
-    const padBottom = H * 0.34;
+    const padBottom = H * 0.2;
     const chartW = W - padX * 2;
     const chartH = H - padTop - padBottom;
     if (chartW <= 0 || chartH <= 0) return;
@@ -154,22 +149,10 @@ export default function createScene(): Scene {
     ctx.moveTo(padX, baseY);
     ctx.lineTo(padX + chartW, baseY);
     ctx.stroke();
-
-    // ---- current mode -------------------------------------------------
-    const mode = state && state.mode;
-    if (mode) {
-      const label = `${String(mode.compute).toUpperCase()}  ->  ${mode.raster}  ->  ${mode.present}`;
-      ctx.fillStyle = 'rgba(255,255,255,0.38)';
-      ctx.font = `600 ${Math.max(10, H * 0.022)}px -apple-system, "Segoe UI", system-ui, sans-serif`;
-      ctx.textAlign = 'right';
-      ctx.textBaseline = 'alphabetic';
-      ctx.fillText(label, padX + chartW, padTop - H * 0.03);
-      ctx.textAlign = 'left';
-    }
   }
 
   /**
-   * One dashed horizontal guide with a right-aligned label.
+   * One dashed horizontal guide with a left-aligned label.
    */
   function drawGuide(
     ctx: CanvasRenderingContext2D,

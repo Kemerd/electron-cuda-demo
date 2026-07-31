@@ -342,12 +342,13 @@ const JET_WIDTH = 0.2617994;
  *  are copies, not independent tuning.
  * ------------------------------------------------------------------ */
 
-const COVERAGE_CUT_MIN = 0.06;
-const COVERAGE_CUT_MAX = 0.72;
-const COVERAGE_GAIN_MIN = 2.35;
-const COVERAGE_GAIN_MAX = 1.18;
+const ECHO_FLOOR = 0.16;
+const COVERAGE_CUT_MIN = 0.045;
+const COVERAGE_CUT_MAX = 1.0;
+const COVERAGE_DIAL_CURVE = 0.075;
+const COVERAGE_SHOULDER = 1.45;
 const CELL_SCALE = 4.6;
-const CELL_DEPTH = 0.85;
+const CELL_DEPTH = 0.55;
 const CELL_DRIFT = 0.017;
 
 /** Smoothstep, matching the GLSL definition the other two backends use. */
@@ -359,27 +360,35 @@ function smoothstepf(e0: number, e1: number, x: number): number {
 }
 
 /**
- * Threshold + gain on a raw density value.
+ * Four stages, mirroring gsShapeCoverage in common.cuh exactly. The full
+ * rationale for each constant lives on the CUDA side; in brief:
  *
- * The cut slides from 0.72 (clear) down to 0.06 (severe) and zeroes everything
- * beneath it, which is what produces large fully-clear regions and sharp cell
- * edges. What survives is rescaled back across 0..1 so a cell that only just
- * cleared a high cut still reaches the upper reflectivity bands -- without
- * that, turning coverage DOWN would also turn every remaining storm green and
- * the dial would read as a brightness knob. The toe over the first sliver of
- * the surviving range keeps the boundary from aliasing under magnification.
+ *   0. shoulder  -- compress the solver's saturated vortex cores down the ramp
+ *                   BEFORE classifying, so the bulk of a system reads green.
+ *   1. threshold -- a cut that slides all the way to 1.0 at the clear end, so
+ *                   "Clear" clears the pinned cores too; the dial is curved
+ *                   first so the slider's travel lands where the field changes.
+ *   2. remap     -- survivors are stretched onto [ECHO_FLOOR, 1], NOT [0, 1].
+ *                   Every renderer discards reflectivity under the floor, so
+ *                   mapping to zero would run a second invisible threshold and
+ *                   the dial would barely appear to work.
+ *   3. toe       -- eases the cell boundary so it does not alias under
+ *                   magnification. Applied to the parameter, not the output.
  */
 function shapeCoverage(raw: number, coverage: number): number {
   const c = Number.isFinite(coverage) ? Math.min(1, Math.max(0, coverage)) : WEATHER_COVERAGE_DEFAULT;
-  const d = Number.isFinite(raw) ? Math.min(1, Math.max(0, raw)) : 0;
+  const d0 = Number.isFinite(raw) ? Math.min(1, Math.max(0, raw)) : 0;
+  const d = Math.pow(d0, COVERAGE_SHOULDER);
 
-  const cut = COVERAGE_CUT_MAX + (COVERAGE_CUT_MIN - COVERAGE_CUT_MAX) * c;
-  const gain = COVERAGE_GAIN_MIN + (COVERAGE_GAIN_MAX - COVERAGE_GAIN_MIN) * c;
+  const curved = Math.pow(c, COVERAGE_DIAL_CURVE);
+  const cut = COVERAGE_CUT_MAX + (COVERAGE_CUT_MIN - COVERAGE_CUT_MAX) * curved;
 
   if (d <= cut) return 0;
 
-  const t = (d - cut) / Math.max(1e-4, 1 - cut);
-  return Math.min(1, Math.max(0, t * gain * smoothstepf(0, 0.12, t)));
+  let t = (d - cut) / Math.max(1e-4, 1 - cut);
+  t *= smoothstepf(0, 0.1, t);
+
+  return Math.min(1, Math.max(0, ECHO_FLOOR + (1 - ECHO_FLOOR) * t));
 }
 
 /**

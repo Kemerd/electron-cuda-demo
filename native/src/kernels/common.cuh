@@ -377,13 +377,38 @@ __host__ __device__ __forceinline__ float gsSmoothstep(float e0, float e1, float
  *     cut  0.05 -> 55%   0.075 -> 33%   0.10 -> 24%   0.125 -> 18%
  *          0.15 -> 13%   0.175 ->  9%   0.20 ->  8%   0.25 ->  6%
  *
- * so the entire useful travel of the dial lives between roughly 0.05 and 0.25.
- * The default (0.35) interpolates to 0.152, which is the ~13% globe coverage
- * CONTRACTS section 8 asks for; the ends give a nearly bare planet and a
- * widespread-severe one.
+ * so the visually interesting travel all lives between roughly 0.05 and 0.25.
+ * The MAX is nevertheless 1.0 rather than 0.25, because a cut below the pinned
+ * vortex cores leaves them on screen and "Clear" has to mean clear - see
+ * GS_COVERAGE_DIAL_CURVE, which is what stops that wide range from wasting the
+ * slider.
  */
-#define GS_COVERAGE_CUT_MIN 0.050f
-#define GS_COVERAGE_CUT_MAX 0.245f
+#define GS_COVERAGE_CUT_MIN 0.045f
+#define GS_COVERAGE_CUT_MAX 1.000f
+
+/**
+ * @brief Curve applied to the dial before it picks a cut.
+ *
+ * The cut range has to reach all the way to 1.0, because the solver's vortex
+ * cores pin at exactly 1.0 and a cut below that leaves them on screen - a
+ * "Clear" setting that still shows every storm core is not clear, and measured
+ * as a NON-MONOTONIC dial (coverage 0 came out busier than coverage 0.1,
+ * because the surviving cores were being stretched brighter). But interpolating
+ * the cut linearly over 0.045..1.0 wastes almost the whole slider: the field's
+ * survivor curve is nearly flat above 0.25, so the top three quarters of the
+ * travel would do nothing visible.
+ *
+ * Raising the dial to this power before the lerp spends the travel where the
+ * field actually changes: the bottom of the slider sweeps the cut down through
+ * the flat region quickly, and the rest of it works the steep part.
+ *
+ * Solved rather than guessed, then walked in on the measured field. A sweep at
+ * this value puts globe echo at 0% / 8% / 12% / 14% / 23% for dial positions
+ * 0 / 0.1 / 0.35 / 0.6 / 1.0: monotonic, genuinely clear at the bottom,
+ * genuinely widespread at the top, and the DEFAULT lands inside the 10-20%
+ * band CONTRACTS section 8 specifies as realistic scattered coverage.
+ */
+#define GS_COVERAGE_DIAL_CURVE 0.075f
 
 /**
  * @brief Exponent applied to the raw density BEFORE the threshold.
@@ -445,9 +470,10 @@ __host__ __device__ __forceinline__ float gsShapeCoverage(float raw, float cover
   // intrinsic has no host counterpart.
   const float d = powf(d0, GS_COVERAGE_SHOULDER);
 
-  const float cut = gsLerpf(GS_COVERAGE_CUT_MAX, GS_COVERAGE_CUT_MIN, c);
-
-  // Stage 1.
+  // Stage 1. The dial is curved before it picks a cut - see
+  // GS_COVERAGE_DIAL_CURVE for why a linear sweep wastes most of the slider.
+  const float cut = gsLerpf(GS_COVERAGE_CUT_MAX, GS_COVERAGE_CUT_MIN,
+                            powf(c, GS_COVERAGE_DIAL_CURVE));
   if (d <= cut) return 0.0f;
 
   // Stage 2 + 3. The denominator cannot be smaller than 1 - GS_COVERAGE_CUT_MAX,

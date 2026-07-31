@@ -30,9 +30,35 @@ import electron = require('electron');
 import type { IpcRendererEvent } from 'electron';
 
 const { contextBridge, ipcRenderer } = electron;
-import type { GeoSwarmBridge, NativeViewRect, NativeViewStartArgs, NativeViewStatsResult, OverlaySceneInfo, Unsubscribe } from './bridge-types.js';
-import type { OverlayInputEvent } from './overlay-types.js';
+import type { GeoSwarmBridge, NativeViewRect, NativeViewStartArgs, NativeViewStatsResult, Unsubscribe } from './bridge-types.js';
+import type { HudAction, HudUiState, OverlayInputEvent } from './overlay-types.js';
 import type { Capabilities, GpuStats, OkResult, PumpToRendererMsg, SceneParams } from '../shared/protocol.js';
+
+/**
+ * True when this preload is running inside the HUD overlay window (the same
+ * bundle loaded with ?hud=1 into the transparent cutout window). Two behaviors
+ * hang off it, both load-bearing:
+ *
+ *   - The RENDERER_READY handshake is suppressed. The frame pump owns exactly
+ *     ONE port and re-establishes it on every handshake, so a second window
+ *     announcing itself would steal the port out from under the main renderer
+ *     and kill the frame drive mid-session.
+ *   - Nothing else changes: the HUD page uses the same bridge for caps, GPU
+ *     stats and the read-only nview stats poll, which is exactly why it loads
+ *     this preload rather than a second one.
+ *
+ * location.search is readable at preload time (the document URL is committed
+ * before the preload runs), but it is still wrapped -- a throw here would take
+ * the whole bridge down with it.
+ */
+const IS_HUD_WINDOW: boolean = (() => {
+  try {
+    return /[?&]hud=1(?:&|$)/.test(window.location.search);
+  } catch (err) {
+    console.warn('[preload] could not read location.search:', String(err));
+    return false;
+  }
+})();
 
 // Channel names are duplicated as literals here rather than imported: a
 // sandboxed CJS preload cannot import the ESM protocol module, and adding a
@@ -51,13 +77,19 @@ const CH = Object.freeze({
   NVIEW_START: 'nview:start',       // IPC.NVIEW_START
   NVIEW_STOP: 'nview:stop',         // IPC.NVIEW_STOP
   NVIEW_STATS: 'nview:stats',       // IPC.NVIEW_STATS
-  // HUD overlay window (CONTRACTS section 6). These mirror OVERLAY_IPC in
-  // overlay-types.ts rather than protocol.ts's IPC block -- same reason the
-  // literals above are duplicated at all: a sandboxed CJS preload cannot
-  // import an ESM module, so the strings are repeated with the key named.
+  // HUD overlay window (CONTRACTS section 6, cutout design). These mirror
+  // OVERLAY_IPC in overlay-types.ts rather than protocol.ts's IPC block --
+  // same reason the literals above are duplicated at all: a sandboxed CJS
+  // preload cannot import an ESM module, so the strings are repeated with the
+  // key named.
   OVERLAY_SET: 'overlay:set',                  // OVERLAY_IPC.SET
-  OVERLAY_SCENE: 'overlay:scene',              // OVERLAY_IPC.SCENE
+  OVERLAY_INPUT: 'overlay:input',              // OVERLAY_IPC.INPUT
   OVERLAY_INPUT_RELAY: 'overlay:input-relay',  // OVERLAY_IPC.INPUT_RELAY
+  OVERLAY_READY: 'overlay:ready',              // OVERLAY_IPC.READY
+  OVERLAY_ACTION: 'overlay:action',            // OVERLAY_IPC.ACTION
+  OVERLAY_ACTION_RELAY: 'overlay:action-relay', // OVERLAY_IPC.ACTION_RELAY
+  OVERLAY_UI: 'overlay:ui',                    // OVERLAY_IPC.UI
+  OVERLAY_UI_PUSH: 'overlay:ui-push',          // OVERLAY_IPC.UI_PUSH
 });
 
 /** The engine port, once main hands it over. */
@@ -78,6 +110,21 @@ const frameListeners: Array<(msg: PumpToRendererMsg) => void> = [];
  * chance to subscribe, or the first events of a mode switch are dropped.
  */
 const overlayInputListeners: Array<(event: OverlayInputEvent) => void> = [];
+
+/**
+ * Subscribers to user intents relayed from the HUD window (main-renderer side).
+ * Module scope for the same first-event reason as the input listeners above.
+ */
+const overlayActionListeners: Array<(action: HudAction) => void> = [];
+
+/**
+ * Subscribers to UI snapshots forwarded by main (HUD side), plus the latest
+ * snapshot for late-subscriber replay: the push can land while the HUD bundle
+ * is still evaluating, and without the replay the chrome would boot showing
+ * defaults until the next state change somewhere else in the app.
+ */
+const overlayUiListeners: Array<(state: HudUiState) => void> = [];
+let lastUiState: HudUiState | null = null;
 
 /**
  * Messages the renderer tried to send before the port arrived. The handshake is
@@ -205,6 +252,46 @@ ipcRenderer.on(CH.OVERLAY_INPUT_RELAY, (_event: IpcRendererEvent, payload: unkno
 });
 
 /**
+ * User intents relayed from the HUD chrome, forwarded by main. Main has already
+ * validated the shape; each listener is still isolated so one throwing consumer
+ * cannot starve the others.
+ */
+ipcRenderer.on(CH.OVERLAY_ACTION_RELAY, (_event: IpcRendererEvent, payload: unknown) => {
+  if (!payload || typeof payload !== 'object') return;
+  const action = payload as HudAction;
+
+  for (let i = 0; i < overlayActionListeners.length; i++) {
+    const fn = overlayActionListeners[i];
+    if (typeof fn !== 'function') continue;
+    try {
+      fn(action);
+    } catch (err) {
+      console.warn('[preload] overlay action listener threw:', errText(err));
+    }
+  }
+});
+
+/**
+ * UI snapshots forwarded by main to the HUD window. Cached for the replay in
+ * onUiState() -- see lastUiState above.
+ */
+ipcRenderer.on(CH.OVERLAY_UI_PUSH, (_event: IpcRendererEvent, payload: unknown) => {
+  if (!payload || typeof payload !== 'object') return;
+  const state = payload as HudUiState;
+  lastUiState = state;
+
+  for (let i = 0; i < overlayUiListeners.length; i++) {
+    const fn = overlayUiListeners[i];
+    if (typeof fn !== 'function') continue;
+    try {
+      fn(state);
+    } catch (err) {
+      console.warn('[preload] overlay ui listener threw:', errText(err));
+    }
+  }
+});
+
+/**
  * Thin wrapper around ipcRenderer.invoke that turns a rejected main-process
  * handler into the documented { ok:false, reason } shape instead of an unhandled
  * rejection in renderer code.
@@ -216,6 +303,28 @@ function invokeSafe<T extends OkResult = OkResult>(channel: string, payload?: un
     ok: false,
     reason: `IPC "${channel}" failed: ${errText(err)}`,
   } as T));
+}
+
+/**
+ * Clamp anything that claims to be a normalized coordinate into 0..1.
+ *
+ * A NaN reaching the receiver becomes a NaN clientX on a synthetic event, which
+ * OrbitControls happily folds into the camera position -- and a NaN camera is
+ * unrecoverable without a reload. Cheap to prevent, miserable to debug.
+ */
+function norm01(value: unknown): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return undefined;
+  return value < 0 ? 0 : value > 1 ? 1 : value;
+}
+
+/** Finite-number passthrough for the fields that have no natural range. */
+function finiteNum(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+/** Boolean passthrough that never forwards `undefined` as `false`. */
+function boolFlag(value: unknown): boolean | undefined {
+  return typeof value === 'boolean' ? value : undefined;
 }
 
 const api: GeoSwarmBridge = {
@@ -368,43 +477,24 @@ const api: GeoSwarmBridge = {
   },
 
   /**
-   * HUD overlay window (CONTRACTS section 6).
+   * HUD overlay window (CONTRACTS section 6, cutout design).
    *
-   * All three are one-way sends rather than invokes. setActive/setScene are
-   * fire-and-forget lifecycle signals with nothing to return, and the input
-   * relay is on the interaction path -- an invoke round trip per relayed
-   * pointermove would put IPC latency between the user's hand and the camera.
+   * Every method here is a one-way send or a callback registrar -- no invokes.
+   * The lifecycle signals have nothing to return, and both relays (input and
+   * actions) sit on interaction paths where an invoke round trip would put IPC
+   * latency between the user's hand and the response.
    */
   overlay: {
-    setActive(active: boolean, info?: OverlaySceneInfo | null): void {
-      // Scene metadata rides along so the title chip is correct on the very
-      // first HUD push rather than one interval later.
-      const payload: Record<string, unknown> = { active: !!active };
-      if (info && typeof info === 'object') {
-        payload.scene = String(info.scene ?? '');
-        payload.title = String(info.title ?? '');
-        payload.subtitle = String(info.subtitle ?? '');
-      }
+    /** Main-renderer side: bring the full-window HUD up or take it down. */
+    setActive(active: boolean): void {
       try {
-        ipcRenderer.send(CH.OVERLAY_SET, payload);
+        ipcRenderer.send(CH.OVERLAY_SET, { active: !!active });
       } catch (err) {
         console.warn('[preload] overlay setActive failed:', errText(err));
       }
     },
 
-    setScene(info: OverlaySceneInfo): void {
-      if (!info || typeof info !== 'object') return;
-      try {
-        ipcRenderer.send(CH.OVERLAY_SCENE, {
-          scene: String(info.scene ?? ''),
-          title: String(info.title ?? ''),
-          subtitle: String(info.subtitle ?? ''),
-        });
-      } catch (err) {
-        console.warn('[preload] overlay setScene failed:', errText(err));
-      }
-    },
-
+    /** Main-renderer side: receive input relayed from the cutout. */
     onInput(cb: (event: OverlayInputEvent) => void): Unsubscribe {
       if (typeof cb !== 'function') {
         console.warn('[preload] overlay onInput called without a function');
@@ -416,6 +506,164 @@ const api: GeoSwarmBridge = {
         if (i >= 0) overlayInputListeners.splice(i, 1);
       };
     },
+
+    /**
+     * Main-renderer side: push a fresh UI snapshot for the HUD to mirror.
+     *
+     * The object is forwarded as-is (it is renderer-built, plain data, and main
+     * re-validates the shape before storing it); rebuilding it field by field
+     * here would just be a second copy of the validation main already does.
+     */
+    pushUiState(state: HudUiState): void {
+      if (!state || typeof state !== 'object') return;
+      try {
+        ipcRenderer.send(CH.OVERLAY_UI, state);
+      } catch (err) {
+        console.warn('[preload] overlay pushUiState failed:', errText(err));
+      }
+    },
+
+    /** Main-renderer side: receive user intents captured in the HUD chrome. */
+    onAction(cb: (action: HudAction) => void): Unsubscribe {
+      if (typeof cb !== 'function') {
+        console.warn('[preload] overlay onAction called without a function');
+        return () => {};
+      }
+      overlayActionListeners.push(cb);
+      return () => {
+        const i = overlayActionListeners.indexOf(cb);
+        if (i >= 0) overlayActionListeners.splice(i, 1);
+      };
+    },
+
+    /**
+     * HUD side: relay one input event captured over the cutout.
+     *
+     * Every field is copied explicitly rather than the object being forwarded
+     * whole. Two reasons: a DOM event object is not structured-cloneable (it
+     * would throw on send), and rebuilding the payload field by field means the
+     * only things that can ever cross this channel are the ones enumerated here.
+     */
+    sendInput(event: OverlayInputEvent): void {
+      if (!event || typeof event !== 'object') return;
+
+      const kind = event.kind;
+      if (
+        kind !== 'down' &&
+        kind !== 'move' &&
+        kind !== 'up' &&
+        kind !== 'cancel' &&
+        kind !== 'wheel' &&
+        kind !== 'key'
+      ) {
+        return;
+      }
+
+      const payload: OverlayInputEvent = { kind };
+
+      const nx = norm01(event.nx);
+      if (nx !== undefined) payload.nx = nx;
+      const ny = norm01(event.ny);
+      if (ny !== undefined) payload.ny = ny;
+
+      const button = finiteNum(event.button);
+      if (button !== undefined) payload.button = button;
+      const buttons = finiteNum(event.buttons);
+      if (buttons !== undefined) payload.buttons = buttons;
+
+      const deltaX = finiteNum(event.deltaX);
+      if (deltaX !== undefined) payload.deltaX = deltaX;
+      const deltaY = finiteNum(event.deltaY);
+      if (deltaY !== undefined) payload.deltaY = deltaY;
+      const deltaMode = finiteNum(event.deltaMode);
+      if (deltaMode !== undefined) payload.deltaMode = deltaMode;
+
+      const shiftKey = boolFlag(event.shiftKey);
+      if (shiftKey !== undefined) payload.shiftKey = shiftKey;
+      const ctrlKey = boolFlag(event.ctrlKey);
+      if (ctrlKey !== undefined) payload.ctrlKey = ctrlKey;
+      const altKey = boolFlag(event.altKey);
+      if (altKey !== undefined) payload.altKey = altKey;
+      const metaKey = boolFlag(event.metaKey);
+      if (metaKey !== undefined) payload.metaKey = metaKey;
+
+      // Only the three storm-force keys ever cross. Anything else is dropped
+      // here rather than at the receiver, so the channel itself cannot be used
+      // to synthesize arbitrary keystrokes into the main page.
+      if (event.key === '1' || event.key === '2' || event.key === '3') {
+        payload.key = event.key;
+      }
+
+      const pointerId = finiteNum(event.pointerId);
+      if (pointerId !== undefined) payload.pointerId = pointerId;
+
+      try {
+        ipcRenderer.send(CH.OVERLAY_INPUT, payload);
+      } catch (err) {
+        console.warn('[preload] overlay input relay failed:', errText(err));
+      }
+    },
+
+    /**
+     * HUD side: ship one user intent to the main renderer.
+     *
+     * The kind whitelist is applied here as well as main-side -- each layer is
+     * the last line of defence for the one below it.
+     */
+    sendAction(action: HudAction): void {
+      if (!action || typeof action !== 'object') return;
+      const kind = (action as { kind?: unknown }).kind;
+      if (
+        kind !== 'scene' &&
+        kind !== 'mode' &&
+        kind !== 'preset' &&
+        kind !== 'params' &&
+        kind !== 'count' &&
+        kind !== 'coverage' &&
+        kind !== 'pointScale'
+      ) {
+        return;
+      }
+      try {
+        ipcRenderer.send(CH.OVERLAY_ACTION, action);
+      } catch (err) {
+        console.warn('[preload] overlay sendAction failed:', errText(err));
+      }
+    },
+
+    /** HUD side: receive UI snapshots, with latest-snapshot replay. */
+    onUiState(cb: (state: HudUiState) => void): Unsubscribe {
+      if (typeof cb !== 'function') {
+        console.warn('[preload] overlay onUiState called without a function');
+        return () => {};
+      }
+      overlayUiListeners.push(cb);
+
+      // Replay the latest snapshot so a subscriber that registered after the
+      // push paints immediately rather than showing defaults until the next
+      // state change.
+      if (lastUiState) {
+        try {
+          cb(lastUiState);
+        } catch (err) {
+          console.warn('[preload] overlay ui replay threw:', errText(err));
+        }
+      }
+
+      return () => {
+        const i = overlayUiListeners.indexOf(cb);
+        if (i >= 0) overlayUiListeners.splice(i, 1);
+      };
+    },
+
+    /** HUD side: boot handshake -- main replays the latest snapshot on receipt. */
+    hudReady(): void {
+      try {
+        ipcRenderer.send(CH.OVERLAY_READY);
+      } catch (err) {
+        console.warn('[preload] overlay hudReady failed:', errText(err));
+      }
+    },
   },
 };
 
@@ -424,4 +672,11 @@ contextBridge.exposeInMainWorld('geoswarm', api);
 // Handshake last: main creates the channel the instant this lands, so every
 // listener above must already be installed. Fires once per renderer load, which
 // is exactly right -- a reload needs a fresh port.
-ipcRenderer.send(CH.RENDERER_READY);
+//
+// EXCEPT in the HUD window. The pump owns exactly one port and re-establishes
+// it on every handshake, so the overlay announcing itself would steal the port
+// from the main renderer and stop the frame drive dead (see IS_HUD_WINDOW).
+// The HUD announces itself through overlay:ready instead, from its own boot.
+if (!IS_HUD_WINDOW) {
+  ipcRenderer.send(CH.RENDERER_READY);
+}

@@ -106,15 +106,18 @@ const PI  : f32 = 3.1415927;
 const TAU : f32 = 6.2831853;
 const HALF_PI : f32 = 1.5707963;
 
-// Coverage shaping -- mirrored from common.cuh (gsShapeCoverage) and
-// weather.cu (ShapeDensity). CONTRACTS section 8 requires the dial to shape
-// density identically in every backend, so these numbers may not drift.
-const kCoverageCutMin  : f32 = 0.06;
-const kCoverageCutMax  : f32 = 0.72;
-const kCoverageGainMin : f32 = 2.35;
-const kCoverageGainMax : f32 = 1.18;
+// Coverage shaping -- mirrored from common.cuh (gsShapeCoverage, and the
+// GS_COVERAGE_* / GS_ECHO_FLOOR constants) and weather.cu (ShapeDensity).
+// CONTRACTS section 8 requires the dial to shape density identically in every
+// backend, so these numbers are copies and may not drift. The long-form
+// derivation for each one lives on the CUDA constant it mirrors.
+const kEchoFloor       : f32 = 0.16;
+const kCoverageCutMin  : f32 = 0.045;
+const kCoverageCutMax  : f32 = 1.000;
+const kCoverageDialCurve : f32 = 0.075;
+const kCoverageShoulder  : f32 = 1.45;
 const kCellScale       : f32 = 4.6;
-const kCellDepth       : f32 = 0.85;
+const kCellDepth       : f32 = 0.55;
 const kCellDrift       : f32 = 0.017;
 const kCoverageDefault : f32 = 0.35;   // protocol.ts WEATHER_COVERAGE_DEFAULT
 
@@ -459,23 +462,31 @@ fn sampleDensity(fx : f32, fy : f32, w : u32, h : u32) -> f32 {
  *  Coverage shaping -- the Coverage dial (CONTRACTS section 8)
  * =================================================================== */
 
-// Threshold + gain. See the long-form rationale on gsShapeCoverage in
-// common.cuh; the short version is: cut slides from 0.72 (clear) to 0.06
-// (severe) and zeroes everything under it, what survives is rescaled back
-// across 0..1 so a surviving cell still reaches the upper reflectivity bands,
-// and a toe over the first sliver of the range keeps the cell boundary from
-// aliasing when the equirect field is magnified onto the globe.
+// Four stages, mirroring gsShapeCoverage in common.cuh exactly. The full
+// rationale for each constant is on the CUDA side; in brief:
+//
+//   0. shoulder  - compress the solver's saturated vortex cores down the ramp
+//                  BEFORE classifying, so the bulk of a system reads green.
+//   1. threshold - a cut that slides all the way to 1.0 at the clear end, so
+//                  "Clear" clears the pinned cores too; the dial is curved
+//                  first so the slider's travel lands where the field changes.
+//   2. remap     - survivors are stretched onto [kEchoFloor, 1], NOT [0, 1].
+//                  Every renderer discards reflectivity under the floor, so
+//                  mapping to zero would run a second invisible threshold and
+//                  the dial would barely appear to work.
+//   3. toe       - eases the cell boundary so it does not alias under
+//                  magnification. Applied to the parameter, not the output.
 fn shapeCoverage(raw : f32, coverage : f32) -> f32 {
   let c = clamp(coverage, 0.0, 1.0);
-  let d = clamp(raw, 0.0, 1.0);
+  let d = pow(clamp(raw, 0.0, 1.0), kCoverageShoulder);
 
-  let cut  = mix(kCoverageCutMax,  kCoverageCutMin,  c);
-  let gain = mix(kCoverageGainMin, kCoverageGainMax, c);
-
+  let cut = mix(kCoverageCutMax, kCoverageCutMin, pow(c, kCoverageDialCurve));
   if (d <= cut) { return 0.0; }
 
-  let t = (d - cut) / max(1e-4, 1.0 - cut);
-  return clamp(t * gain * smoothstepf(0.0, 0.12, t), 0.0, 1.0);
+  var t = (d - cut) / max(1e-4, 1.0 - cut);
+  t = t * smoothstepf(0.0, 0.10, t);
+
+  return clamp(kEchoFloor + (1.0 - kEchoFloor) * t, 0.0, 1.0);
 }
 
 // Cell mask + the dial. Ridged fBm on the sphere breaks the solver's

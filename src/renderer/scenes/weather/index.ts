@@ -791,11 +791,20 @@ export default function createScene(): Scene {
   }
 
   return {
-    // The radar picture keeps moving without any new field arriving: the wind
-    // layer re-decimates on its own VECTOR_REBUILD_MS cadence and the storm-cell
-    // shell stack rides the same clock. Every tick shows something new, so every
-    // tick counts toward the effective-FPS headline.
-    selfAnimates: true,
+    // NO selfAnimates flag. The flag was here on the strength of "the wind layer
+    // re-decimates on its own VECTOR_REBUILD_MS cadence", which does not survive
+    // being checked: 500 ms is a 2 Hz cadence, not a per-tick one, and a rebuild
+    // driven from the SAME field texture at the SAME camera reproduces the same
+    // vectors anyway. Every layer in this scene -- radar shell, storm-cell slice
+    // stack, wind glyphs, knots labels -- is a pure function of the field
+    // texture and the camera. Not one of them carries a time uniform (check the
+    // uniform blocks: uField/uHasField on the shell, uField/uSlices/uInnerR/
+    // uOuterR/uIntensity/uEchoFloor on the stack -- no clock anywhere).
+    //
+    // So with the field frozen and the camera still, this scene redraws an
+    // identical picture, and its ticks must not count toward the effective-FPS
+    // headline. Real motion here comes from new field payloads and from camera
+    // movement, and both are credited by their own evidence in consumeFreshness.
 
     mount(ctx: SceneMountContext) {
       root = document.createElement('div');

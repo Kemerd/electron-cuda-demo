@@ -58,10 +58,12 @@ import {
 import type {
   Capabilities,
   ComputeBackend,
+  GpuStats,
   InputState,
   ModeState,
   PresetId,
   SceneId,
+  SceneParams,
 } from '../shared/protocol';
 
 import { isFiniteNumber } from './types';
@@ -84,6 +86,14 @@ import { createNativeView } from './present/native-view';
 import type { NativeViewApi } from './present/native-view';
 import type { OverlayInputEvent } from '../main/overlay-types';
 import type { CudaSourceApi, RgbaFrame } from './cuda-source';
+
+import { createBenchController } from './bench/index';
+import type {
+  BenchApplyResult,
+  BenchCellRequest,
+  BenchControllerApi,
+  BenchHost,
+} from './bench/index';
 
 import { createSidebar } from './ui/sidebar';
 import { createSceneControls } from './ui/scene-controls';
@@ -322,6 +332,25 @@ let linkFailureReason = '';
  *  came off a worker, a WGSL pipeline or a CUDA MessagePort -- which is the
  *  entire point of the DataSource seam (CONTRACTS section 8).
  * ------------------------------------------------------------------ */
+
+/**
+ * What a reconfiguration attempt actually did.
+ *
+ * ensureSource() and configureSource() used to return void, which was fine for
+ * every interactive caller -- a slider drag does not wait on anything. The
+ * benchmark harness does: it has to know a cell is genuinely ready before it
+ * starts warming up, and whether the backend clamped the count it was given.
+ * The value is additive and every pre-existing call site ignores it.
+ */
+interface SourceOutcome {
+  ok: boolean;
+  reason?: string;
+  /** Count the backend is really running, when it differs from the request. */
+  actualCount?: number;
+  /** True when the backend clamped the request (the CPU baseline auto-cap). */
+  capped?: boolean;
+  cappedReason?: string;
+}
 
 /** The one live source, or null when the active backend has no implementation. */
 let activeSource: DataSource | null = null;
@@ -720,6 +749,16 @@ function onSourceEntities(f: EntityFrame): void {
     ui.overlay.pushSimStep();
   }
 
+  // BENCH: the harness is FED the same numbers the overlay is, at the same
+  // instant, so its results and the live readout can never disagree about what
+  // a sim step or a timing was. It ignores everything outside a measure window.
+  if (bench) {
+    bench.sampleCount(f.count);
+    if (f.timings) {
+      bench.sampleTimings(f.timings.simMs, f.timings.copyMs, f.timings.renderMs ?? 0);
+    }
+  }
+
   // The CUDA link verdict is driven by real records arriving on the CUDA path.
   // Non-latching: this promotes the chip whether the last verdict was "nothing
   // yet" or "failed".
@@ -779,6 +818,19 @@ function onSourceRgba(f: RgbaFrame): void {
     // A rastered frame advanced the sim too (renderFrame does both), so it
     // counts as a step exactly as an entity batch does.
     ui.overlay.pushSimStep();
+  }
+
+  // BENCH: mode 5's costs are all here -- renderMs is the ray-march and copyMs
+  // is the device->host trip that makes this mode deliberately wasteful.
+  //
+  // sampleCount(0) rather than the pixel count: a rastered frame IS a completed
+  // sim step (renderFrame does both) and must be counted as one, but it carries
+  // no ENTITY count. Feeding it w*h would put a few million "records" into the
+  // field the cap detector compares against the requested agent count, and
+  // every mode-5 row would come out marked capped for arithmetic reasons.
+  if (bench) {
+    bench.sampleCount(0);
+    bench.sampleTimings(f.simMs, f.copyMs, f.renderMs);
   }
 
   // A rastered frame is proof of a live link exactly as an entity batch is --
@@ -865,7 +917,7 @@ function disposeActiveSource(): void {
  * lived (a preset change that reconfigured the engine but not the scene, a
  * scene change that left the old source running).
  */
-async function ensureSource(engineScene: SceneId): Promise<void> {
+async function ensureSource(engineScene: SceneId): Promise<SourceOutcome> {
   const wanted = mode.compute;
   const token = ++sourceToken;
 
@@ -875,13 +927,12 @@ async function ensureSource(engineScene: SceneId): Promise<void> {
     // the matrix the UI greys out. Say so once and run without a source.
     disposeActiveSource();
     setChip('source', `${wanted} backend not implemented yet`, 'warn');
-    return;
+    return { ok: false, reason: `${wanted} backend not implemented yet` };
   }
 
   // Same backend already live: just reconfigure it for the new scene/preset.
   if (activeSource && activeSourceId === wanted) {
-    await configureSource(activeSource, engineScene, token);
-    return;
+    return await configureSource(activeSource, engineScene, token);
   }
 
   disposeActiveSource();
@@ -893,7 +944,7 @@ async function ensureSource(engineScene: SceneId): Promise<void> {
     const why = errText(err);
     console.warn('[app] could not create %s source: %s', wanted, why);
     setChip('source', `${registration.label} unavailable`, 'warn', why);
-    return;
+    return { ok: false, reason: why };
   }
 
   // The user changed mode/scene while the factory was resolving.
@@ -903,7 +954,7 @@ async function ensureSource(engineScene: SceneId): Promise<void> {
     } catch {
       /* nothing to recover; the source never became active */
     }
-    return;
+    return { ok: false, reason: 'superseded by a newer configure' };
   }
 
   source.onEntities(onSourceEntities);
@@ -927,30 +978,40 @@ async function ensureSource(engineScene: SceneId): Promise<void> {
   clearChip('source');
   console.log(`[app] compute source -> ${registration.label}`);
 
-  await configureSource(source, engineScene, token);
+  return await configureSource(source, engineScene, token);
 }
 
 /**
  * Configure a source for a scene at the current preset, and surface the CPU
  * cap if one was applied.
+ *
+ * The returned SourceOutcome is what the benchmark harness waits on: it needs
+ * to know that a cell is genuinely ready before it starts a warmup, and it
+ * needs the cap information for the same reason the chip does -- a run at 20k
+ * under a request for 2M is a result at 20k. Nothing else reads the value; the
+ * interactive call sites all `void` it, exactly as they did when this returned
+ * nothing.
  */
 async function configureSource(
   source: DataSource,
   engineScene: SceneId,
   token: number,
-): Promise<void> {
+): Promise<SourceOutcome> {
   sourceConfigured = false;
 
   let result;
   try {
     result = await source.configure(engineScene, sceneParams);
   } catch (err) {
-    console.warn('[app] source configure threw: %s', errText(err));
-    return;
+    const why = errText(err);
+    console.warn('[app] source configure threw: %s', why);
+    return { ok: false, reason: why };
   }
 
   // A newer configure superseded this one while it was in flight.
-  if (token !== sourceToken) return;
+  if (token !== sourceToken) {
+    return { ok: false, reason: 'superseded by a newer configure' };
+  }
 
   if (!result || result.ok !== true) {
     const why = (result && result.reason) || 'unknown';
@@ -968,7 +1029,7 @@ async function configureSource(
     if (source.id === COMPUTE.CUDA) {
       linkFailureReason = `configureScene refused: ${why}`;
     }
-    return;
+    return { ok: false, reason: why };
   }
 
   sourceConfigured = true;
@@ -987,6 +1048,42 @@ async function configureSource(
   if (source.id === COMPUTE.CUDA && !cudaLinkVerified) {
     resetLinkAttempt('waiting for the first frame after configureScene');
   }
+
+  return { ok: true, ...readSourceCap(source) };
+}
+
+/**
+ * Read a source's auto-cap state, when it has one.
+ *
+ * The same feature test updateCapChip() uses, factored out because the harness
+ * needs the numbers rather than the chip: a cell that ran 20k agents under a
+ * request for 2M has to be MARKED as capped in the results table, and the only
+ * place that fact exists is on the backend that did the capping.
+ */
+function readSourceCap(source: DataSource): {
+  actualCount?: number;
+  capped?: boolean;
+  cappedReason?: string;
+} {
+  const probe = source as Partial<{
+    wasCapped(): boolean;
+    activeCount(): number;
+    requestedCount(): number;
+  }>;
+
+  if (typeof probe.wasCapped !== 'function' || !probe.wasCapped()) return {};
+
+  const active = typeof probe.activeCount === 'function' ? probe.activeCount() : 0;
+  const asked = typeof probe.requestedCount === 'function' ? probe.requestedCount() : 0;
+
+  return {
+    actualCount: active,
+    capped: true,
+    cappedReason:
+      `The CPU baseline auto-caps: it ran ${fmtCount(active)} of the ` +
+      `${fmtCount(asked)} requested. A single thread cannot step the higher ` +
+      `counts at an interactive rate.`,
+  };
 }
 
 /**
@@ -1117,11 +1214,15 @@ async function pollGpuStats(): Promise<void> {
     // The overlay decides what an unusable snapshot looks like; it only needs
     // to be handed whatever came back.
     if (ui.overlay) ui.overlay.setGpuStats(stats);
+    // BENCH: cache the snapshot so the harness reads the poll that already
+    // runs rather than opening a second IPC cadence for the same question.
+    lastGpuStats = stats ?? null;
   } catch (err) {
     // The preload already converts a rejected invoke into { ok:false }, so this
     // is the belt-and-braces path: hide the line, keep the poll alive.
     console.warn('[app] gpu stats poll failed: %s', errText(err));
     if (ui.overlay) ui.overlay.setGpuStats(null);
+    lastGpuStats = null;
   } finally {
     gpuStatsInFlight = false;
   }
@@ -1546,6 +1647,13 @@ async function mountScene(id: string): Promise<void> {
   mountSceneControls(id);
   applyStormPointScale();
 
+  // BENCH: the Benchmark tab's panel is application-owned, not scene-owned --
+  // a sweep mounts the OTHER scenes underneath it, so a panel living in the
+  // benchmark scene module would be destroyed by the first transition of its
+  // own sweep. This tells the controller which tab is showing; it decides
+  // whether the panel stays attached (see bench/index.ts).
+  syncBenchTab(id);
+
   // The new scene appended its own .scene-root, so re-apply the visibility rule
   // for the active mode -- otherwise a scene mounted while mode 5 is live would
   // paint over the blit canvas.
@@ -1816,6 +1924,10 @@ function resizeActiveScene(): void {
   // child window lagging the layout by one animation step. Nudging it here
   // costs one rect comparison when nothing moved.
   if (nativeView) nativeView.resync();
+
+  // BENCH: the results charts are canvases sized from their own box, and the
+  // stage changes size on a sidebar collapse without firing a window event.
+  if (bench) bench.resize();
 
   if (blit && blit.ok) {
     try {
@@ -2232,6 +2344,214 @@ function installOverlayInputRelay(): void {
   });
 }
 
+/* ==================================================================== *
+ *  BENCH WIRING REGION (src/renderer/bench/**)
+ *
+ *  Everything the Benchmark tab needs from the application, in one block.
+ *  Nothing outside this region knows the harness exists except for four call
+ *  sites, each one line long: the tab-activation hook in mountScene(), the
+ *  sample feeds in the payload sinks, the drive in tick(), and the resize
+ *  forward in resizeActiveScene().
+ *
+ *  The design rule the whole region is built on: the harness drives the app
+ *  through the SAME router a human clicking the matrix drives it through.
+ *  applyCell() below is applyMode() + mountScene() + ensureSource() in
+ *  sequence -- it does not reach past any of them into the sources, because a
+ *  transition that skipped the router would be measuring a state the app can
+ *  never actually be in. Every reconfiguration cost the harness reports is a
+ *  cost a user would really pay.
+ * ==================================================================== */
+
+/** The tab controller, built on first navigation to the Benchmark scene. */
+let bench: BenchControllerApi | null = null;
+
+/**
+ * What the app looked like before a sweep started, so it can be put back.
+ *
+ * Captured on the first applyCell() of a run rather than at start(): by the
+ * time the runner is asking for a cell the operator has definitely committed,
+ * and capturing earlier would mean a cancelled-before-anything-happened sweep
+ * still "restored" over a mode the user changed in the meantime.
+ */
+interface BenchRestorePoint {
+  mode: ModeState;
+  navScene: string;
+  params: FidelityParams;
+}
+let benchRestore: BenchRestorePoint | null = null;
+
+/** Map an engine scene id back to the nav id that drives it. */
+function navIdForScene(scene: SceneId): string {
+  for (const [id, entry] of Object.entries(SCENE_REGISTRY)) {
+    if (entry.engineScene === scene) return id;
+  }
+  return 'globe';
+}
+
+/**
+ * Bring the app to one benchmark cell and report whether it got there.
+ *
+ * Order matters and is not arbitrary:
+ *
+ *   1. counts first, into sceneParams, so the configure that follows allocates
+ *      the size the cell asked for rather than the previous cell's;
+ *   2. mode next, through applyMode() -- which validates legality, swaps the
+ *      presentation surface and starts/stops the native view;
+ *   3. scene last, through mountScene(), which ends by awaiting ensureSource().
+ *
+ * When the scene is already mounted step 3 would be a no-op that skips the
+ * reconfigure entirely, so that case calls ensureSource() directly -- the same
+ * thing a preset click does.
+ */
+async function benchApplyCell(request: BenchCellRequest): Promise<BenchApplyResult> {
+  if (!request || typeof request !== 'object') {
+    return { ok: false, reason: 'malformed cell request' };
+  }
+
+  // First cell of a run: remember where to put everything back.
+  if (!benchRestore) {
+    benchRestore = {
+      mode: { ...mode },
+      navScene: activeSceneId || 'globe',
+      params: { ...sceneParams },
+    };
+  }
+
+  // ---- 1. counts ----------------------------------------------------
+  // The weather scene's size is its grid, which is a fidelity parameter rather
+  // than an entity count -- writing it into swarmCount would reallocate the
+  // wrong thing entirely.
+  if (request.countKind === 'grid') {
+    sceneParams = { ...sceneParams, weatherGrid: request.count };
+  } else if (request.scene === SCENES.STORM) {
+    sceneParams = { ...sceneParams, stormCount: request.count };
+  } else {
+    sceneParams = { ...sceneParams, swarmCount: request.count };
+  }
+
+  // ---- 2. mode -------------------------------------------------------
+  const legal = isLegalMode(request.mode);
+  if (!legal.ok) {
+    return { ok: false, reason: legal.reason ?? 'illegal mode' };
+  }
+
+  // applyMode() kicks its own ensureSource() when the compute axis moved. That
+  // is not awaited (it is a click handler), so the await below is what the
+  // harness actually waits on -- and because both funnel through the same
+  // sourceToken guard, the earlier one simply loses the race and resolves as
+  // superseded. That is correct behavior, not a leak.
+  applyMode(request.mode);
+
+  // ---- 3. scene ------------------------------------------------------
+  const navId = navIdForScene(request.scene);
+  let outcome: SourceOutcome;
+
+  if (navId !== activeSceneId) {
+    await mountScene(navId);
+    // mountScene ends by awaiting ensureSource(), but it discards the result --
+    // ask the router for the current state rather than re-running a configure
+    // that would free and reallocate the buffers that were just built.
+    outcome = sourceConfigured
+      ? { ok: true, ...(activeSource ? readSourceCap(activeSource) : {}) }
+      : { ok: false, reason: 'scene mounted but the compute source did not configure' };
+  } else {
+    outcome = await ensureSource(activeEngineScene());
+  }
+
+  // Keep the visible controls honest while the sweep drives them. A slider
+  // reading 50k while the harness measures 2M is the same stale-number defect
+  // CONTRACTS calls out for preset changes -- it does not stop being one
+  // because a machine moved the value instead of a hand.
+  resyncSceneControls();
+
+  if (!outcome.ok) {
+    return { ok: false, reason: outcome.reason ?? 'configure failed' };
+  }
+
+  return {
+    ok: true,
+    ...(isFiniteNumber(outcome.actualCount) ? { actualCount: outcome.actualCount } : {}),
+    ...(outcome.capped === true ? { capped: true } : {}),
+    ...(outcome.cappedReason ? { cappedReason: outcome.cappedReason } : {}),
+  };
+}
+
+/** Put the app back the way the operator left it. */
+async function benchRestoreApp(): Promise<void> {
+  const point = benchRestore;
+  benchRestore = null;
+  if (!point) return;
+
+  sceneParams = { ...point.params };
+  applyMode(point.mode);
+
+  if (point.navScene !== activeSceneId) {
+    await mountScene(point.navScene);
+  } else {
+    await ensureSource(activeEngineScene());
+  }
+
+  resyncSceneControls();
+  console.log('[app] benchmark sweep finished; app state restored');
+}
+
+/**
+ * Latest GPU telemetry snapshot, cached for the harness.
+ *
+ * The 1 Hz poll already runs for the overlay (see pollGpuStats). Holding the
+ * last answer here costs one assignment a second and saves the harness from
+ * opening a second IPC cadence to ask the same question.
+ */
+let lastGpuStats: GpuStats | null = null;
+
+/** The application seam the runner drives. */
+const benchHost: BenchHost = {
+  caps: (): MergedCaps => caps,
+  sceneParams: (): SceneParams => sceneParams,
+  applyCell: benchApplyCell,
+  restore: benchRestoreApp,
+  gpuStats: (): GpuStats | null => lastGpuStats,
+  nativeStats: () => nativeStats,
+};
+
+/**
+ * Build the controller on demand.
+ *
+ * Lazy for the same reason the blit presenter is: a session that never opens
+ * the Benchmark tab should not pay for two canvases and a fourteen-column
+ * table. The mount host is #stage-surface, which is where the panel overlays
+ * whatever scene the sweep put there.
+ */
+function ensureBench(): BenchControllerApi | null {
+  if (bench) return bench;
+
+  const host = document.getElementById('stage-surface');
+  if (!host) {
+    console.warn('[app] #stage-surface missing; the Benchmark tab cannot mount');
+    return null;
+  }
+
+  bench = createBenchController(benchHost, host);
+  return bench;
+}
+
+/**
+ * Tell the controller whether its tab is the selected one.
+ *
+ * Called from mountScene(). The controller decides what to do with that: the
+ * panel stays on screen through a sweep even when the operator navigates away,
+ * because the sweep is what put the other scene there in the first place.
+ */
+function syncBenchTab(navId: string): void {
+  // Only build the thing when the tab is actually visited, but once it exists
+  // it keeps hearing about navigation so a running sweep can keep its readout.
+  if (navId !== 'benchmark' && !bench) return;
+
+  const controller = ensureBench();
+  if (!controller) return;
+  controller.setTabActive(navId === 'benchmark');
+}
+
 /* ------------------------------------------------------------------ *
  *  Main loop
  * ------------------------------------------------------------------ */
@@ -2376,6 +2696,22 @@ function consumeFreshness(): boolean {
   // rAF loop also mark ticks fresh would fight that readout.
   if (isNativePresentMode()) return false;
 
+  // The CUDA-raster (blit) path is a SINGLE-EVIDENCE mode: the only pixels this
+  // process puts on screen are the RGBA frame the engine hands to blit.present().
+  // The scene's three.js render still runs -- it owns the camera rig -- but it
+  // draws into a canvas that is not composited in this mode, so neither its
+  // self-animation nor a camera move is visible to anyone until the NEXT engine
+  // frame comes back carrying that camera. Counting them here is what produced
+  // the Wave-4 reading of 240 effective while fresh RGBA frames landed at 86/s:
+  // the rAF spin rate wearing the headline's clothes, which is exactly the
+  // perception lie CONTRACTS section 8 calls a defect.
+  //
+  // Camera freshness is not lost by this, only deferred by one round trip: a
+  // drag makes the engine render a new view, that view arrives as a payload, and
+  // hadPayload credits the tick that shows it. The counter follows the pictures
+  // the user sees rather than the intentions this process had.
+  if (isCudaRasterMode()) return hadPayload;
+
   return hadPayload || camMoved || ptrMoved || animating;
 }
 
@@ -2455,6 +2791,16 @@ function tick(now: number): void {
     // cost of a render nobody is looking at.
     if (!isCudaRasterMode()) ui.overlay.setDrawMs(drawMs);
     ui.overlay.tick(now);
+  }
+
+  // BENCH: the harness gets the IDENTICAL (frameMs, fresh) pair the overlay
+  // just got, which is the whole reason the benchmark's headline and the live
+  // headline are the same measurement rather than two definitions of "a frame".
+  // Its tick() runs last, after the frame has been driven and drawn, so a phase
+  // edge always lands between frames rather than inside one.
+  if (bench) {
+    bench.sampleFrame(frameMs, fresh);
+    bench.tick(now);
   }
 }
 
@@ -2581,9 +2927,14 @@ async function boot(): Promise<void> {
   ui.matrix.setCaps(caps);
 
   ui.presets = createPresets(document.getElementById('presets-panel'), {
-    // Ultra is the documented default, but it is tuned for a very large GPU.
-    // Phase 1 proves the transport, so start at Low and let the user climb.
-    initial: caps.cuda.ok ? 'low' : DEFAULT_PRESET,
+    // Boot on the documented default whenever CUDA is actually present. The old
+    // safe-boot-at-Low rule predates a proven transport -- it was there so a
+    // broken pump could not open on a 2M-agent configure -- and the pump has
+    // been verified end to end since. Booting at Low on a card that runs Ultra
+    // means the first thing anyone sees is a 20k-dart demo of a 2M-dart engine.
+    // Without CUDA the three.js/CPU baselines carry the scene alone, and Low is
+    // still the only honest opening count there.
+    initial: caps.cuda.ok ? DEFAULT_PRESET : 'low',
     onChange: (params, presetKey) => {
       sceneParams = params;
 

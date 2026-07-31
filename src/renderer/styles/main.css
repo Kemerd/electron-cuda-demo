@@ -1193,6 +1193,406 @@ input[type='range']:active::-webkit-slider-thumb { transform: scale(1.06); }
   .fps-card { width: 176px; }
 }
 
+/* =====================================================================
+   Benchmark tab (src/renderer/bench/**)
+
+   The panel is an overlay on #stage-surface rather than a scene's own DOM,
+   because a sweep MOUNTS the other scenes underneath it -- see the module
+   header in bench/index.ts. Two display modes:
+
+     default        the tab is selected and idle; the panel owns the surface
+                    and its backdrop is near-opaque.
+     .is-observing  a sweep is running while the operator is on another tab;
+                    the panel narrows to a column against the left edge and
+                    goes translucent so the scene being measured stays
+                    watchable -- watching the storm at 4M IS the demo.
+
+   Every number in here inherits the tabular-figure rule from the type block
+   at the top of this file via .mono / .stat, and the table adds it directly.
+   ===================================================================== */
+
+.bench-panel {
+  position: absolute;
+  inset: 0;
+  z-index: 4; /* above the scene canvas + blit surface, below .overlay-layer */
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px 18px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  background: rgba(10, 11, 15, 0.94);
+  backdrop-filter: var(--blur);
+  transition:
+    inset var(--dur) var(--spring),
+    background-color var(--dur) var(--spring),
+    width var(--dur) var(--spring);
+}
+
+/* Observing: step aside so the measured scene is visible behind. */
+.bench-panel.is-observing {
+  inset: 0 auto 0 0;
+  width: min(46%, 560px);
+  background: rgba(10, 11, 15, 0.82);
+  border-right: 1px solid var(--hairline);
+}
+
+/* A reduced-duration run is not a measurement; mark the whole panel. */
+.bench-panel.is-reduced {
+  box-shadow: inset 0 0 0 1px var(--warn-dim);
+}
+
+/* ---- header ---------------------------------------------------------- */
+
+.bench-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.bench-heading h2 {
+  margin: 0;
+  font-size: var(--fs-lead);
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.bench-heading p {
+  margin: 3px 0 0;
+  max-width: 62ch;
+  font-size: var(--fs-small);
+  color: var(--text-secondary);
+  line-height: 1.4;
+}
+
+.bench-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.bench-btn {
+  padding: 7px 14px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--hairline-strong);
+  background: var(--panel);
+  color: var(--text);
+  font-size: var(--fs-small);
+  font-weight: 550;
+  transition:
+    background-color var(--dur-fast) var(--spring),
+    border-color var(--dur-fast) var(--spring),
+    transform var(--dur-fast) var(--spring);
+}
+
+.bench-btn:hover:not(:disabled) {
+  background: var(--panel-hover);
+  border-color: var(--accent);
+}
+
+.bench-btn:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+.bench-btn:disabled {
+  color: var(--text-disabled);
+  border-color: var(--hairline);
+  cursor: default;
+}
+
+.bench-btn.is-primary {
+  background: var(--accent-dim);
+  border-color: var(--accent-glow);
+  color: var(--accent);
+}
+
+.bench-btn.is-primary:disabled {
+  background: none;
+  color: var(--text-disabled);
+}
+
+/* ---- scope controls -------------------------------------------------- */
+
+.bench-scope {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 20px;
+  align-items: center;
+}
+
+.bench-scope-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.bench-scope-label {
+  font-size: var(--fs-micro);
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+.bench-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: var(--fs-small);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.bench-check input {
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.bench-select {
+  padding: 4px 8px;
+  border-radius: 8px;
+  border: 1px solid var(--hairline-strong);
+  background: var(--panel-solid);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--fs-small);
+  cursor: pointer;
+}
+
+/* ---- methodology ----------------------------------------------------- */
+
+.bench-method {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 12px;
+  padding: 10px 12px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--hairline);
+  background: rgba(255, 255, 255, 0.028);
+}
+
+.bench-method-title {
+  font-size: var(--fs-micro);
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.bench-method p {
+  margin: 0;
+  flex: 1 1 42ch;
+  font-size: var(--fs-micro);
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+.bench-debug {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: var(--fs-micro);
+  color: var(--text-tertiary);
+  cursor: pointer;
+}
+
+.bench-debug input {
+  accent-color: var(--warn);
+  cursor: pointer;
+}
+
+.bench-panel.is-reduced .bench-debug {
+  color: var(--warn);
+}
+
+/* ---- progress -------------------------------------------------------- */
+
+.bench-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--hairline);
+  background: var(--panel);
+  transition: opacity var(--dur) var(--spring);
+}
+
+.bench-progress.is-idle {
+  opacity: 0.5;
+}
+
+.bench-progress-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: var(--fs-small);
+}
+
+.bench-phase {
+  font-weight: 650;
+  color: var(--accent);
+  min-width: 84px;
+}
+
+.bench-cell {
+  flex: 1 1 auto;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.bench-elapsed {
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--fs-micro);
+}
+
+.bench-track {
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.07);
+  overflow: hidden;
+}
+
+.bench-fill {
+  height: 100%;
+  width: 0;
+  border-radius: 2px;
+  background: var(--text-tertiary);
+  transition: width 120ms linear;
+}
+
+/* Warmup is visibly NOT a measurement; the measure window is. */
+.bench-fill.is-warmup { background: var(--warn); }
+.bench-fill.is-measuring { background: var(--accent); }
+
+/* ---- charts ---------------------------------------------------------- */
+
+.bench-charts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 12px;
+  flex-shrink: 0;
+}
+
+.bench-chart {
+  display: block;
+  width: 100%;
+  height: 208px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--hairline);
+  background: rgba(255, 255, 255, 0.022);
+}
+
+/* ---- results table --------------------------------------------------- */
+
+.bench-table-wrap {
+  flex: 1 1 auto;
+  min-height: 120px;
+  overflow: auto;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--hairline);
+}
+
+.bench-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-micro);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1;
+}
+
+.bench-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 7px 9px;
+  text-align: left;
+  font-weight: 650;
+  letter-spacing: 0.03em;
+  color: var(--text-tertiary);
+  background: var(--panel-solid);
+  border-bottom: 1px solid var(--hairline-strong);
+  cursor: pointer;
+  white-space: nowrap;
+  user-select: none;
+}
+
+.bench-table th:hover {
+  color: var(--text-secondary);
+}
+
+.bench-table th.is-sorted {
+  color: var(--accent);
+}
+
+/* Sort arrow, drawn with a glyph rather than an icon font. */
+.bench-table th.is-sorted::after {
+  content: ' \2191';
+}
+
+.bench-table th.is-sorted.is-desc::after {
+  content: ' \2193';
+}
+
+.bench-table th.is-numeric,
+.bench-table td.is-numeric {
+  text-align: right;
+}
+
+.bench-table td {
+  padding: 6px 9px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.045);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.bench-table tbody tr:hover td {
+  background: rgba(255, 255, 255, 0.032);
+}
+
+/* The headline column is the one the eye should land on. */
+.bench-table td.is-headline {
+  color: var(--text);
+  font-weight: 650;
+  font-size: var(--fs-small);
+}
+
+.bench-table td.is-cuda { color: rgba(118, 185, 0, 0.86); }
+.bench-table td.is-accent { color: rgba(79, 209, 255, 0.86); }
+
+/* A skipped cell has no numbers and must not read like one that does. */
+.bench-table tr.is-skipped td {
+  color: var(--text-disabled);
+  font-style: italic;
+}
+
+/* A capped run is a real result at a SMALLER size -- marked, never hidden. */
+.bench-table tr.is-capped td.is-headline,
+.bench-table tr.is-capped td:last-child {
+  color: var(--warn);
+}
+
+.bench-empty {
+  margin: 0;
+  padding: 22px;
+  text-align: center;
+  font-size: var(--fs-small);
+  color: var(--text-tertiary);
+}
+
+/* Narrow stages: the observing column would eat the scene, so go full width
+   and let the operator scroll instead. */
+@media (max-width: 900px) {
+  .bench-panel { padding: 12px; }
+  .bench-panel.is-observing { inset: 0; width: auto; }
+  .bench-chart { height: 172px; }
+}
+
 /* ---------------------------------------------------------------------
    Reduced motion -- honor it everywhere, including the scene canvases
    (scenes read this via matchMedia and slow their animation instead of

@@ -83,10 +83,22 @@ constexpr float kAdvectScale = 0.10f;
 constexpr float kJetLat = 0.6981317f;
 constexpr float kJetWidth = 0.2617994f;
 
-/** Volume extrusion: the shell the 2D density is lofted into, as a fraction of
- *  the volume's half-extent. Matches the raster's march range. */
-constexpr float kVolumeInner = GS_GLOBE_RADIUS;
-constexpr float kVolumeOuter = GS_ALTITUDE_MAX * 1.5f;
+/**
+ * Volume extrusion: the shell the 2D density is lofted into. These MUST equal
+ * raster.cu's kShellInner/kShellOuter (the march range) and they are both the
+ * three.js slice stack's radii - CELL_INNER_R / CELL_OUTER_R in
+ * src/renderer/scenes/weather/storm-cells.ts, 1.005R and 1.055R per CONTRACTS
+ * section 8.
+ *
+ * The old pair (GS_GLOBE_RADIUS .. GS_ALTITUDE_MAX*1.5f = 1.0R .. 1.65R) lofted
+ * the density into an atmosphere 13x deeper than the one the WebGL path draws,
+ * which is what made the CUDA storm cells erupt as radial wedges standing half
+ * a globe-radius off the surface while the three.js tab showed the same systems
+ * lying flat on it. Same field, same shell, both backends - the picture is not
+ * allowed to change with the raster backend.
+ */
+constexpr float kVolumeInner = GS_GLOBE_RADIUS * 1.005f;
+constexpr float kVolumeOuter = GS_GLOBE_RADIUS * 1.055f;
 
 /** Half-extent of the cube the density volume covers, world units. Sized to
  *  just contain kVolumeOuter so no resolution is wasted on empty corners. */
@@ -612,7 +624,15 @@ void VolumeExtrudeKernel(unsigned char* __restrict__ volume,
   // the sphere shading in the composite) and out at this column's own top. The
   // upper edge is deliberately soft - a hard cut would read as a sliced-off
   // cylinder rather than an anvil.
-  const float altitude = gsSmoothstep(0.0f, 0.16f, hn) *
+  //
+  // The lower edge widened 0.16 -> 0.30 with the shell pull-in. hn is normalised
+  // over the shell, and the shell is now 0.050 world units across a cube whose
+  // voxels are 2*1.055/256 = 0.00824 - about six voxels of radial resolution, so
+  // 0.16 of it was a ramp one voxel wide. That is not a fade, it is a step with
+  // the trilinear filter doing all the work, and it put a hard bright rim at the
+  // base of every cell. 0.30 spends roughly two voxels on the fade, which is the
+  // least the grid can actually represent as a gradient.
+  const float altitude = gsSmoothstep(0.0f, 0.30f, hn) *
                          gsSmoothstep(topCap, topCap * 0.55f, hn);
 
   /* --- 3D detail --------------------------------------------------------- */

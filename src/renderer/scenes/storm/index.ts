@@ -319,10 +319,23 @@ export default function createScene(): Scene {
   }
 
   return {
-    // uTime is written and consumed by the point shader every frame, and the
-    // shockwave rings expand on their own age -- the picture changes with no new
-    // particle batch and no camera input, so every tick is a fresh frame.
-    selfAnimates: true,
+    // NO selfAnimates flag, and the reason is worth writing down because the
+    // flag WAS here and it was wrong. The claim used to be "uTime is consumed by
+    // the point shader every frame" -- but read the two shader sources above:
+    // uTime is handed to the material and neither stage ever references it. The
+    // vertex stage is a pure function of position/energy/uPointScale and the
+    // fragment stage of vEnergy alone. Freeze the sim and hold the camera still
+    // and this scene redraws a byte-identical particle cloud.
+    //
+    // What that bought was a headline reading 102 effective while the sim
+    // stepped at 10/s -- the rAF rate laundered through a uniform nobody reads,
+    // which is the exact perception lie CONTRACTS section 8 names a defect.
+    //
+    // The shockwave rings DO move on their own age, but only while a wave is
+    // alive: they are born from a click (which credits its own tick through the
+    // pointer comparison) and they expand for SHOCKWAVE_LIFE_SEC on top of a
+    // sim that is producing payloads the whole time anyway. A blanket
+    // always-fresh flag is far too big a hammer for a second of ring animation.
 
     mount(ctx: SceneMountContext) {
       root = document.createElement('div');

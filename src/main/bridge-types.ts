@@ -27,7 +27,7 @@ import type {
   PumpToRendererMsg,
   SceneParams,
 } from '../shared/protocol.js';
-import type { OverlayInputEvent } from './overlay-types.js';
+import type { HudAction, HudUiState, OverlayInputEvent } from './overlay-types.js';
 
 /** Rect used by the native-view channels; css px plus the device pixel ratio. */
 export interface NativeViewRect {
@@ -73,48 +73,72 @@ export interface NativeViewBridge {
 export type Unsubscribe = () => void;
 
 /**
- * Scene metadata the HUD overlay window shows in its title chip.
- *
- * The main renderer is the only thing that knows what scene is mounted and what
- * it is called, so it pushes the strings rather than main duplicating the
- * registry.
- */
-export interface OverlaySceneInfo {
-  scene: string;
-  title: string;
-  subtitle: string;
-}
-
-/**
- * Controls for the HUD overlay window (CONTRACTS section 6).
+ * Controls for the HUD overlay window (CONTRACTS section 6, cutout design).
  *
  * The renderer drives the lifecycle because it is what owns the mode router: it
  * is the only side that knows a native present mode is actually engaged AND
  * that the render thread genuinely started. Main inferring it from nview:start
  * would put a HUD on screen for a start that failed.
+ *
+ * The same bridge serves BOTH windows -- the overlay is the same bundle loaded
+ * with ?hud=1 -- so this surface carries both directions of the conversation.
+ * Each method documents which window is expected to call it; nothing enforces
+ * that at the type level because the enforcement lives where it matters, in
+ * main's per-channel validation.
  */
 export interface OverlayBridge {
   /**
-   * Create or destroy the overlay window.
+   * Create or destroy the overlay window. Main-renderer side.
    *
-   * @param active true to bring it up over the current native rect
-   * @param info   scene metadata, so the title chip is right on the first push
+   * @param active true to bring the full-window HUD up, false to destroy it
    */
-  setActive(active: boolean, info?: OverlaySceneInfo | null): void;
-
-  /** Push new scene title/description without touching the window's lifecycle. */
-  setScene(info: OverlaySceneInfo): void;
+  setActive(active: boolean): void;
 
   /**
-   * Subscribe to input relayed from the overlay window.
+   * Subscribe to input relayed from the overlay window. Main-renderer side.
    *
-   * Events arrive with coordinates normalized to the native rect (0..1); the
+   * Events arrive with coordinates normalized to the stage rect (0..1); the
    * receiver maps them back onto its own stage box and replays them into the
    * camera rig, so orbit/pan/zoom behave identically to the composite path.
    *
    * @returns a function that removes this listener
    */
   onInput(cb: (event: OverlayInputEvent) => void): Unsubscribe;
+
+  /**
+   * Push a fresh UI snapshot for the HUD to mirror. Main-renderer side.
+   * Fire-and-forget; main stores the latest and forwards it to the overlay.
+   */
+  pushUiState(state: HudUiState): void;
+
+  /**
+   * Subscribe to user intents captured in the HUD chrome. Main-renderer side.
+   * @returns a function that removes this listener
+   */
+  onAction(cb: (action: HudAction) => void): Unsubscribe;
+
+  /**
+   * Relay one captured input event toward the main renderer. HUD side.
+   *
+   * Fire and forget by design: the relay is on the interaction path, and an
+   * invoke round trip per pointermove would put IPC latency between the user's
+   * hand and the camera.
+   */
+  sendInput(event: OverlayInputEvent): void;
+
+  /** Ship one user intent to the main renderer. HUD side. */
+  sendAction(action: HudAction): void;
+
+  /**
+   * Subscribe to UI snapshots forwarded by main. HUD side.
+   * The latest snapshot is replayed to a late subscriber, so the chrome paints
+   * correctly even when the push beat the page's boot sequence.
+   * @returns a function that removes this listener
+   */
+  onUiState(cb: (state: HudUiState) => void): Unsubscribe;
+
+  /** One-shot boot handshake: ask main to replay the latest snapshot. HUD side. */
+  hudReady(): void;
 }
 
 /**
