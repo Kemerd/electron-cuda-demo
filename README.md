@@ -1,10 +1,11 @@
 # GeoSwarm
 
 [![CI](https://github.com/Kemerd/electron-cuda-demo/actions/workflows/ci.yml/badge.svg)](https://github.com/Kemerd/electron-cuda-demo/actions/workflows/ci.yml)
+[![Try the Live Demo](https://img.shields.io/badge/%E2%96%B6%20Try%20the%20Live%20Demo-kemerd.github.io-2ea44f?style=flat&logo=github&logoColor=white)](https://kemerd.github.io/electron-cuda-demo/)
 
 **Real CUDA kernels inside an Electron app — benchmarked honestly against WebGPU and JavaScript.**
 
-![Project Screenshot](preview.png)
+[![Project Screenshot](preview.png)](https://kemerd.github.io/electron-cuda-demo/)
 
 Two million simulated drones over a live globe. The usual web stack draws them at **10 fps**. The same GPU, addressed properly, draws them at **195 fps** — and the difference isn't compute, it's *data motion*. This repo is the receipts: seven pipeline configurations, one uninterrupted 61-cell benchmark sweep, every number reproducible from the in-app Benchmark tab.
 
